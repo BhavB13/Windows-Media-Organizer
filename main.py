@@ -1,18 +1,22 @@
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk
 from tkinterdnd2 import TkinterDnD
 from ui_components import Sidebar, StatusHeader, HomeFrame, OrganizerFrame, TransferFrame
 from utils import HashCache
+from runtime_paths import initialize_runtime_data
 
 class App(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Media Organizer Pro")
+        self.title("Duplicate & Transfer Manager")
         self.geometry("1400x950")
         self.minsize(1100, 760)
         self.selected_adb_serial = ""
-        
-        self.hash_cache = HashCache("hash_cache.json")
+
+        project_root = Path(__file__).resolve().parent
+        self.runtime_paths, self.migration_result = initialize_runtime_data(project_root)
+        self.hash_cache = HashCache(str(self.runtime_paths.hash_cache))
         self.hash_cache.load()
         
         self.header = StatusHeader(self)
@@ -49,6 +53,10 @@ class App(TkinterDnD.Tk):
         self.hash_cache.save()
         self.destroy()
 
-if __name__ == "__main__":
+def main():
     app = App()
     app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

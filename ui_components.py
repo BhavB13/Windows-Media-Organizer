@@ -13,15 +13,8 @@ except ImportError:
     HAS_PIL = False
 
 from adb_bridge import ADBBridge
-from engine import (
-    execute_smart_transfer,
-    group_duplicates,
-    normalize_settings,
-    validate_scan_paths,
-    validate_transfer_paths,
-)
 from drive_cache import default_adb_cache_path
-from discovery import discover_files, ScanProgress
+from discovery import ScanProgress
 from utils import (
     DEFAULT_EXCLUDES,
     DEFAULT_MEDIA_EXTS,
@@ -32,6 +25,28 @@ from utils import (
 )
 from models import Settings, TransferSettings
 from transfer_safety import cleanup_partial_files
+from runtime_paths import get_runtime_paths
+from duplicate_transfer_manager.controllers.qt_compat import QRunnable, QThreadPool
+from duplicate_transfer_manager.core import (
+    CancellationToken,
+    OperationPhase,
+    OperationReporter,
+    OperationState,
+    map_exception,
+)
+from duplicate_transfer_manager.services import DuplicateScanService, TransferService
+
+
+class QtFunctionRunnable(QRunnable):
+    """Run a legacy frontend adapter on a Qt-owned worker thread."""
+
+    def __init__(self, function, *args):
+        super().__init__()
+        self.function = function
+        self.args = args
+
+    def run(self):
+        self.function(*self.args)
 
 
 def get_adb_device_by_serial(serial):
@@ -219,7 +234,7 @@ class Sidebar(ttk.Frame):
 class HomeFrame(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
-        ttk.Label(self, text="Media Organizer Pro", font=("Segoe UI", 28, "bold"), foreground="#569cd6").pack(pady=(80, 10))
+        ttk.Label(self, text="Duplicate & Transfer Manager", font=("Segoe UI", 28, "bold"), foreground="#569cd6").pack(pady=(80, 10))
         ttk.Label(self, text="Manage Android and Local Storage Seamlessly", font=("Segoe UI", 12)).pack()
         ttk.Label(self, text="Select a module from the sidebar to begin.", font=("Segoe UI", 10, "italic"), foreground="#888888").pack(pady=20)
 
@@ -244,6 +259,8 @@ class OrganizerFrame(ttk.Frame):
         self.ai_semantic_var = tk.BooleanVar(value=False)
 
         self.stop_event = threading.Event()
+        self.scan_cancellation = CancellationToken()
+        self.thread_pool = QThreadPool.globalInstance()
         self.start_time = 0
         self.scan_thread = None
         self.scan_running = False
@@ -405,6 +422,7 @@ class OrganizerFrame(ttk.Frame):
 
     def _cancel_scan(self):
         self.stop_event.set()
+        self.scan_cancellation.cancel()
         self.scan_status_var.set("Cancelling...")
         self.scan_detail_var.set("Cancel requested")
         self.scan_running = True
@@ -506,93 +524,104 @@ class OrganizerFrame(ttk.Frame):
         self.scan_current_path_var.set("Current path: -")
         self.progress_var.set(0)
         self._sync_scan_mode()
+        settings = Settings(
+            scan_root=self.scan_var.get(),
+            output_root="",
+            criteria="hash",
+            hash_algo=self.hash_algo_var.get(),
+            hash_mode=self.hash_mode_var.get(),
+            only_media=self.only_media_var.get(),
+            extensions=DEFAULT_MEDIA_EXTS,
+            min_size_kb=self.min_size_var.get(),
+            exclude_dirs=DEFAULT_EXCLUDES,
+            skip_hidden_system=self.skip_hidden_var.get(),
+            dry_run=self.dry_run_var.get(),
+            preserve_structure=True,
+            max_hash_workers=self.threads_var.get(),
+            use_adb=self.adb_var.get(),
+            adb_serial=self.app.get_selected_device_serial(),
+            isolate_folder=self.isolate_dir_var.get(),
+        )
+        options = {
+            "ai_selected": self.ai_blurry_var.get() or self.ai_semantic_var.get(),
+            "isolate_folder": self.isolate_dir_var.get(),
+            "keep_policy": self.keep_policy_var.get(),
+        }
+        logger = SessionLogger(self.log_widget, self.log_dir_var.get())
+        self.scan_cancellation = CancellationToken()
         if self.scan_heartbeat_job is None:
             self._scan_heartbeat()
-        threading.Thread(target=self._run_scan, daemon=True).start()
+        self.thread_pool.start(
+            QtFunctionRunnable(self._run_scan, settings, options, logger)
+        )
 
-    def _run_scan(self):
-        logger = SessionLogger(self.log_widget, self.log_dir_var.get())
-        try:
-            settings = Settings(
-                scan_root=self.scan_var.get(),
-                output_root="",
-                criteria="hash",
-                hash_algo=self.hash_algo_var.get(),
-                hash_mode=self.hash_mode_var.get(),
-                only_media=self.only_media_var.get(),
-                extensions=DEFAULT_MEDIA_EXTS,
-                min_size_kb=self.min_size_var.get(),
-                exclude_dirs=DEFAULT_EXCLUDES,
-                skip_hidden_system=self.skip_hidden_var.get(),
-                dry_run=self.dry_run_var.get(),
-                preserve_structure=True,
-                max_hash_workers=self.threads_var.get(),
-                use_adb=self.adb_var.get(),
-                adb_serial=self.app.get_selected_device_serial(),
-                isolate_folder=self.isolate_dir_var.get(),
+    def _legacy_scan_event(self, event):
+        details = event.details
+        if details:
+            self.after(
+                0,
+                lambda: self.scan_folders_var.set(
+                    f"Folders scanned: {details.get('folders_scanned', 0)}"
+                ),
             )
-            settings = normalize_settings(settings)
-            validation_error = validate_scan_paths(settings)
-            if validation_error:
-                logger.log(f"ERROR: {validation_error}")
-                self.scan_terminal_status = "Blocked"
-                self.scan_detail_var.set(validation_error)
-                self._update_progress(0, 1, "Scan blocked")
-                self.after(0, lambda: messagebox.showerror("Invalid Scan Settings", validation_error))
-                return
+            self.after(
+                0,
+                lambda: self.scan_files_var.set(
+                    f"Files found: {details.get('files_found', 0)}"
+                ),
+            )
+            self.after(
+                0,
+                lambda: self.scan_errors_var.set(
+                    f"Errors: {details.get('errors', 0)}"
+                ),
+            )
+        if event.current_item:
+            self.after(
+                0,
+                lambda: self.scan_current_path_var.set(
+                    f"Current path: {event.current_item}"
+                ),
+            )
+        if event.total_items:
+            self._update_progress(
+                event.processed_items,
+                event.total_items,
+                event.message,
+            )
+        else:
+            self.after(0, lambda: self.scan_detail_var.set(event.message))
 
-            if self.ai_blurry_var.get() or self.ai_semantic_var.get():
+    def _run_scan(self, settings, options, logger):
+        try:
+            if options["ai_selected"]:
                 logger.log("WARNING: AI modules selected but not yet implemented. Proceeding with Hash...")
 
             self.start_time = time.time()
-            self._apply_scan_progress(ScanProgress(phase="discovering", source=settings.scan_root, current_path=settings.scan_root, message="Discovering files...", is_adb=settings.use_adb))
-
-            discovery = discover_files(
-                settings.scan_root,
-                settings,
-                self.stop_event,
-                progress_callback=self._apply_scan_progress,
-                logger=logger,
+            reporter = OperationReporter(
+                event_sink=self._legacy_scan_event,
+                state_sink=lambda state: self.after(
+                    0,
+                    lambda: self.scan_status_var.set(state.value.title()),
+                ),
+                log_sink=logger.log,
             )
-
-            if discovery.cancelled or self.stop_event.is_set():
+            result = DuplicateScanService(self.app.hash_cache).run(
+                settings,
+                self.scan_cancellation,
+                reporter,
+            )
+            if result.status == OperationState.CANCELLED:
                 logger.log("Scan cancelled.")
                 self.scan_terminal_status = "Cancelled"
-                self._apply_scan_progress(ScanProgress(
-                    phase="cancelled",
-                    source=settings.scan_root,
-                    current_path=settings.scan_root,
-                    folders_scanned=discovery.folders_scanned,
-                    files_found=discovery.files_found,
-                    errors=len(discovery.errors),
-                    message="Scan cancelled",
-                    is_adb=settings.use_adb,
-                    cancelled=True,
-                ))
                 self.after(0, self.progress_bar.stop)
                 return
 
-            files = discovery.files
-            self.scan_status_var.set("Hashing")
-            logger.log(f"Discovery complete: {discovery.files_found} files across {discovery.folders_scanned} folders.")
-            if discovery.errors:
-                logger.log(f"Discovery reported {len(discovery.errors)} error(s).")
-
-            self.start_time = time.time()
-            self._update_progress(0, 1, f"Found {len(files)} files. Grouping...")
-
-            duplicates = group_duplicates(files, settings, self.stop_event, self.app.hash_cache, logger, self._update_progress)
-
-            if self.stop_event.is_set():
-                logger.log("Scan stopped.")
-                self.scan_terminal_status = "Stopped"
-                self._update_progress(0, 1, "Stopped.")
-                self.after(0, self.progress_bar.stop)
-                return
-
+            duplicates = result.data["groups"]
             logger.log("Processing and sorting duplicates. Please wait...")
             isolated_count = 0
-            policy = self.keep_policy_var.get()
+            policy = options["keep_policy"]
+            isolate_folder = options["isolate_folder"]
 
             for idx, group in enumerate(duplicates):
                 group.sort(key=lambda x: x.created, reverse=(policy == "Newest"))
@@ -601,9 +630,9 @@ class OrganizerFrame(ttk.Frame):
                     self.after(0, lambda g=group_id, p=file_info.path: self.results_tree.insert("", "end", values=(g, p)))
 
                 for dup in group[1:]:
-                    if self.isolate_dir_var.get():
-                        os.makedirs(self.isolate_dir_var.get(), exist_ok=True)
-                        target = ensure_unique_path(os.path.join(self.isolate_dir_var.get(), os.path.basename(dup.path)))
+                    if isolate_folder:
+                        os.makedirs(isolate_folder, exist_ok=True)
+                        target = ensure_unique_path(os.path.join(isolate_folder, os.path.basename(dup.path)))
                         if settings.dry_run:
                             logger.log(f"WOULD MOVE: {dup.path} -> {target}")
                         else:
@@ -620,9 +649,9 @@ class OrganizerFrame(ttk.Frame):
                     isolated_count += 1
 
             logger.log("\n--- Scan Complete ---")
-            if self.isolate_dir_var.get() and settings.dry_run:
+            if isolate_folder and settings.dry_run:
                 action = "Would Move"
-            elif self.isolate_dir_var.get():
+            elif isolate_folder:
                 action = "Moved"
             else:
                 action = "Found"
@@ -632,11 +661,17 @@ class OrganizerFrame(ttk.Frame):
             self._update_progress(1, 1, "Scan Complete.")
             self.after(0, self.progress_bar.stop)
             self.scan_terminal_status = "Complete"
-            self.scan_status_var.set("Complete")
+            self.after(0, lambda: self.scan_status_var.set("Complete"))
+        except Exception as exc:
+            error = map_exception(exc)
+            logger.log(f"ERROR: {error.technical_detail}")
+            self.scan_terminal_status = "Failed"
+            self.after(0, lambda: self.scan_detail_var.set(error.message))
+            self.after(0, lambda: messagebox.showerror(error.title, error.message))
         finally:
             if self.stop_event.is_set() and self.scan_terminal_status == "Running":
                 self.scan_terminal_status = "Stopped"
-                self.scan_detail_var.set("Scan stopped")
+                self.after(0, lambda: self.scan_detail_var.set("Scan stopped"))
             self.scan_running = False
             self.scan_last_update = time.time()
             self.after(0, self.progress_bar.stop)
@@ -663,7 +698,7 @@ class TransferFrame(ttk.Frame):
         self.skip_hidden_var = tk.BooleanVar(value=True)
         self.dry_run_var = tk.BooleanVar(value=False)
         self.cache_location_var = tk.StringVar(
-            value=f"Automatic caches: {os.path.abspath(os.path.join(os.getcwd(), 'drive_caches'))}"
+            value=f"Automatic caches: {get_runtime_paths().drive_caches}"
         )
         self.min_size_var = tk.IntVar(value=0)
         self.threads_var = tk.IntVar(value=4)
@@ -673,6 +708,8 @@ class TransferFrame(ttk.Frame):
         self.keep_awake_var = tk.BooleanVar(value=True)
 
         self.stop_event = threading.Event()
+        self.transfer_cancellation = CancellationToken()
+        self.thread_pool = QThreadPool.globalInstance()
         self.start_time = 0
         self.transfer_running = False
         self.transfer_last_update = 0.0
@@ -749,7 +786,7 @@ class TransferFrame(ttk.Frame):
         ctrl_frame = ttk.Frame(self, padding=10)
         ctrl_frame.pack(fill="x")
         ttk.Button(ctrl_frame, text="Start Sync", command=self._start).pack(side="left")
-        ttk.Button(ctrl_frame, text="Stop", command=lambda: self.stop_event.set()).pack(side="left", padx=5)
+        ttk.Button(ctrl_frame, text="Stop", command=self._cancel_transfer).pack(side="left", padx=5)
         ttk.Button(ctrl_frame, text="ADB Diagnostics", command=self._show_adb_diagnostics).pack(side="left", padx=5)
         ttk.Button(ctrl_frame, text="Clean Partials", command=self._clean_partials).pack(side="left", padx=5)
 
@@ -821,7 +858,7 @@ class TransferFrame(ttk.Frame):
             var.set(path) if path else None
 
     def _open_cache_folder(self):
-        cache_dir = os.path.abspath(os.path.join(os.getcwd(), "drive_caches"))
+        cache_dir = str(get_runtime_paths().drive_caches)
         os.makedirs(cache_dir, exist_ok=True)
         try:
             os.startfile(cache_dir)
@@ -868,6 +905,12 @@ class TransferFrame(ttk.Frame):
             return
         removed = cleanup_partial_files(root)
         messagebox.showinfo("Clean Partials", f"Removed {len(removed)} partial file(s).")
+
+    def _cancel_transfer(self):
+        self.stop_event.set()
+        self.transfer_cancellation.cancel()
+        self.transfer_terminal_status = "Stopping"
+        self.transfer_detail_var.set("Stop requested; finishing the current safe checkpoint.")
 
     def _update_progress(self, current, total, text=""):
         self.transfer_last_update = time.time()
@@ -932,95 +975,107 @@ class TransferFrame(ttk.Frame):
         self.start_time = time.time()
         self.transfer_status_var.set("Scanning...")
         self.transfer_detail_var.set("Preparing transfer comparison")
+        active_exts = []
+        if self.pics_var.get():
+            active_exts.extend(['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.heic', '.webp'])
+        if self.vids_var.get():
+            active_exts.extend(['.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.mpeg', '.mpg', '.3gp', '.mts', '.m2ts', '.hevc'])
+        if self.audio_var.get():
+            active_exts.extend(['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a'])
+        custom = self.custom_ext_var.get().strip()
+        if custom:
+            active_exts.extend([item.strip().lower() for item in custom.split(',') if item.strip()])
+        active_exts = normalize_extensions(active_exts)
+        if not active_exts:
+            messagebox.showwarning(
+                "No File Types Selected",
+                "Select Pictures, Videos, Audio, or enter a custom extension.",
+            )
+            self.transfer_running = False
+            return
+        settings = TransferSettings(
+            source_root=self.src_var.get(),
+            dest_root=self.dst_var.get(),
+            output_root=self.out_var.get(),
+            criteria="hash",
+            hash_algo=self.hash_algo_var.get(),
+            hash_mode=self.hash_mode_var.get(),
+            only_media=True,
+            extensions=active_exts,
+            min_size_kb=self.min_size_var.get(),
+            exclude_dirs=DEFAULT_EXCLUDES,
+            skip_hidden_system=self.skip_hidden_var.get(),
+            dry_run=self.dry_run_var.get(),
+            preserve_structure=True,
+            max_hash_workers=self.threads_var.get(),
+            transfer_mode="copy",
+            duplicate_policy="skip",
+            use_dest_cache=True,
+            source_is_adb=self.adb_src_var.get(),
+            adb_serial=self.app.get_selected_device_serial(),
+            log_folder=self.log_dir_var.get(),
+            isolate_folder="",
+            drive_cache_path="",
+            update_drive_cache=True,
+            use_adb_cache=True,
+            adb_cache_path="",
+            transfer_profile=self.transfer_profile_var.get(),
+            retry_attempts=self.retry_attempts_var.get(),
+            conflict_policy=self.conflict_policy_var.get(),
+            keep_device_awake=self.keep_awake_var.get(),
+        )
+        logger = SessionLogger(self.log_widget, self.log_dir_var.get())
+        self.transfer_cancellation = CancellationToken()
         if self.transfer_heartbeat_job is None:
             self._transfer_heartbeat()
-        threading.Thread(target=self._run_transfer, daemon=True).start()
+        self.thread_pool.start(
+            QtFunctionRunnable(self._run_transfer, settings, logger)
+        )
 
-    def _run_transfer(self):
-        logger = SessionLogger(self.log_widget, self.log_dir_var.get())
+    def _run_transfer(self, settings, logger):
         try:
-            active_exts = []
-            if self.pics_var.get():
-                active_exts.extend(['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.heic', '.webp'])
-            if self.vids_var.get():
-                active_exts.extend(['.mp4', '.mov', '.avi', '.mkv', '.wmv', '.flv', '.mpeg', '.mpg', '.3gp', '.mts', '.m2ts', '.hevc'])
-            if self.audio_var.get():
-                active_exts.extend(['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a'])
-
-            custom = self.custom_ext_var.get().strip()
-            if custom:
-                active_exts.extend([item.strip().lower() for item in custom.split(',') if item.strip()])
-            active_exts = normalize_extensions(active_exts)
-
-            if not active_exts:
-                logger.log("WARNING: No file types selected! Please check Pictures, Videos, or enter a Custom Extension.")
-                self.transfer_terminal_status = "Failed"
-                self.transfer_detail_var.set("No file types selected")
-                self._update_progress(0, 1, "Failed: No File Types Selected")
-                return
-
-            settings = TransferSettings(
-                source_root=self.src_var.get(),
-                dest_root=self.dst_var.get(),
-                output_root=self.out_var.get(),
-                criteria="hash",
-                hash_algo=self.hash_algo_var.get(),
-                hash_mode=self.hash_mode_var.get(),
-                only_media=True,
-                extensions=active_exts,
-                min_size_kb=self.min_size_var.get(),
-                exclude_dirs=DEFAULT_EXCLUDES,
-                skip_hidden_system=self.skip_hidden_var.get(),
-                dry_run=self.dry_run_var.get(),
-                preserve_structure=True,
-                max_hash_workers=self.threads_var.get(),
-                transfer_mode="copy",
-                duplicate_policy="skip",
-                use_dest_cache=True,
-                source_is_adb=self.adb_src_var.get(),
-                adb_serial=self.app.get_selected_device_serial(),
-                log_folder=self.log_dir_var.get(),
-                isolate_folder="",
-                drive_cache_path="",
-                update_drive_cache=True,
-                use_adb_cache=True,
-                adb_cache_path="",
-                transfer_profile=self.transfer_profile_var.get(),
-                retry_attempts=self.retry_attempts_var.get(),
-                conflict_policy=self.conflict_policy_var.get(),
-                keep_device_awake=self.keep_awake_var.get(),
-            )
-            settings.use_dest_cache = True
-            settings = normalize_settings(settings)
-            validation_error = validate_transfer_paths(settings)
-            if validation_error:
-                logger.log(f"ERROR: {validation_error}")
-                self.transfer_terminal_status = "Blocked"
-                self.transfer_detail_var.set(validation_error)
-                self._update_progress(0, 1, "Transfer blocked")
-                self.after(0, lambda: messagebox.showerror("Invalid Transfer Settings", validation_error))
-                return
-
             logger.log("Comparison is recursive across the entire compare folder, including nested subfolders.")
-            result = execute_smart_transfer(settings, self.stop_event, self.app.hash_cache, logger, self._update_progress)
-            self.app.hash_cache.save()
+            reporter = OperationReporter(
+                event_sink=lambda event: self._update_progress(
+                    event.bytes_processed or event.processed_items,
+                    event.total_bytes or event.total_items,
+                    event.message,
+                ),
+                state_sink=lambda state: self.after(
+                    0,
+                    lambda: self.transfer_status_var.set(state.value.title()),
+                ),
+                log_sink=logger.log,
+            )
+            result = TransferService(self.app.hash_cache).run(
+                settings,
+                self.transfer_cancellation,
+                reporter,
+            )
             if result:
                 self.transfer_terminal_status = "Complete"
-                action_word = "Would Copy" if result.get("dry_run") else "Copied"
+                raw = result.data["engine_result"]
+                action_word = "Would Copy" if raw.get("dry_run") else "Copied"
                 summary = (
-                    f"Done | {action_word}: {result['transferred']} | "
-                    f"Duplicates: {result['duplicates']} | Skipped: {result['skipped']} | "
-                    f"Errors: {result.get('errors', 0)}"
+                    f"Done | {action_word}: {result.counts['transferred']} | "
+                    f"Duplicates: {result.counts['duplicates']} | Skipped: {result.counts['skipped']} | "
+                    f"Errors: {result.counts.get('errors', 0)}"
                 )
-                if result.get("adb_device_failed"):
+                if raw.get("adb_device_failed"):
                     self.transfer_terminal_status = "ADB Disconnected"
                     summary = "ADB authorization lost | Unlock phone, reconnect USB debugging, and retry"
-                self.transfer_detail_var.set(summary)
+                self.after(0, lambda: self.transfer_detail_var.set(summary))
                 self._update_progress(1, 1, summary)
+        except Exception as exc:
+            error = map_exception(exc)
+            logger.log(f"ERROR: {error.technical_detail}")
+            self.transfer_terminal_status = "Failed"
+            self.after(0, lambda: self.transfer_detail_var.set(error.message))
+            self.after(0, lambda: messagebox.showerror(error.title, error.message))
         finally:
             if self.stop_event.is_set() and self.transfer_terminal_status == "Running":
                 self.transfer_terminal_status = "Stopped"
-                self.transfer_detail_var.set("Transfer stopped")
+                self.after(0, lambda: self.transfer_detail_var.set("Transfer stopped"))
             self.transfer_running = False
             self.transfer_last_update = time.time()
             self.after(0, self._transfer_heartbeat)

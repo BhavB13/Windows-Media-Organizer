@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "duplicate-transfer-manager"
+version = "0.2.0"
+description = "Find duplicate files and safely import new media on Windows."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "BhavB13" }]
+classifiers = [
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "Pillow==11.3.0",
+    "PySide6==6.9.1",
+    "tkinterdnd2==0.4.3",
+]
+
+[project.urls]
+Repository = "https://github.com/BhavB13/Windows-Media-Organizer"
+Roadmap = "https://github.com/BhavB13/Windows-Media-Organizer/blob/main/OVERHAUL_PLAN.md"
+
+[project.scripts]
+duplicate-transfer-manager = "main:main"
+dtm-build-cache = "drive_cache:main"
+
+[tool.setuptools]
+packages = [
+    "duplicate_transfer_manager",
+    "duplicate_transfer_manager.controllers",
+    "duplicate_transfer_manager.core",
+    "duplicate_transfer_manager.services",
+]
+package-dir = {duplicate_transfer_manager = "src/duplicate_transfer_manager"}
+py-modules = [
+    "adb_bridge",
+    "build_drive_cache",
+    "discovery",
+    "drive_cache",
+    "engine",
+    "main",
+    "models",
+    "runtime_paths",
+    "transfer_safety",
+    "ui_components",
+    "utils",
+]
+
+[tool.unittest]
+start-directory = "tests"

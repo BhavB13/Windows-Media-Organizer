@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments and packaging
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Application runtime data
+hash_cache.json
+drive_caches/
+transfer_reports/
+transfer_state/
+logs/
+updates/
+quarantine/
+*.partial
+
+# Generated helper from schedule_adb_cache.ps1
+refresh_adb_cache.ps1

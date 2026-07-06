@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 
 from adb_bridge import ADBBridge, ADBOperationError
+from runtime_paths import get_runtime_paths
 
 
 ES_CONTINUOUS = 0x80000000
@@ -92,7 +93,7 @@ class TransferJournal:
 def default_journal_path(output_root, serial="local"):
     safe_serial = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in serial) or "local"
     root_tag = hashlib.sha256(os.path.abspath(output_root).encode("utf-8")).hexdigest()[:10]
-    return os.path.join(os.getcwd(), "transfer_state", f"{safe_serial}_{root_tag}.journal.json")
+    return str(get_runtime_paths().journals / f"{safe_serial}_{root_tag}.journal.json")
 
 
 def preflight_transfer(output_root, source_files, is_adb=False, serial="", verify_write=True):
@@ -104,7 +105,7 @@ def preflight_transfer(output_root, source_files, is_adb=False, serial="", verif
             errors.append(f"ADB device is not ready: {detail}")
     if verify_write:
         try:
-            probe = os.path.join(output_root, ".media_organizer_write_test")
+            probe = os.path.join(output_root, ".duplicate_transfer_manager_write_test")
             with open(probe, "wb") as handle:
                 handle.write(b"")
             os.remove(probe)
@@ -215,12 +216,11 @@ def cleanup_partial_files(root):
 
 
 def write_transfer_report(output_root, result, failures):
-    report_dir = os.path.join(os.getcwd(), "transfer_reports")
-    os.makedirs(report_dir, exist_ok=True)
-    path = os.path.join(report_dir, f"transfer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    report_dir = get_runtime_paths().reports
+    path = report_dir / f"transfer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     payload = dict(result)
     payload["failures"] = failures
     payload["created_at"] = datetime.now().isoformat(timespec="seconds")
-    with open(path, "w", encoding="utf-8") as handle:
+    with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
-    return path
+    return str(path)

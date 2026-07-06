@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from discovery import discover_files
 from models import Settings
+from runtime_paths import get_runtime_paths
 from utils import DEFAULT_EXCLUDES, DEFAULT_MEDIA_EXTS, normalize_extensions
 
 
@@ -213,7 +214,7 @@ class DriveHashCache:
 def default_cache_path(root):
     safe = os.path.abspath(root).replace("\\", "_").replace("/", "_").replace(":", "")
     safe = safe.strip("_") or "root"
-    return os.path.join(os.getcwd(), "drive_caches", f"{safe}.json")
+    return str(get_runtime_paths().drive_caches / f"{safe}.json")
 
 
 class ADBHashCache(DriveHashCache):
@@ -237,7 +238,7 @@ class ADBHashCache(DriveHashCache):
 def default_adb_cache_path(serial):
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", serial.strip()).strip("._") or "device"
     serial_tag = hashlib.sha256(serial.strip().encode("utf-8")).hexdigest()[:10]
-    return os.path.join(os.getcwd(), "drive_caches", f"adb_{cleaned}_{serial_tag}.json")
+    return str(get_runtime_paths().drive_caches / f"adb_{cleaned}_{serial_tag}.json")
 
 
 def build_drive_cache(root, cache_path, settings, stop_event, logger=None, progress_callback=None, hash_func=None):
@@ -283,9 +284,13 @@ def _parse_extensions(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build or update a Media Organizer drive hash cache.")
+    parser = argparse.ArgumentParser(description="Build or update a Duplicate & Transfer Manager drive hash cache.")
     parser.add_argument("--root", required=True, help="Folder or drive root to cache, for example N:\\ or C:\\Users\\Name\\Pictures.")
-    parser.add_argument("--cache", default="", help="Cache JSON path. Defaults to ./drive_caches/<root>.json.")
+    parser.add_argument(
+        "--cache",
+        default="",
+        help="Cache JSON path. Defaults to the application cache folder under LocalAppData.",
+    )
     parser.add_argument("--algo", default="sha256", choices=["sha256", "md5"])
     parser.add_argument("--mode", default="full", choices=["full", "fast"])
     parser.add_argument("--adb", action="store_true", help="Treat --root as an ADB device path.")

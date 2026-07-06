@@ -487,7 +487,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                 )
                 if single_read_import:
                     stage_key = hashlib.sha256(f.path.encode("utf-8")).hexdigest()
-                    stage_dir = os.path.join(output_root, ".media_organizer_staging")
+                    stage_dir = os.path.join(output_root, ".duplicate_transfer_manager_staging")
                     staged_path = os.path.join(stage_dir, f"{stage_key}_{filename}")
                     pull_with_retries(
                         f.path,
@@ -732,7 +732,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
             logger.log("Transfer resume journal checkpoint completed.")
         except OSError as exc:
             logger.log(f"WARNING: Failed to finalize transfer journal: {exc}")
-    staging_dir = os.path.join(output_root, ".media_organizer_staging")
+    staging_dir = os.path.join(output_root, ".duplicate_transfer_manager_staging")
     try:
         os.rmdir(staging_dir)
     except OSError:

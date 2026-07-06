@@ -6,6 +6,8 @@ import ctypes
 import queue
 from datetime import datetime
 
+from runtime_paths import get_runtime_paths
+
 DEFAULT_MEDIA_EXTS = [
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".heic", ".webp",
     ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".mpeg", ".mpg",
@@ -19,6 +21,7 @@ DEFAULT_EXCLUDES = [
     ".git",
     ".venv",
     ".media_organizer_staging",
+    ".duplicate_transfer_manager_staging",
 ]
 
 class SessionLogger:
@@ -26,9 +29,11 @@ class SessionLogger:
         self.ui_widget = ui_text_widget
         self.log_file = None
         self._queue = queue.Queue()
-        if log_folder and os.path.exists(log_folder):
+        if not log_folder:
+            log_folder = str(get_runtime_paths().logs)
+        if os.path.exists(log_folder):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.log_file = os.path.join(log_folder, f"media_organizer_log_{timestamp}.txt")
+            self.log_file = os.path.join(log_folder, f"duplicate_transfer_manager_{timestamp}.log")
         if self.ui_widget:
             self._schedule_flush()
 

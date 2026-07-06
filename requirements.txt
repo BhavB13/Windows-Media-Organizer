@@ -1,0 +1,4 @@
+# Runtime dependencies pinned for the Phase 0 legacy frontend.
+Pillow==11.3.0
+PySide6==6.9.1
+tkinterdnd2==0.4.3
