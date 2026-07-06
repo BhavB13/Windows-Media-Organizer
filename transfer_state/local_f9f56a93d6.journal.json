@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "completed": {
+    "C:\\Users\\Bhave\\AppData\\Local\\Temp\\tmp8er8_0x5\\source\\new.jpg": {
+      "target": "C:\\Users\\Bhave\\AppData\\Local\\Temp\\tmp8er8_0x5\\output\\new.jpg",
+      "size": 15,
+      "hash": "639637ae816588bd8fc564e035bc8f959d0128654c2bc07952e4f246af8d22ef",
+      "completed_at": 1782589431.8920064
+    }
+  },
+  "failures": {},
+  "updated_at": 1782589431.8933563
+}

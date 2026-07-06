@@ -1,0 +1,12 @@
+{
+  "transferred": 8547,
+  "duplicates": 2029,
+  "isolated": 0,
+  "skipped": 2029,
+  "resumed": 2923,
+  "errors": 1,
+  "adb_device_failed": true,
+  "dry_run": false,
+  "failures": [],
+  "created_at": "2026-06-27T17:50:14"
+}

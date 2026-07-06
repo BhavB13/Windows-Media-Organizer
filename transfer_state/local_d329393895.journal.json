@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "completed": {
+    "C:\\Users\\Bhave\\AppData\\Local\\Temp\\tmpgm74vujp\\source\\new.jpg": {
+      "target": "C:\\Users\\Bhave\\AppData\\Local\\Temp\\tmpgm74vujp\\output\\new.jpg",
+      "size": 9,
+      "hash": "b52866ab92478c8dae6c891d495279afd117f112aa24e3f93dfee51b6a4aba86",
+      "completed_at": 1782589736.502315
+    }
+  },
+  "failures": {},
+  "updated_at": 1782589736.5052629
+}

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "completed": {
+    "C:\\Users\\Bhave\\AppData\\Local\\Temp\\tmpzzwawslc\\source\\new.jpg": {
+      "target": "C:\\Users\\Bhave\\AppData\\Local\\Temp\\tmpzzwawslc\\output\\new.jpg",
+      "size": 9,
+      "hash": "b52866ab92478c8dae6c891d495279afd117f112aa24e3f93dfee51b6a4aba86",
+      "completed_at": 1782587705.562579
+    }
+  },
+  "failures": {},
+  "updated_at": 1782587705.5631225
+}

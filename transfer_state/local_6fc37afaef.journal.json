@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "completed": {
+    "C:\\Users\\Bhave\\AppData\\Local\\Temp\\tmpwh8volel\\source\\B\\unique.jpg": {
+      "target": "C:\\Users\\Bhave\\AppData\\Local\\Temp\\tmpwh8volel\\output\\B\\unique.jpg",
+      "size": 6,
+      "hash": "c2720445a45267813688ff73fa188aa060c1b661aefaf1650d42f690697b5ab3",
+      "completed_at": 1782589736.5223522
+    }
+  },
+  "failures": {},
+  "updated_at": 1782589736.525113
+}

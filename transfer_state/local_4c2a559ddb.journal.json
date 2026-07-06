@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "completed": {
+    "C:\\Users\\Bhave\\AppData\\Local\\Temp\\tmpd2l1cagc\\source\\photo.jpg": {
+      "target": "C:\\Users\\Bhave\\AppData\\Local\\Temp\\tmpd2l1cagc\\dest\\photo.jpg",
+      "size": 20,
+      "hash": "dd61b723233d95f3b563b70cddfaf18316c0444d63b30ffa3b290a7481657e0b",
+      "completed_at": 1782589939.710219
+    }
+  },
+  "failures": {},
+  "updated_at": 1782589939.7125669
+}
