@@ -7,6 +7,7 @@ from typing import Any
 
 from engine import execute_smart_transfer, normalize_settings, validate_transfer_paths
 
+from .import_workflow import classify_transfer_stage
 from ..core import (
     CancellationToken,
     ErrorCode,
@@ -55,18 +56,24 @@ class TransferService:
         )
 
         def on_progress(current: int, total: int, text: str = "") -> None:
-            lowered = text.lower()
+            stage = classify_transfer_stage(text)
             state = OperationState.TRANSFERRING
             phase = OperationPhase.TRANSFER
-            if "discover" in lowered or "scanning" in lowered:
+            if stage == "discovery":
                 state = OperationState.SCANNING
                 phase = OperationPhase.DISCOVERY
-            elif "cache" in lowered or "checking" in lowered:
+            elif stage == "comparison":
                 state = OperationState.COMPARING
                 phase = OperationPhase.COMPARISON
-            elif "waiting" in lowered or "authorization lost" in lowered:
+            elif stage == "verification":
+                state = OperationState.TRANSFERRING
+                phase = OperationPhase.VERIFICATION
+            elif stage == "reconnect":
                 state = OperationState.RECONNECTING
                 phase = OperationPhase.RECONNECT
+            elif stage == "finalization":
+                state = OperationState.TRANSFERRING
+                phase = OperationPhase.FINALIZATION
             if reporter.state != state:
                 reporter.set_state(state, phase=phase)
             reporter.progress_callback(current, total, text, phase=phase)

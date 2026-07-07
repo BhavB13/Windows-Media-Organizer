@@ -218,7 +218,7 @@ class Sidebar(ttk.Frame):
         ttk.Label(self, text="NAVIGATION", font=("Segoe UI", 10, "bold"), foreground="#569cd6").pack(anchor="w", pady=(0, 10))
         ttk.Button(self, text="Home", command=lambda: self.app.show_frame("HomeFrame")).pack(fill="x", pady=2)
         ttk.Button(self, text="Duplicate Organizer", command=lambda: self.app.show_frame("OrganizerFrame")).pack(fill="x", pady=2)
-        ttk.Button(self, text="Smart Sync Transfer", command=lambda: self.app.show_frame("TransferFrame")).pack(fill="x", pady=2)
+        ttk.Button(self, text="Import Files", command=lambda: self.app.show_frame("TransferFrame")).pack(fill="x", pady=2)
 
         ttk.Label(self, text="QUICK PATHS", font=("Segoe UI", 10, "bold"), foreground="#569cd6").pack(anchor="w", pady=(20, 10))
         ttk.Button(self, text="Android Camera (ADB)", command=lambda: self._set_path("/sdcard/DCIM/Camera", True)).pack(fill="x", pady=2)
@@ -255,8 +255,6 @@ class OrganizerFrame(ttk.Frame):
         self.dry_run_var = tk.BooleanVar(value=False)
         self.min_size_var = tk.IntVar(value=0)
         self.threads_var = tk.IntVar(value=4)
-        self.ai_blurry_var = tk.BooleanVar(value=False)
-        self.ai_semantic_var = tk.BooleanVar(value=False)
 
         self.stop_event = threading.Event()
         self.scan_cancellation = CancellationToken()
@@ -324,11 +322,6 @@ class OrganizerFrame(ttk.Frame):
         ttk.Spinbox(pref_frame, from_=1, to=16, textvariable=self.threads_var, width=5).grid(row=0, column=3, sticky="w")
         ttk.Checkbutton(pref_frame, text="Media Only (images/videos)", variable=self.only_media_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=5)
         ttk.Checkbutton(pref_frame, text="Dry Run", variable=self.dry_run_var).grid(row=1, column=2, columnspan=2, sticky="w")
-
-        ai_frame = ttk.LabelFrame(config_container, text="Smart AI Processing (Experimental)", padding=10)
-        ai_frame.pack(side="left", fill="x", expand=True, padx=(5, 0))
-        ttk.Checkbutton(ai_frame, text="Flag Blurry Media (Local ML)", variable=self.ai_blurry_var).pack(anchor="w", pady=2)
-        ttk.Checkbutton(ai_frame, text="Semantic Deduplication", variable=self.ai_semantic_var).pack(anchor="w", pady=2)
 
         route_frame = ttk.LabelFrame(self, text="Routing & Sorting Options", padding=10)
         route_frame.pack(fill="x", padx=10, pady=5)
@@ -543,7 +536,6 @@ class OrganizerFrame(ttk.Frame):
             isolate_folder=self.isolate_dir_var.get(),
         )
         options = {
-            "ai_selected": self.ai_blurry_var.get() or self.ai_semantic_var.get(),
             "isolate_folder": self.isolate_dir_var.get(),
             "keep_policy": self.keep_policy_var.get(),
         }
@@ -594,9 +586,6 @@ class OrganizerFrame(ttk.Frame):
 
     def _run_scan(self, settings, options, logger):
         try:
-            if options["ai_selected"]:
-                logger.log("WARNING: AI modules selected but not yet implemented. Proceeding with Hash...")
-
             self.start_time = time.time()
             reporter = OperationReporter(
                 event_sink=self._legacy_scan_event,
@@ -721,7 +710,7 @@ class TransferFrame(ttk.Frame):
         self._build_ui()
 
     def _build_ui(self):
-        path_frame = ttk.LabelFrame(self, text="Smart Sync Transfer", padding=10)
+        path_frame = ttk.LabelFrame(self, text="Guided Import", padding=10)
         path_frame.pack(fill="x", padx=10, pady=5)
         ttk.Label(path_frame, text="Source Drive/Folder:").grid(row=0, column=0, sticky="w")
         source_entry = ttk.Entry(path_frame, textvariable=self.src_var)
@@ -731,13 +720,13 @@ class TransferFrame(ttk.Frame):
         ttk.Checkbutton(path_frame, text="ADB Source", variable=self.adb_src_var).grid(row=0, column=2)
         ttk.Button(path_frame, text="Browse", command=lambda: self._browse(self.src_var, self.adb_src_var.get())).grid(row=0, column=3, padx=5)
 
-        ttk.Label(path_frame, text="Compare Against Folder:").grid(row=1, column=0, sticky="w", pady=5)
+        ttk.Label(path_frame, text="Existing Library:").grid(row=1, column=0, sticky="w", pady=5)
         compare_entry = ttk.Entry(path_frame, textvariable=self.dst_var)
         compare_entry.grid(row=1, column=1, sticky="we", padx=5)
         compare_entry.drop_target_register(DND_FILES)
         compare_entry.dnd_bind('<<Drop>>', lambda e: self.dst_var.set(e.data.strip('{}')))
         ttk.Button(path_frame, text="Browse", command=lambda: self._browse(self.dst_var, False)).grid(row=1, column=3, padx=5)
-        ttk.Label(path_frame, text="Optional Output Folder:").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Label(path_frame, text="Save New Files To:").grid(row=2, column=0, sticky="w", pady=5)
         output_entry = ttk.Entry(path_frame, textvariable=self.out_var)
         output_entry.grid(row=2, column=1, sticky="we", padx=5)
         output_entry.drop_target_register(DND_FILES)

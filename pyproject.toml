@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duplicate-transfer-manager"
-version = "0.2.0"
+version = "0.6.0"
 description = "Find duplicate files and safely import new media on Windows."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -36,6 +36,7 @@ packages = [
     "duplicate_transfer_manager.controllers",
     "duplicate_transfer_manager.core",
     "duplicate_transfer_manager.services",
+    "duplicate_transfer_manager.ui",
 ]
 package-dir = {duplicate_transfer_manager = "src/duplicate_transfer_manager"}
 py-modules = [
@@ -45,6 +46,7 @@ py-modules = [
     "drive_cache",
     "engine",
     "main",
+    "legacy_main",
     "models",
     "runtime_paths",
     "transfer_safety",

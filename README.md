@@ -4,31 +4,54 @@ Duplicate & Transfer Manager is a Windows desktop utility for finding duplicate
 files and safely importing new media from local folders, removable drives, and
 Android devices connected through ADB.
 
-The current interface is the stabilized legacy frontend. Its operations now use
-the framework-neutral service and Qt controller architecture described in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The complete PySide6 frontend
-overhaul is tracked in [OVERHAUL_PLAN.md](OVERHAUL_PLAN.md).
+The primary interface is a responsive PySide6 application shell with system,
+light, and dark themes. Its operations use the framework-neutral service and Qt
+controller architecture described in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The remaining workflow overhaul
+is tracked in [OVERHAUL_PLAN.md](OVERHAUL_PLAN.md).
 
 ## Current capabilities
 
 - Recursively discover local or Android files.
 - Confirm duplicates by content hash.
-- Review and optionally isolate duplicate files.
+- Review duplicate groups, choose which copy to keep, estimate recoverable
+  space, and move selected duplicates into app-managed quarantine.
+- Restore quarantined local files individually or by operation with
+  rename/skip/replace conflict choices.
+- Start from an overview dashboard with primary duplicate/import actions,
+  connected Android devices, recent operations, interrupted work, and local
+  storage summaries.
+- Review local activity records and existing transfer reports; reports can be
+  opened, exported, or removed from the app data folder.
+- Search and filter quarantine records with operation grouping, recoverable-size
+  summaries, and restore controls.
 - Compare a source against an existing library and copy only new files.
+- Use a guided import workflow with phone, folder, or drive sources; plain
+  Reliable/Balanced/Fast profiles; review-before-run; live stages; and summary
+  cards.
+- Configure theme, Simple/Advanced mode, default categories, default transfer
+  profile, cache management, Android behavior, diagnostics consent, and update
+  channel.
+- Complete first-run onboarding for local scans, Android authorization, privacy,
+  diagnostics consent, and update behavior.
 - Preserve source directory structure.
 - Resume interrupted transfers with journals.
 - Use reusable local and Android hash caches.
-- Verify Android transfers and produce JSON reports.
+- Verify transfers, clean partial files, and produce JSON reports.
 - Run copy-only dry runs before making changes.
 
 ## Requirements
 
 - 64-bit Windows 10 or Windows 11
 - Python 3.12
-- Android Platform Tools available on `PATH` when using Android features
+- Android Platform Tools available on `PATH` when using Android features during
+  development
 
-Phase 7 will bundle Android Platform Tools in the distributed application. The
-development version still uses the installed `adb` command.
+The repository pins the license-compatible Android Platform Tools release that
+will be bundled by Windows packaging, and diagnostics display that pinned
+version. Development runs may still use the installed `adb` command, but the
+application does not alter system-wide ADB installations or environment
+variables.
 
 ## Developer installation
 
@@ -51,6 +74,12 @@ It can also be launched from the repository with:
 
 ```powershell
 python main.py
+```
+
+The previous Tkinter interface remains temporarily available for compatibility:
+
+```powershell
+python legacy_main.py
 ```
 
 ## Tests
@@ -98,8 +127,10 @@ communicate through `OperationEvent`, `OperationResult`, and controller signals.
 ## Safety
 
 Smart transfers are copy-only: source files are not modified or deleted.
-Duplicate isolation can move local files only after confirmation. Always review
-a dry run before processing important libraries and keep an independent backup.
+Duplicate quarantine can move local files only after scan, review, and explicit
+confirmation. Android duplicates are copied into quarantine so phone originals
+remain untouched. Always review results before processing important libraries
+and keep an independent backup.
 
 ## License
 

@@ -431,6 +431,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         "and copied using their relative source paths."
     )
     transferred, isolated, skipped, transfer_errors = 0, 0, 0, 0
+    bytes_transferred = 0
     resumed = 0
     failures = []
     adb_device_failed = False
@@ -630,6 +631,10 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                         partial_path = f"{target_path}.partial"
                         shutil.copy2(f.path, partial_path)
                         os.replace(partial_path, target_path)
+                        if os.path.getsize(target_path) != f.size:
+                            failed_path = f"{target_path}.partial"
+                            os.replace(target_path, failed_path)
+                            raise OSError(f"Post-transfer size verification failed; retained as {failed_path}")
                 except (OSError, shutil.Error, subprocess.CalledProcessError, ADBOperationError) as exc:
                     logger.log(f"WARNING: Failed to copy file: {f.path} -> {target_path} ({exc})")
                     transfer_errors += 1
@@ -664,6 +669,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
             if h:
                 dest_hashes.add(h)
             transferred += 1
+            bytes_transferred += f.size
             source_folder = os.path.dirname(f.path)
             transferred_folder_counts[source_folder] = transferred_folder_counts.get(source_folder, 0) + 1
             
@@ -680,7 +686,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
             break
 
     if progress_callback:
-        progress_callback(1, 1, "Dry Run Complete" if settings.dry_run else "Transfer Complete")
+        progress_callback(1, 1, "Report generation complete" if not settings.dry_run else "Dry Run Complete")
     
     logger.log("\n--- Dry Run Complete ---" if settings.dry_run else "\n--- Transfer Complete ---")
     transfer_label = "Would Transfer to Destination" if settings.dry_run else "Transferred to Destination"
@@ -747,6 +753,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         "skipped": skipped,
         "resumed": resumed,
         "errors": transfer_errors,
+        "bytes_transferred": bytes_transferred,
         "adb_device_failed": adb_device_failed,
         "dry_run": settings.dry_run,
     }

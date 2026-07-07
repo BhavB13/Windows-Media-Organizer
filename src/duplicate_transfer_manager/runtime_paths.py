@@ -26,6 +26,7 @@ class RuntimePaths:
     quarantine: Path
     logs: Path
     updates: Path
+    operations: Path
     hash_cache: Path
     settings_file: Path
     migration_marker: Path
@@ -40,6 +41,7 @@ class RuntimePaths:
             self.quarantine,
             self.logs,
             self.updates,
+            self.operations,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         return self
@@ -83,6 +85,7 @@ def get_runtime_paths(root: str | os.PathLike[str] | None = None, *, create: boo
         quarantine=data_root / "quarantine",
         logs=data_root / "logs",
         updates=data_root / "updates",
+        operations=data_root / "operations",
         hash_cache=cache / "hash_cache.json",
         settings_file=data_root / "settings.json",
         migration_marker=data_root / MIGRATION_MARKER_NAME,

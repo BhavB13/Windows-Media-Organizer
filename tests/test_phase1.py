@@ -44,13 +44,15 @@ from models import Settings, TransferSettings
 from utils import DEFAULT_EXCLUDES, DEFAULT_MEDIA_EXTS, HashCache
 
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 if PYSIDE_AVAILABLE:
-    from PySide6.QtCore import QCoreApplication
+    from PySide6.QtWidgets import QApplication
 
 
 def process_qt_events():
     if PYSIDE_AVAILABLE:
-        application = QCoreApplication.instance() or QCoreApplication([])
+        application = QApplication.instance() or QApplication([])
         application.processEvents()
 
 

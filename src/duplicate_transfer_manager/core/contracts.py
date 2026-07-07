@@ -107,6 +107,11 @@ class AppSettings:
     android_enabled: bool = True
     keep_android_awake: bool = True
     check_updates_automatically: bool = True
+    cache_retention_days: int = 90
+    android_default_path: str = "/sdcard/DCIM"
+    android_platform_tools_path: str = ""
+    android_platform_tools_version: str = "37.0.0"
+    onboarding_completed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -126,6 +131,10 @@ class QuarantineRecord:
     reason: str
     operation_id: str
     timestamp: str = field(default_factory=utc_now_iso)
+    source_is_adb: bool = False
+    device_serial: str = ""
+    restored_path: str = ""
+    restored_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -140,4 +149,8 @@ class QuarantineRecord:
             reason=str(values.get("reason", "")),
             operation_id=str(values.get("operation_id", "")),
             timestamp=str(values.get("timestamp", utc_now_iso())),
+            source_is_adb=bool(values.get("source_is_adb", False)),
+            device_serial=str(values.get("device_serial", "")),
+            restored_path=str(values.get("restored_path", "")),
+            restored_at=str(values.get("restored_at", "")),
         )

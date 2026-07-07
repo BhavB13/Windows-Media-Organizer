@@ -63,6 +63,11 @@ compatibility suite.
 
 ## Phase 2 — Design System and Application Shell
 
+**Status: Complete — July 6, 2026.** Verified with 64 automated tests, a
+warning-free version 0.3.0 wheel, an installed-wheel shell smoke test, and
+visual review at 960×720, 1360×860, and 1920×1080 in light and dark themes,
+including a true 200% Qt scale-factor render.
+
 - Create a reusable PySide6 design system rather than styling individual screens independently.
 - Use Segoe UI, restrained blue accent colors, clear spacing, rounded cards, consistent iconography, and accessible semantic colors.
 - Support system, light, and dark themes.
@@ -82,6 +87,13 @@ compatibility suite.
 - Gate completion on visual review at common laptop and desktop resolutions in both themes.
 
 ## Phase 3 — Duplicate Review Workflow
+
+**Status: Complete — July 6, 2026.** Implemented as a staged PySide6 workflow
+backed by the existing duplicate scan controller plus a manifest-based
+quarantine and restore service. Verified with Phase 3 service tests covering
+default keep selection, recoverable-size estimates, local quarantine,
+manifest writing, individual restore, operation restore conflict policies, and
+Android quarantine copy behavior.
 
 - Replace the current single dense duplicate screen with a staged workflow:
   1. Select a local or Android location.
@@ -112,6 +124,13 @@ compatibility suite.
 
 ## Phase 4 — Guided Import and Transfer Workflow
 
+**Status: Complete — July 6, 2026.** Implemented as a guided PySide6 import
+flow backed by `TransferController`, `TransferService`, and reusable import
+workflow helpers. Verified with Phase 4 tests covering copy-only
+structure-preserving settings, Reliable/Balanced/Fast presets, category
+mapping, same-library save explanation, distinct transfer stages, summary-card
+result data, and partial-file cleanup.
+
 - Replace “Smart Sync Transfer” with a guided import flow:
   1. Choose phone, folder, or drive as the source.
   2. Choose the existing library to compare against.
@@ -139,6 +158,13 @@ compatibility suite.
 - Keep detailed activity logs available through an expandable panel.
 
 ## Phase 5 — Overview, Activity, Settings, and Recovery
+
+**Status: Complete — July 6, 2026.** Implemented as a local-first recovery and
+operations layer on top of the Phase 2 shell and Phase 3/4 workflows. Verified
+with Phase 5 service tests covering operation records, transfer-report activity,
+report export/removal, dashboard summaries with connected devices, quarantine
+storage, settings persistence, diagnostics Platform Tools metadata, and
+quarantine grouping/filtering.
 
 - Build an overview dashboard with primary actions, connected devices, recent operations, interrupted transfers, and storage summaries.
 - Add an Activity page backed by local operation records and existing transfer reports.
