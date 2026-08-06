@@ -16,7 +16,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
+from urllib.parse import urlsplit
 from urllib.request import urlopen
+
+from packaging.version import InvalidVersion, Version
 
 from adb_bridge import ADBBridge
 
@@ -42,6 +45,8 @@ def _atomic_json_write(path: Path, payload: Any) -> None:
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             json.dump(payload, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary_name, path)
     except Exception:
         try:
@@ -658,15 +663,16 @@ class UpdateService:
         channel: str = "stable",
         force: bool = False,
     ) -> dict[str, Any]:
+        _validate_update_url(manifest_url, "manifest URL")
         if not force and not self.check_due():
             result = {
                 "checked": False,
                 "reason": "last check was less than 24 hours ago",
             }
-            self.record_check(result)
             return result
         try:
             with urlopen(manifest_url, timeout=15) as response:
+                _validate_update_response_url(response, manifest_url, "manifest redirect URL")
                 payload = json.loads(response.read().decode("utf-8"))
         except (OSError, URLError, json.JSONDecodeError) as exc:
             raise ServiceError(
@@ -699,6 +705,7 @@ class UpdateService:
                 "release_notes_url",
                 "minimum_supported_version",
                 "signature",
+                "authenticode_thumbprint",
             )
             if field not in manifest
         ]
@@ -708,6 +715,14 @@ class UpdateService:
                 "Update manifest is missing required fields.",
                 technical_detail=", ".join(missing),
             )
+        if not str(manifest.get("authenticode_thumbprint", "")).strip():
+            raise ServiceError(
+                ErrorCode.INVALID_DATA,
+                "Update manifest publisher identity is missing.",
+                recoverable=False,
+            )
+        _validate_update_url(str(manifest["installer_url"]), "installer URL")
+        _validate_update_url(str(manifest["release_notes_url"]), "release notes URL")
         if manifest["channel"] != channel:
             raise ServiceError(
                 ErrorCode.VALIDATION,
@@ -785,16 +800,58 @@ class UpdateService:
             )
         self.verify_manifest(manifest, require_newer=True)
         target = self.paths.updates / f"DuplicateTransferManagerSetup-{manifest['version']}.exe"
+        partial = target.with_suffix(target.suffix + ".partial")
+        expected_size = int(manifest["size"])
+        if expected_size <= 0 or expected_size > 2 * 1024 * 1024 * 1024:
+            raise ServiceError(
+                ErrorCode.INVALID_DATA,
+                "Update installer size is outside the supported range.",
+                technical_detail=f"declared size={expected_size}",
+                recoverable=False,
+            )
         try:
             with urlopen(str(manifest["installer_url"]), timeout=60) as response:
-                target.write_bytes(response.read())
-        except (OSError, URLError) as exc:
+                _validate_update_response_url(
+                    response,
+                    str(manifest["installer_url"]),
+                    "installer redirect URL",
+                )
+                received = 0
+                with partial.open("wb") as stream:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        received += len(chunk)
+                        if received > expected_size:
+                            raise ServiceError(
+                                ErrorCode.INVALID_DATA,
+                                "Downloaded installer exceeds the signed manifest size.",
+                                recoverable=False,
+                            )
+                        stream.write(chunk)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            if received != expected_size:
+                raise ServiceError(
+                    ErrorCode.INVALID_DATA,
+                    "Downloaded installer size does not match the signed manifest.",
+                    technical_detail=f"received={received} expected={expected_size}",
+                )
+            self.verify_manifest(manifest, installer_path=partial)
+            os.replace(partial, target)
+        except (OSError, URLError, ServiceError) as exc:
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if isinstance(exc, ServiceError):
+                raise
             raise ServiceError(
                 ErrorCode.IO_ERROR,
                 "Could not download the update installer.",
                 technical_detail=str(exc),
             ) from exc
-        self.verify_manifest(manifest, installer_path=target)
         return target
 
     def prepare_update_state(self, manifest: dict[str, Any]) -> Path:
@@ -875,11 +932,11 @@ class UpdateService:
             return False
         if signature.get("Status") != 0 and signature.get("Status") != "Valid":
             return False
-        if expected_thumbprint:
-            certificate = signature.get("SignerCertificate") or {}
-            thumbprint = str(certificate.get("Thumbprint", "")).replace(" ", "")
-            return thumbprint.lower() == expected_thumbprint.replace(" ", "").lower()
-        return True
+        if not expected_thumbprint.strip():
+            return False
+        certificate = signature.get("SignerCertificate") or {}
+        thumbprint = str(certificate.get("Thumbprint", "")).replace(" ", "")
+        return thumbprint.lower() == expected_thumbprint.replace(" ", "").lower()
 
     def record_check(self, result: dict[str, Any]) -> None:
         payload = {
@@ -929,17 +986,46 @@ def _resource_path(relative_path: str) -> Path:
     source_candidate = source_root / relative_path
     if source_candidate.exists():
         return source_candidate
-    return Path.cwd() / relative_path
+    raise FileNotFoundError(f"Required application resource is unavailable: {relative_path}")
 
 
 def _compare_versions(left: str, right: str) -> int:
-    def parts(value: str) -> tuple[int, ...]:
-        normalized = value.split("-", 1)[0]
-        return tuple(int(part) for part in normalized.split(".") if part.isdigit())
+    try:
+        left_version = Version(left)
+        right_version = Version(right)
+    except InvalidVersion as exc:
+        raise ValueError(f"Invalid application version: {exc}") from exc
+    return (left_version > right_version) - (left_version < right_version)
 
-    left_parts = parts(left)
-    right_parts = parts(right)
-    width = max(len(left_parts), len(right_parts))
-    left_padded = left_parts + ((0,) * (width - len(left_parts)))
-    right_padded = right_parts + ((0,) * (width - len(right_parts)))
-    return (left_padded > right_padded) - (left_padded < right_padded)
+
+_UPDATE_HOSTS = {
+    "api.github.com",
+    "github.com",
+    "github-releases.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
+
+
+def _validate_update_url(url: str, label: str) -> None:
+    parsed = urlsplit(str(url))
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise ServiceError(
+            ErrorCode.VALIDATION,
+            f"The {label} must use HTTPS.",
+            recoverable=False,
+        )
+    if parsed.username or parsed.password or parsed.hostname.lower() not in _UPDATE_HOSTS:
+        raise ServiceError(
+            ErrorCode.VALIDATION,
+            f"The {label} does not use an approved release host.",
+            technical_detail=parsed.hostname or "missing host",
+            recoverable=False,
+        )
+
+
+def _validate_update_response_url(response: Any, requested_url: str, label: str) -> None:
+    getter = getattr(response, "geturl", None)
+    final_url = str(getter()) if callable(getter) else requested_url
+    _validate_update_url(final_url, label)

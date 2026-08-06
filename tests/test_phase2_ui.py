@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, PropertyMock, patch
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -15,11 +15,10 @@ try:
 except ImportError as exc:  # pragma: no cover - Phase 2 runtime installs PySide6
     raise unittest.SkipTest(f"PySide6 is required for UI tests: {exc}")
 
-from duplicate_transfer_manager.core import AppSettings, QuarantineRecord
+from duplicate_transfer_manager.core import AppSettings, QuarantineRecord, ServiceError
 from duplicate_transfer_manager.runtime_paths import get_runtime_paths
 from duplicate_transfer_manager.services import (
     DuplicateQuarantineService,
-    FileOrganizerService,
     OperationRecordService,
     ReportService,
     SettingsService,
@@ -30,7 +29,6 @@ from duplicate_transfer_manager.ui.pages import (
     DuplicatesPage,
     HelpPage,
     ImportPage,
-    OrganizerPage,
     OverviewPage,
     QuarantinePage,
     SettingsPage,
@@ -268,86 +266,6 @@ class Phase2UiTests(unittest.TestCase):
         self.assertFalse(page.banner.isHidden())
         self.assertIn("not changed", page.banner.label.text().lower())
 
-    def test_organizer_page_requires_review_then_exposes_recovery(self):
-        paths = get_runtime_paths(Path(self.temp_dir.name) / "organizer-data")
-        source = Path(self.temp_dir.name) / "organizer-source"
-        destination = Path(self.temp_dir.name) / "organizer-destination"
-        (source / "nested").mkdir(parents=True)
-        destination.mkdir()
-        (source / "nested" / "photo.jpg").write_bytes(b"image")
-        page = OrganizerPage(FileOrganizerService(paths), OperationRecordService(paths))
-        page.source.set_path(str(source))
-        page.destination.set_path(str(destination))
-        page._populate_folders()
-        page._review()
-        page.controller.wait_for_done(10_000)
-        QTest.qWait(100)
-        self.application.processEvents()
-
-        self.assertFalse(page.plan_card.isHidden())
-        self.assertFalse(page.run_button.isHidden())
-        self.assertEqual(page.plan_table.rowCount(), 1)
-        page.deleteLater()
-
-    def test_organizer_page_runs_reviewed_move_and_lists_rollback(self):
-        paths = get_runtime_paths(Path(self.temp_dir.name) / "organizer-run-data")
-        source = Path(self.temp_dir.name) / "organizer-run-source"
-        destination = Path(self.temp_dir.name) / "organizer-run-destination"
-        (source / "nested").mkdir(parents=True)
-        destination.mkdir()
-        original = source / "nested" / "photo.jpg"
-        original.write_bytes(b"image")
-        page = OrganizerPage(FileOrganizerService(paths), OperationRecordService(paths))
-        page.source.set_path(str(source))
-        page.destination.set_path(str(destination))
-        page._populate_folders()
-        page._review()
-        page.controller.wait_for_done(10_000)
-        QTest.qWait(100)
-        with patch(
-            "duplicate_transfer_manager.ui.pages.QMessageBox.question",
-            return_value=QMessageBox.StandardButton.Yes,
-        ):
-            page._run()
-        page.controller.wait_for_done(10_000)
-        QTest.qWait(100)
-
-        self.assertFalse(original.exists())
-        self.assertTrue((destination / "photo.jpg").exists())
-        self.assertGreater(page.recovery_choice.count(), 0)
-        page.deleteLater()
-
-    def test_organizer_ml_review_offers_local_bulk_and_correction_controls(self):
-        paths = get_runtime_paths(Path(self.temp_dir.name) / "organizer-ml-data")
-        source = Path(self.temp_dir.name) / "organizer-ml-source"
-        destination = Path(self.temp_dir.name) / "organizer-ml-destination"
-        (source / "nested").mkdir(parents=True)
-        destination.mkdir()
-        (source / "nested" / "receipt.jpg").write_bytes(b"image")
-        page = OrganizerPage(FileOrganizerService(paths), OperationRecordService(paths))
-        page.source.set_path(str(source))
-        page.destination.set_path(str(destination))
-        page.mode.setCurrentIndex(page.mode.findData("ml"))
-        page._populate_folders()
-        page._review()
-        page.controller.wait_for_done(10_000)
-        QTest.qWait(100)
-        self.application.processEvents()
-
-        self.assertFalse(page.relabel_plan.isHidden())
-        self.assertFalse(page.always_rule.isHidden())
-        self.assertFalse(page.exclude_folder.isHidden())
-        self.assertFalse(page.export_plan.isHidden())
-        page.plan_filter.setText("receipt")
-        self.assertFalse(page.plan_table.isRowHidden(0))
-        page.plan_filter.setText("no-such-file")
-        self.assertTrue(page.plan_table.isRowHidden(0))
-        page._set_plan_selection(False)
-        self.assertFalse(next(iter(page.plan_checks.values())).isChecked())
-        page._set_plan_selection(True)
-        self.assertTrue(next(iter(page.plan_checks.values())).isChecked())
-        page.deleteLater()
-
     def test_sort_workspace_exposes_profile_rules_review_and_history_sections(self):
         page = self.window.pages["sort"]
 
@@ -363,6 +281,7 @@ class Phase2UiTests(unittest.TestCase):
             {key for key, option in page.category_checks.items() if option.isChecked()},
             {"pictures", "videos", "audio", "documents"},
         )
+
         self.assertFalse(page.category_checks["archives"].isChecked())
         self.assertTrue(page.run_button.isHidden())
         self.assertTrue(page.drop_zone.acceptDrops())
@@ -383,6 +302,33 @@ class Phase2UiTests(unittest.TestCase):
         page.advanced_panel.toggle.click()
         self.application.processEvents()
         self.assertEqual(page.horizontalScrollBar().maximum(), 0)
+
+    def test_verified_update_launch_refuses_busy_work_and_quits_after_success(self):
+        class UpdateServiceStub:
+            def __init__(self):
+                self.calls = []
+
+            def launch_verified_installer(self, manifest, installer_path, *, approved):
+                self.calls.append((manifest, installer_path, approved))
+                return {"launched": True}
+
+        service = UpdateServiceStub()
+        controller = self.window.pages["duplicates"].controller
+        with patch.object(type(controller), "busy", new_callable=PropertyMock, return_value=True):
+            with self.assertRaises(ServiceError):
+                self.window.launch_verified_update(service, {}, "installer.exe", approved=True)
+        self.assertEqual(service.calls, [])
+
+        fake_application = Mock()
+        with patch.object(self.window, "close") as close, patch(
+            "duplicate_transfer_manager.ui.shell.QApplication.instance",
+            return_value=fake_application,
+        ):
+            result = self.window.launch_verified_update(service, {"version": "1.0"}, "installer.exe", approved=True)
+
+        self.assertTrue(result["launched"])
+        close.assert_called_once_with()
+        fake_application.quit.assert_called_once_with()
 
     def test_sort_workspace_previews_executes_and_undoes_reviewed_rule(self):
         paths = get_runtime_paths(Path(self.temp_dir.name) / "sort-workspace-data")

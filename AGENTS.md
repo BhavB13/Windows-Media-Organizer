@@ -43,8 +43,9 @@ Read these before making changes:
 
 ## Validation
 
-- Tests: `python -m pytest -q` (run the smallest relevant subset for changed files,
-  e.g. `python -m pytest tests/test_engine.py -q`)
+- Tests: `.venv\Scripts\python.exe -m unittest discover -s tests` (run the
+  smallest relevant subset for changed files, e.g.
+  `.venv\Scripts\python.exe -m unittest tests.test_engine`)
 - Dev deps: `pip install -r requirements-dev.txt`
 - Build/package artifacts live under `packaging/` (Inno Setup `installer.iss`,
   PyInstaller `duplicate_transfer_manager.spec`)

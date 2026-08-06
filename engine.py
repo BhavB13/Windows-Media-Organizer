@@ -12,6 +12,8 @@ from discovery import discover_files
 from drive_cache import ADBHashCache, DriveHashCache, default_adb_cache_path, default_cache_path
 from models import FileInfo
 from transfer_safety import (
+    APP_PARTIAL_SUFFIX,
+    APP_STAGING_DIRECTORY,
     TransferJournal,
     default_journal_path,
     preflight_transfer,
@@ -22,7 +24,17 @@ from transfer_safety import (
 )
 from utils import ensure_unique_path, is_hidden_or_system, normalize_excludes, normalize_extensions
 
+
+class HashCancelled(RuntimeError):
+    """Raised when a content hash stops before reading the complete file."""
+
+
+def _hash_cancelled(stop_event):
+    return bool(stop_event and stop_event.is_set())
+
 def compute_hash(path, settings, stop_event, hash_cache=None, is_adb=False, logger=None):
+    if _hash_cancelled(stop_event):
+        raise HashCancelled(path)
     if is_adb:
         try:
             digest = ADBBridge.remote_hash(path, settings.hash_algo, serial=getattr(settings, "adb_serial", ""))
@@ -32,6 +44,8 @@ def compute_hash(path, settings, stop_event, hash_cache=None, is_adb=False, logg
             if exc.device_unavailable:
                 raise
             return ""
+        if _hash_cancelled(stop_event):
+            raise HashCancelled(path)
         if not digest and logger:
             logger.log(f"WARNING: Failed to hash ADB file: {path}")
         return digest
@@ -46,13 +60,19 @@ def compute_hash(path, settings, stop_event, hash_cache=None, is_adb=False, logg
                 h.update(str(size).encode()); h.update(f.read(1048576))
                 f.seek(-1048576, 2); h.update(f.read(1048576))
             else:
-                while not stop_event.is_set():
+                while True:
+                    if _hash_cancelled(stop_event):
+                        raise HashCancelled(path)
                     data = f.read(1048576)
                     if not data: break
                     h.update(data)
+        if _hash_cancelled(stop_event):
+            raise HashCancelled(path)
         digest = h.hexdigest()
         if hash_cache: hash_cache.set(path, settings.hash_algo, settings.hash_mode, size, mtime, digest)
         return digest
+    except HashCancelled:
+        raise
     except (OSError, ValueError) as exc:
         if logger:
             logger.log(f"WARNING: Failed to hash file: {path} ({exc})")
@@ -127,6 +147,93 @@ def resolve_conflict_path(path, policy):
     if policy == "skip":
         return ""
     return ensure_unique_path(path)
+
+
+def transfer_staging_path(output_root, target_path, label="partial"):
+    stage_dir = os.path.join(output_root, APP_STAGING_DIRECTORY)
+    os.makedirs(stage_dir, exist_ok=True)
+    token = hashlib.sha256(os.path.abspath(target_path).encode("utf-8", "replace")).hexdigest()
+    filename = os.path.basename(target_path) or "transfer"
+    return os.path.join(stage_dir, f"{token}_{label}_{filename}{APP_PARTIAL_SUFFIX}")
+
+
+def _copy_no_clobber(source, target):
+    """Copy an app-owned staged file without ever replacing an existing target."""
+
+    created = False
+    try:
+        with open(source, "rb") as input_stream, open(target, "xb") as output_stream:
+            created = True
+            shutil.copyfileobj(input_stream, output_stream, 1024 * 1024)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+        shutil.copystat(source, target)
+        os.remove(source)
+    except Exception:
+        if created:
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+        raise
+
+
+def promote_transfer_file(staged_path, target_path, policy, output_root):
+    """Promote staged content while preserving the reviewed conflict policy."""
+
+    policy = policy if policy in {"rename", "skip", "replace"} else "rename"
+    staged_path = os.path.abspath(staged_path)
+    target_path = os.path.abspath(target_path)
+    if policy == "replace":
+        backup = ""
+        if os.path.exists(target_path):
+            backup_root = os.path.join(output_root, ".duplicate_transfer_manager_backups")
+            os.makedirs(backup_root, exist_ok=True)
+            backup = ensure_unique_path(os.path.join(backup_root, os.path.basename(target_path)))
+            os.replace(target_path, backup)
+        try:
+            os.replace(staged_path, target_path)
+        except Exception:
+            if backup and os.path.exists(backup) and not os.path.exists(target_path):
+                os.replace(backup, target_path)
+            raise
+        return target_path, backup
+
+    candidate = target_path
+    while True:
+        try:
+            try:
+                os.link(staged_path, candidate)
+                os.remove(staged_path)
+            except (AttributeError, NotImplementedError):
+                _copy_no_clobber(staged_path, candidate)
+            return candidate, ""
+        except FileExistsError:
+            if policy == "skip":
+                try:
+                    os.remove(staged_path)
+                except OSError:
+                    pass
+                return "", ""
+            candidate = ensure_unique_path(candidate)
+        except OSError as exc:
+            # Some filesystems do not support hard links. Exclusive creation is
+            # still no-clobber, though promotion is no longer atomic to readers.
+            if getattr(exc, "winerror", None) not in {1, 17, 50} and exc.errno not in {
+                getattr(os, "EXDEV", 18), 1, 13, 17, 18, 95,
+            }:
+                raise
+            try:
+                _copy_no_clobber(staged_path, candidate)
+                return candidate, ""
+            except FileExistsError:
+                if policy == "skip":
+                    try:
+                        os.remove(staged_path)
+                    except OSError:
+                        pass
+                    return "", ""
+                candidate = ensure_unique_path(candidate)
 
 def validate_transfer_paths(settings):
     source_root = settings.source_root.strip()
@@ -293,9 +400,58 @@ def group_duplicates(infos, settings, stop_event, hash_cache, logger, progress_c
             try:
                 digest = future.result()
                 if digest: hash_groups.setdefault(digest, []).append(futures[future])
-            except: continue
+            except HashCancelled:
+                break
+            except Exception:
+                continue
 
-    return [group for group in hash_groups.values() if len(group) > 1]
+    candidates = [group for group in hash_groups.values() if len(group) > 1]
+    if getattr(settings, "hash_mode", "full") != "fast" or not candidates or stop_event.is_set():
+        return candidates
+
+    # A sampled digest is only a candidate filter. Destructive duplicate review
+    # must be based on a complete SHA-256 read of every candidate file.
+    full_settings = copy(settings)
+    full_settings.hash_algo = "sha256"
+    full_settings.hash_mode = "full"
+    full_groups = {}
+    candidates_to_hash = [info for group in candidates for info in group]
+    total_candidates = len(candidates_to_hash)
+    if progress_callback:
+        progress_callback(0, total_candidates, "Confirming duplicate candidates with full-content SHA-256...")
+    with ThreadPoolExecutor(max_workers=settings.max_hash_workers) as pool:
+        futures = {
+            pool.submit(
+                compute_hash,
+                info.path,
+                full_settings,
+                stop_event,
+                hash_cache,
+                info.is_adb,
+                logger,
+            ): info
+            for info in candidates_to_hash
+        }
+        confirmed = 0
+        for future in as_completed(futures):
+            if stop_event.is_set():
+                break
+            try:
+                digest = future.result()
+            except HashCancelled:
+                break
+            except Exception:
+                continue
+            confirmed += 1
+            if digest:
+                full_groups.setdefault(digest, []).append(futures[future])
+            if progress_callback:
+                progress_callback(
+                    confirmed,
+                    total_candidates,
+                    "Confirming duplicate candidates with full-content SHA-256...",
+                )
+    return [group for group in full_groups.values() if len(group) > 1]
 
 def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_callback=None):
     settings = normalize_settings(settings)
@@ -428,7 +584,17 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                     f.size,
                     f.created,
                 )
-            h = cached or compute_hash(f.path, compare_scan_settings, stop_event, hash_cache, is_adb=False, logger=logger)
+            try:
+                h = cached or compute_hash(
+                    f.path,
+                    compare_scan_settings,
+                    stop_event,
+                    hash_cache,
+                    is_adb=False,
+                    logger=logger,
+                )
+            except HashCancelled:
+                break
             if h and drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
                 drive_cache.set_file_hash(
                     f.path,
@@ -484,6 +650,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         filename = os.path.basename(f.path)
         bytes_before = source_byte_offsets[i]
         staged_path = ""
+        partial_path = ""
         if journal and journal.is_complete(f.path, f.size):
             resumed += 1
             if resumed == 1 or resumed % 100 == 0:
@@ -510,7 +677,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                 )
                 if single_read_import:
                     stage_key = hashlib.sha256(f.path.encode("utf-8")).hexdigest()
-                    stage_dir = os.path.join(output_root, ".duplicate_transfer_manager_staging")
+                    stage_dir = os.path.join(output_root, APP_STAGING_DIRECTORY)
                     staged_path = os.path.join(stage_dir, f"{stage_key}_{filename}")
                     pull_with_retries(
                         f.path,
@@ -525,6 +692,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                         reconnect_timeout=getattr(settings, "reconnect_timeout", 300),
                         stall_timeout=getattr(settings, "stall_timeout", 180),
                         stop_event=stop_event,
+                        partial_path=f"{staged_path}{APP_PARTIAL_SUFFIX}",
                     )
                     h = compute_hash(staged_path, hash_settings, stop_event, hash_cache, False, logger)
                     if i == 0 or (i + 1) % 25 == 0:
@@ -534,6 +702,14 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                         )
                 else:
                     h = compute_hash(f.path, hash_settings, stop_event, hash_cache, f.is_adb, logger)
+            except HashCancelled:
+                if journal:
+                    journal.fail(
+                        f.path,
+                        "Hashing cancelled",
+                        partial_path or (f"{staged_path}{APP_PARTIAL_SUFFIX}" if staged_path else ""),
+                    )
+                break
             except ADBOperationError:
                 transfer_errors += 1
                 adb_device_failed = True
@@ -548,7 +724,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                 transfer_errors += 1
                 failures.append({"source": f.path, "error": str(exc)})
                 if journal:
-                    journal.fail(f.path, exc)
+                    journal.fail(f.path, exc, partial_path or (f"{staged_path}{APP_PARTIAL_SUFFIX}" if staged_path else ""))
                 logger.log(f"WARNING: Single-read import staging failed: {f.path} ({exc})")
                 continue
             if (
@@ -618,19 +794,24 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                 destination_template=getattr(settings, "destination_template", "preserve"),
                 source_timestamp=f.created,
             )
-            target_path = resolve_conflict_path(target_path, getattr(settings, "conflict_policy", "rename"))
+            conflict_policy = getattr(settings, "conflict_policy", "rename")
+            target_path = resolve_conflict_path(target_path, conflict_policy)
             if not target_path:
                 skipped += 1
                 logger.log(f"SKIPPED existing target due to conflict policy: {f.path}")
                 continue
             if not settings.dry_run:
+                replaced_backup = ""
                 try:
                     if f.is_adb:
                         if staged_path:
                             os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                            os.replace(staged_path, target_path)
+                            target_path, replaced_backup = promote_transfer_file(
+                                staged_path, target_path, conflict_policy, output_root
+                            )
                         else:
-                            pull_with_retries(
+                            partial_path = transfer_staging_path(output_root, target_path, "adb")
+                            pulled_path = pull_with_retries(
                                 f.path,
                                 target_path,
                                 serial=getattr(settings, "adb_serial", ""),
@@ -643,28 +824,57 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                                 reconnect_timeout=getattr(settings, "reconnect_timeout", 300),
                                 stall_timeout=getattr(settings, "stall_timeout", 180),
                                 stop_event=stop_event,
+                                partial_path=partial_path,
+                                promote=False,
                             )
+                            target_path, replaced_backup = promote_transfer_file(
+                                pulled_path, target_path, conflict_policy, output_root
+                            )
+                            partial_path = ""
+                        if not target_path:
+                            skipped += 1
+                            logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")
+                            continue
+                        if not staged_path:
                             verified_hash = compute_hash(
                                 target_path, hash_settings, stop_event, hash_cache, False, logger
                             )
                             if verified_hash != h:
-                                failed_path = f"{target_path}.partial"
+                                failed_path = transfer_staging_path(output_root, target_path, "failed")
                                 os.replace(target_path, failed_path)
+                                partial_path = failed_path
                                 raise OSError(f"Post-transfer hash verification failed; retained as {failed_path}")
                     else:
-                        partial_path = f"{target_path}.partial"
+                        partial_path = transfer_staging_path(output_root, target_path, "local")
                         shutil.copy2(f.path, partial_path)
-                        os.replace(partial_path, target_path)
+                        target_path, replaced_backup = promote_transfer_file(
+                            partial_path, target_path, conflict_policy, output_root
+                        )
+                        partial_path = ""
+                        if not target_path:
+                            skipped += 1
+                            logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")
+                            continue
                         if os.path.getsize(target_path) != f.size:
-                            failed_path = f"{target_path}.partial"
+                            failed_path = transfer_staging_path(output_root, target_path, "failed")
                             os.replace(target_path, failed_path)
+                            partial_path = failed_path
                             raise OSError(f"Post-transfer size verification failed; retained as {failed_path}")
+                except HashCancelled:
+                    if target_path and os.path.exists(target_path):
+                        partial_path = transfer_staging_path(output_root, target_path, "cancelled")
+                        os.replace(target_path, partial_path)
+                        if replaced_backup and os.path.exists(replaced_backup):
+                            os.replace(replaced_backup, target_path)
+                    if journal:
+                        journal.fail(f.path, "Verification cancelled", partial_path)
+                    break
                 except (OSError, shutil.Error, subprocess.CalledProcessError, ADBOperationError) as exc:
                     logger.log(f"WARNING: Failed to copy file: {f.path} -> {target_path} ({exc})")
                     transfer_errors += 1
                     failures.append({"source": f.path, "target": target_path, "error": str(exc)})
                     if journal:
-                        journal.fail(f.path, exc)
+                        journal.fail(f.path, exc, partial_path)
                     if isinstance(exc, ADBOperationError) and exc.device_unavailable:
                         adb_device_failed = True
                         logger.log(
@@ -676,7 +886,15 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                         break
                     continue
                 if journal:
-                    journal.complete(f.path, target_path, f.size, h)
+                    journal.complete(
+                        f.path,
+                        target_path,
+                        f.size,
+                        h,
+                        replaced_backup,
+                        hash_settings.hash_algo,
+                        hash_settings.hash_mode,
+                    )
                 if h and drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run and os.path.exists(target_path):
                     try:
                         drive_cache.set_file_hash(
@@ -762,7 +980,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
             logger.log("Transfer resume journal checkpoint completed.")
         except OSError as exc:
             logger.log(f"WARNING: Failed to finalize transfer journal: {exc}")
-    staging_dir = os.path.join(output_root, ".duplicate_transfer_manager_staging")
+    staging_dir = os.path.join(output_root, APP_STAGING_DIRECTORY)
     try:
         os.rmdir(staging_dir)
     except OSError:

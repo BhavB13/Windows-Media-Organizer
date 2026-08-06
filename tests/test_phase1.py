@@ -199,7 +199,7 @@ class ServiceTests(unittest.TestCase):
             max_hash_workers=1,
         )
         with self.assertRaises(RuntimeError):
-            DuplicateScanService(HashCache("unused.json")).run(
+            DuplicateScanService(HashCache(os.devnull)).run(
                 settings,
                 token,
                 OperationReporter(),
@@ -242,7 +242,7 @@ class ServiceTests(unittest.TestCase):
                 "duplicate_transfer_manager.services.transfer_service.execute_smart_transfer",
                 return_value=raw,
             ):
-                result = TransferService(HashCache("unused.json")).run(
+                result = TransferService(HashCache(os.devnull)).run(
                     settings,
                     CancellationToken(),
                     OperationReporter(),
@@ -388,8 +388,8 @@ class ControllerTests(unittest.TestCase):
 
     def test_all_required_controller_types_expose_operation_signals(self):
         controllers = [
-            DuplicateScanController(HashCache("unused.json")),
-            TransferController(HashCache("unused.json")),
+            DuplicateScanController(HashCache(os.devnull)),
+            TransferController(HashCache(os.devnull)),
             DeviceController(),
             ReportsController(),
             QuarantineController(),

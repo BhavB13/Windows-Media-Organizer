@@ -17,17 +17,22 @@ from discovery import (
 )
 from drive_cache import ADBHashCache, DriveHashCache, build_drive_cache
 from engine import (
+    HashCancelled,
     build_compare_scan_settings,
     build_transfer_hash_settings,
     build_relative_path,
     build_target_path,
     execute_smart_transfer,
+    compute_hash,
+    group_duplicates,
+    promote_transfer_file,
     iter_files,
     validate_transfer_paths,
     validate_scan_paths,
 )
 from models import FileInfo, Settings, TransferSettings
 from utils import HashCache
+from transfer_safety import TransferJournal
 
 
 class DummyLogger:
@@ -39,6 +44,107 @@ class DummyLogger:
 
 
 class EngineTests(unittest.TestCase):
+    def test_transfer_journal_rejects_same_size_changed_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "target.bin")
+            with open(target, "wb") as handle:
+                handle.write(b"original")
+            journal = TransferJournal(os.path.join(temp_dir, "journal.json"))
+            digest = hashlib.sha256(b"original").hexdigest()
+            journal.complete("source", target, 8, digest, hash_algo="sha256", hash_mode="full")
+            self.assertTrue(journal.is_complete("source", 8))
+
+            with open(target, "wb") as handle:
+                handle.write(b"modified")
+            self.assertFalse(journal.is_complete("source", 8))
+
+    def test_rename_promotion_does_not_clobber_target_created_after_resolution(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            staged = os.path.join(root, "staged.dtm-partial")
+            target = os.path.join(root, "photo.jpg")
+            with open(staged, "wb") as handle:
+                handle.write(b"incoming")
+            # This occupant appears after planning selected `target`.
+            with open(target, "wb") as handle:
+                handle.write(b"incumbent")
+
+            promoted, backup = promote_transfer_file(staged, target, "rename", root)
+
+            self.assertEqual(backup, "")
+            with open(target, "rb") as handle:
+                self.assertEqual(handle.read(), b"incumbent")
+            self.assertNotEqual(promoted, target)
+            with open(promoted, "rb") as handle:
+                self.assertEqual(handle.read(), b"incoming")
+
+    def test_fast_duplicate_candidates_are_confirmed_with_full_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            first = os.path.join(root, "first.bin")
+            second = os.path.join(root, "second.bin")
+            shared_start = b"A" * 1048576
+            shared_end = b"Z" * 1048576
+            with open(first, "wb") as handle:
+                handle.write(shared_start + (b"B" * 1048576) + shared_end)
+            with open(second, "wb") as handle:
+                handle.write(shared_start + (b"C" * 1048576) + shared_end)
+            settings = Settings(
+                scan_root=root, output_root="", criteria="hash", hash_algo="sha256",
+                hash_mode="fast", only_media=False, extensions=[], min_size_kb=0,
+                exclude_dirs=[], skip_hidden_system=True, dry_run=True,
+                preserve_structure=True, max_hash_workers=2,
+            )
+            infos = [
+                FileInfo(first, os.path.getsize(first), os.path.getmtime(first)),
+                FileInfo(second, os.path.getsize(second), os.path.getmtime(second)),
+            ]
+
+            groups = group_duplicates(
+                infos, settings, threading.Event(), HashCache(os.path.join(root, "cache.json")), DummyLogger()
+            )
+
+            self.assertEqual(groups, [])
+
+            with open(second, "wb") as handle:
+                handle.write(shared_start + (b"B" * 1048576) + shared_end)
+            infos[1] = FileInfo(second, os.path.getsize(second), os.path.getmtime(second))
+            groups = group_duplicates(
+                infos, settings, threading.Event(), HashCache(os.path.join(root, "cache2.json")), DummyLogger()
+            )
+            self.assertEqual(len(groups), 1)
+            self.assertEqual({item.path for item in groups[0]}, {first, second})
+
+    def test_cancelled_hash_is_not_cached_and_later_run_hashes_complete_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "large.bin")
+            payload = (b"0123456789abcdef" * 262144)
+            with open(path, "wb") as handle:
+                handle.write(payload)
+            settings = Settings(
+                scan_root=temp_dir, output_root="", criteria="hash", hash_algo="sha256",
+                hash_mode="full", only_media=False, extensions=[], min_size_kb=0,
+                exclude_dirs=[], skip_hidden_system=True, dry_run=True,
+                preserve_structure=True, max_hash_workers=1,
+            )
+            cache = HashCache(os.path.join(temp_dir, "cache.json"))
+
+            class CancelDuringRead:
+                def __init__(self):
+                    self.calls = 0
+
+                def is_set(self):
+                    self.calls += 1
+                    return self.calls >= 5
+
+            with self.assertRaises(HashCancelled):
+                compute_hash(path, settings, CancelDuringRead(), cache)
+            self.assertEqual(cache.data, {})
+
+            digest = compute_hash(path, settings, threading.Event(), cache)
+            self.assertEqual(digest, hashlib.sha256(payload).hexdigest())
+            self.assertEqual(len(cache.data), 1)
+
     def test_adb_cache_is_device_scoped_and_normalizes_storage_aliases(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = ADBHashCache(os.path.join(temp_dir, "adb.json"), "phone-123")

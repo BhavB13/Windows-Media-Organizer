@@ -13,6 +13,8 @@ from runtime_paths import get_runtime_paths
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 ES_AWAYMODE_REQUIRED = 0x00000040
+APP_STAGING_DIRECTORY = ".duplicate_transfer_manager_staging"
+APP_PARTIAL_SUFFIX = ".dtm-partial"
 
 
 def prevent_windows_sleep():
@@ -65,17 +67,34 @@ class TransferJournal:
         self._dirty_entries = 0
         self._last_save = time.monotonic()
 
-    def complete(self, source, target, size, digest):
+    def complete(
+        self,
+        source,
+        target,
+        size,
+        digest,
+        replaced_backup="",
+        hash_algo="",
+        hash_mode="",
+    ):
         self.data["completed"][source] = {
             "target": target, "size": size, "hash": digest, "completed_at": time.time()
         }
+        if replaced_backup:
+            self.data["completed"][source]["replaced_backup"] = replaced_backup
+        if hash_algo:
+            self.data["completed"][source]["hash_algo"] = hash_algo
+        if hash_mode:
+            self.data["completed"][source]["hash_mode"] = hash_mode
         self.data["failures"].pop(source, None)
         self._dirty_entries += 1
         self.save()
 
-    def fail(self, source, error):
+    def fail(self, source, error, partial_path=""):
         entry = self.data["failures"].setdefault(source, {"attempts": 0})
         entry.update({"attempts": entry["attempts"] + 1, "error": str(error), "updated_at": time.time()})
+        if partial_path:
+            entry["partial_path"] = os.path.abspath(partial_path)
         self._dirty_entries += 1
         self.save()
 
@@ -85,9 +104,39 @@ class TransferJournal:
             return False
         target = entry.get("target", "") if entry else ""
         try:
-            return entry.get("size") == size and os.path.getsize(target) == size
-        except OSError:
+            if entry.get("size") != size or os.path.getsize(target) != size:
+                return False
+            expected = str(entry.get("hash", ""))
+            if not expected:
+                return False
+            algorithm = str(entry.get("hash_algo", "")) or _infer_hash_algorithm(expected)
+            mode = str(entry.get("hash_mode", "full"))
+            return _hash_local_file(target, algorithm, mode) == expected
+        except (OSError, ValueError):
             return False
+
+
+def _infer_hash_algorithm(digest):
+    algorithms = {32: "md5", 40: "sha1", 64: "sha256", 128: "sha512"}
+    algorithm = algorithms.get(len(str(digest)))
+    if not algorithm:
+        raise ValueError("Unsupported journal digest length")
+    return algorithm
+
+
+def _hash_local_file(path, algorithm, mode):
+    digest = hashlib.new(algorithm)
+    size = os.path.getsize(path)
+    with open(path, "rb") as stream:
+        if mode == "fast" and size > 2097152:
+            digest.update(str(size).encode())
+            digest.update(stream.read(1048576))
+            stream.seek(-1048576, 2)
+            digest.update(stream.read(1048576))
+        else:
+            for chunk in iter(lambda: stream.read(1048576), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def default_journal_path(output_root, serial="local"):
@@ -136,9 +185,12 @@ def pull_with_retries(
     reconnect_timeout=300,
     stall_timeout=180,
     stop_event=None,
+    partial_path="",
+    promote=True,
 ):
-    partial = f"{target}.partial"
+    partial = partial_path or f"{target}{APP_PARTIAL_SUFFIX}"
     os.makedirs(os.path.dirname(target), exist_ok=True)
+    os.makedirs(os.path.dirname(partial), exist_ok=True)
     last_error = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
@@ -181,8 +233,10 @@ def pull_with_retries(
                     else None
                 ),
             )
-            os.replace(partial, target)
-            return target
+            if promote:
+                os.replace(partial, target)
+                return target
+            return partial
         except (OSError, ADBOperationError) as exc:
             last_error = exc
             if logger:
@@ -201,18 +255,46 @@ def pull_with_retries(
 
 
 def cleanup_partial_files(root, dry_run=False):
-    removed = []
-    for current_root, _, files in os.walk(root):
-        for filename in files:
-            if not filename.endswith(".partial"):
+    root = os.path.abspath(root)
+    owned = set()
+    staging_root = os.path.join(root, APP_STAGING_DIRECTORY)
+    if os.path.isdir(staging_root):
+        for current_root, _, files in os.walk(staging_root):
+            for filename in files:
+                owned.add(os.path.abspath(os.path.join(current_root, filename)))
+
+    # Version-1 journals remain readable; newer failure entries may additionally
+    # identify an app-owned partial path. Never infer ownership from a suffix.
+    for journal_path in get_runtime_paths().journals.glob("*.json"):
+        try:
+            with journal_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        failures = payload.get("failures", {}) if isinstance(payload, dict) else {}
+        for entry in failures.values() if isinstance(failures, dict) else ():
+            if not isinstance(entry, dict):
                 continue
-            path = os.path.join(current_root, filename)
+            partial = str(entry.get("partial_path", "")).strip()
+            if not partial:
+                continue
+            candidate = os.path.abspath(partial)
             try:
-                if not dry_run:
-                    os.remove(path)
-                removed.append(path)
-            except OSError:
-                pass
+                if os.path.commonpath([root, candidate]) == root:
+                    owned.add(candidate)
+            except (OSError, ValueError):
+                continue
+
+    removed = []
+    for path in sorted(owned):
+        try:
+            if not os.path.isfile(path):
+                continue
+            if not dry_run:
+                os.remove(path)
+            removed.append(path)
+        except OSError:
+            pass
     return removed
 
 

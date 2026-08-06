@@ -6,10 +6,12 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+from uuid import uuid4
 
 try:
     from PIL import Image, UnidentifiedImageError
@@ -23,8 +25,9 @@ from adb_bridge import ADBBridge
 from models import FileInfo
 from utils import ensure_unique_path
 
-from ..core import QuarantineRecord
+from ..core import ErrorCode, QuarantineRecord, ServiceError
 from ..runtime_paths import RuntimePaths, get_runtime_paths
+from .support_services import _atomic_json_write
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
@@ -261,12 +264,34 @@ class DuplicateQuarantineService:
         dry_run: bool = False,
     ) -> QuarantineResult:
         selected = set(selected_ids)
-        operation = operation_id or f"duplicate_{_utc_stamp()}"
-        operation_root = self.paths.quarantine / operation
-        operation_root.mkdir(parents=True, exist_ok=True)
+        operation = operation_id or f"duplicate_{_utc_stamp()}_{uuid4().hex}"
+        operation_path = Path(operation)
+        if (
+            not operation
+            or operation_path.is_absolute()
+            or operation_path.name != operation
+            or operation in {".", ".."}
+        ):
+            raise ServiceError(ErrorCode.VALIDATION, "Choose a valid quarantine operation ID.")
+        quarantine_root = self.paths.quarantine.resolve()
+        operation_root = (quarantine_root / operation).resolve()
+        try:
+            operation_root.relative_to(quarantine_root)
+        except ValueError as exc:
+            raise ServiceError(ErrorCode.VALIDATION, "Quarantine operation path escaped app storage.") from exc
+        try:
+            operation_root.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as exc:
+            raise ServiceError(
+                ErrorCode.VALIDATION,
+                "A quarantine operation with this ID already exists.",
+                technical_detail=str(operation_root),
+            ) from exc
         records: list[QuarantineRecord] = []
         failures: list[str] = []
 
+        planned: list[tuple[DuplicateItem, str, dict]] = []
+        manifest_records: list[dict] = []
         for group in review.groups:
             for item in group.items:
                 if item.id not in selected:
@@ -276,32 +301,50 @@ class DuplicateQuarantineService:
                 if suffix and not target_name.endswith(suffix):
                     target_name = f"{target_name}{suffix}"
                 stored_path = operation_root / target_name
-                try:
-                    if dry_run:
-                        if not item.is_adb and not Path(item.path).exists():
-                            raise FileNotFoundError(item.path)
-                    elif item.is_adb:
-                        ADBBridge.pull(item.path, str(stored_path), serial=adb_serial or None)
-                    else:
-                        if not Path(item.path).exists():
-                            raise FileNotFoundError(item.path)
-                        shutil.move(item.path, stored_path)
-                    records.append(
-                        QuarantineRecord(
-                            original_path=item.path,
-                            stored_path=str(stored_path),
-                            hash=group.hash,
-                            size=item.size,
-                            reason="duplicate",
-                            operation_id=operation,
-                            source_is_adb=item.is_adb,
-                            device_serial=adb_serial if item.is_adb else "",
-                        )
-                    )
-                except Exception as exc:  # noqa: BLE001 - item-level recoverable failure
-                    failures.append(f"{item.path}: {exc}")
+                record = QuarantineRecord(
+                    original_path=item.path,
+                    stored_path=str(stored_path),
+                    hash=group.hash,
+                    size=item.size,
+                    reason="duplicate",
+                    operation_id=operation,
+                    source_is_adb=item.is_adb,
+                    device_serial=adb_serial if item.is_adb else "",
+                )
+                value = record.to_dict()
+                value["status"] = "pending"
+                manifest_records.append(value)
+                planned.append((item, str(stored_path), value))
 
-        manifest_path = self._write_manifest(operation, records, failures, dry_run=dry_run)
+        manifest_path = self._write_manifest(
+            operation,
+            manifest_records,
+            failures,
+            dry_run=dry_run,
+        )
+
+        for item, stored_path_text, manifest_record in planned:
+            stored_path = Path(stored_path_text)
+            try:
+                if dry_run:
+                    if not item.is_adb and not Path(item.path).exists():
+                        raise FileNotFoundError(item.path)
+                    manifest_record["status"] = "previewed"
+                elif item.is_adb:
+                    ADBBridge.pull(item.path, str(stored_path), serial=adb_serial or None)
+                    manifest_record["status"] = "completed"
+                else:
+                    if not Path(item.path).exists():
+                        raise FileNotFoundError(item.path)
+                    shutil.move(item.path, stored_path)
+                    manifest_record["status"] = "completed"
+                records.append(QuarantineRecord.from_dict(manifest_record))
+            except Exception as exc:  # noqa: BLE001 - item-level recoverable failure
+                manifest_record["status"] = "failed"
+                manifest_record["error"] = str(exc)
+                failures.append(f"{item.path}: {exc}")
+            self._write_manifest(operation, manifest_records, failures, dry_run=dry_run)
+
         return QuarantineResult(
             operation_id=operation,
             manifest_path=str(manifest_path),
@@ -333,16 +376,44 @@ class DuplicateQuarantineService:
             return RestoreResult(skipped=(str(target),), dry_run=dry_run)
         if dry_run:
             return RestoreResult(restored=(str(resolved),), dry_run=True)
+        backup = None
+        temporary = None
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
             if conflict_policy == "replace" and resolved.exists():
                 if resolved.is_dir():
                     return RestoreResult(failures=(f"{resolved}: cannot replace a folder with a file.",))
-                resolved.unlink()
-            shutil.move(str(source), str(resolved))
+                backup_dir = self.paths.quarantine / record.operation_id / "restore_backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                backup = Path(ensure_unique_path(str(backup_dir / _safe_token(str(resolved)))))
+                shutil.copy2(resolved, backup)
+                if _sha256_path(backup) != _sha256_path(resolved):
+                    raise OSError("Existing restore target backup verification failed.")
+
+            handle, temporary_name = tempfile.mkstemp(
+                prefix=f".{resolved.name}.",
+                suffix=".dtm-restore",
+                dir=resolved.parent,
+            )
+            os.close(handle)
+            os.remove(temporary_name)
+            temporary = Path(temporary_name)
+            expected = _sha256_path(source)
+            shutil.move(str(source), str(temporary))
+            if _sha256_path(temporary) != expected:
+                raise OSError("Quarantined file changed while it was being restored.")
+            os.replace(temporary, resolved)
+            temporary = None
             self._mark_restored(record, str(resolved))
+            if backup is not None:
+                backup.unlink(missing_ok=True)
             return RestoreResult(restored=(str(resolved),), dry_run=dry_run)
         except OSError as exc:
+            if temporary is not None and temporary.exists() and not source.exists():
+                try:
+                    shutil.move(str(temporary), str(source))
+                except OSError:
+                    pass
             return RestoreResult(failures=(f"{target}: {exc}",), dry_run=dry_run)
 
     def restore_operation(
@@ -378,20 +449,29 @@ class DuplicateQuarantineService:
 
     def list_records(self) -> list[QuarantineRecord]:
         records: list[QuarantineRecord] = []
+        unreadable: list[str] = []
         for manifest in sorted(self.paths.quarantine.glob("*/manifest.json")):
             try:
                 payload = json.loads(manifest.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError) as exc:
+                unreadable.append(f"{manifest}: {exc}")
                 continue
             for value in payload.get("records", []):
                 if isinstance(value, dict):
                     records.append(QuarantineRecord.from_dict(value))
+        if unreadable:
+            raise ServiceError(
+                ErrorCode.INVALID_DATA,
+                "One or more quarantine manifests could not be read. No recovery records were discarded.",
+                technical_detail="\n".join(unreadable),
+                recoverable=False,
+            )
         return records
 
     def _write_manifest(
         self,
         operation_id: str,
-        records: list[QuarantineRecord],
+        records: list[QuarantineRecord | dict],
         failures: list[str],
         *,
         dry_run: bool = False,
@@ -403,11 +483,11 @@ class DuplicateQuarantineService:
             "operation_id": operation_id,
             "created_at": _iso_now(),
             "dry_run": dry_run,
-            "records": [record.to_dict() for record in records],
+            "records": [record.to_dict() if isinstance(record, QuarantineRecord) else dict(record) for record in records],
             "failures": failures,
             "safety": "Files are moved into app quarantine or copied from Android; no permanent deletion is performed.",
         }
-        manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        _atomic_json_write(manifest, payload)
         return manifest
 
     def _mark_restored(self, record: QuarantineRecord, restored_path: str) -> None:
@@ -422,7 +502,7 @@ class DuplicateQuarantineService:
             if value.get("stored_path") == record.stored_path:
                 value["restored_path"] = restored_path
                 value["restored_at"] = _iso_now()
-        manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        _atomic_json_write(manifest, payload)
 
     @staticmethod
     def _resolve_restore_path(target: Path, policy: str) -> Path | None:
@@ -453,3 +533,11 @@ def duplicate_review_to_dict(review: DuplicateReview) -> dict:
         "recoverable_size": review.recoverable_size,
         "warnings": list(review.warnings),
     }
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

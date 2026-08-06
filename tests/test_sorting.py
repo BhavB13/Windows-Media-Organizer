@@ -136,6 +136,11 @@ class SortingProfileStoreTests(unittest.TestCase):
             self.assertEqual(len(created), 1)
             self.assertEqual(repeated, [])
             self.assertEqual(created[0].associations[0].conflict_policy, ConflictPolicy.OVERWRITE)
+            migrated_plan = SortPlanner(store.paths).build(
+                created[0],
+                [metadata(str(Path(temp_dir) / "photo.jpg"), media_type="image")],
+            )
+            self.assertEqual(Path(migrated_plan.items[0].destination).parent.name, "Image")
 
 
 class QuickSortPresetTests(unittest.TestCase):
@@ -599,6 +604,21 @@ class SortExecutorTests(unittest.TestCase):
             self.assertTrue(source.exists())
             self.assertFalse(destination.exists())
 
+    def test_cross_volume_rename_is_included_in_space_preflight(self):
+        item = SortPlanItem(
+            metadata("C:/source/file.bin", size=4096),
+            "rule",
+            SortAction.RENAME,
+            "D:/destination/file.bin",
+            ConflictPolicy.RENAME,
+            1.0,
+            "cross-volume rename",
+        )
+        usage = type("Usage", (), {"free": 0})()
+        with patch("duplicate_transfer_manager.sorting.executor.shutil.disk_usage", return_value=usage):
+            with self.assertRaises(ServiceError):
+                SortExecutor._validate_space([item])
+
     def test_verification_failure_restores_moved_source_without_partial_loss(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths, source, destination, plan = self._plan(Path(temp_dir), SortAction.MOVE)
@@ -628,6 +648,23 @@ class SortExecutorTests(unittest.TestCase):
 
             self.assertEqual(undo.failed, 1)
             self.assertFalse(source.exists())
+            self.assertTrue(destination.exists())
+
+    def test_overwrite_undo_failure_preserves_incumbent_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths, source, destination, plan = self._plan(Path(temp_dir), SortAction.MOVE)
+            executor = SortExecutor(paths)
+            result = executor.execute(plan, approved_sources=[str(source)], confirmed=True)
+            source.write_bytes(b"incumbent")
+
+            with patch(
+                "duplicate_transfer_manager.sorting.executor.shutil.move",
+                side_effect=OSError("forced undo failure"),
+            ):
+                undo = executor.undo(result.run_id, conflict_policy=ConflictPolicy.OVERWRITE)
+
+            self.assertEqual(undo.failed, 1)
+            self.assertEqual(source.read_bytes(), b"incumbent")
             self.assertTrue(destination.exists())
 
     def test_history_retention_removes_only_expired_app_owned_run_data(self):

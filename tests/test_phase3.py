@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from duplicate_transfer_manager.runtime_paths import get_runtime_paths
+from duplicate_transfer_manager.core import ServiceError
 from duplicate_transfer_manager.services import (
     DuplicateQuarantineService,
     build_duplicate_review,
@@ -14,6 +15,103 @@ from models import FileInfo
 
 
 class Phase3DuplicateWorkflowTests(unittest.TestCase):
+    def test_quarantine_operation_ids_are_unique_and_reject_unsafe_or_existing_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            keep = root / "keep.bin"
+            duplicate = root / "duplicate.bin"
+            keep.write_bytes(b"same")
+            duplicate.write_bytes(b"same")
+            paths = get_runtime_paths(root / "data")
+            review = build_duplicate_review(
+                [[FileInfo(str(keep), 4, 100), FileInfo(str(duplicate), 4, 200)]],
+                thumbnail_root=root / "thumbs",
+            )
+            service = DuplicateQuarantineService(paths)
+
+            first = service.quarantine(review, review.groups[0].selected_item_ids, dry_run=True)
+            second = service.quarantine(review, review.groups[0].selected_item_ids, dry_run=True)
+            self.assertNotEqual(first.operation_id, second.operation_id)
+
+            for unsafe in ("../escape", "nested/name", str(root / "absolute")):
+                with self.assertRaises(ServiceError):
+                    service.quarantine(review, review.groups[0].selected_item_ids, operation_id=unsafe, dry_run=True)
+            with self.assertRaises(ServiceError):
+                service.quarantine(review, review.groups[0].selected_item_ids, operation_id=first.operation_id, dry_run=True)
+    def test_replace_restore_failure_preserves_incumbent_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            duplicate = root / "duplicate.bin"
+            keep = root / "keep.bin"
+            duplicate.write_bytes(b"quarantined")
+            keep.write_bytes(b"quarantined")
+            paths = get_runtime_paths(root / "data")
+            review = build_duplicate_review(
+                [[FileInfo(str(keep), keep.stat().st_size, 100), FileInfo(str(duplicate), duplicate.stat().st_size, 200)]],
+                thumbnail_root=root / "thumbs",
+            )
+            service = DuplicateQuarantineService(paths)
+            result = service.quarantine(review, review.groups[0].selected_item_ids, operation_id="op-replace-failure")
+            duplicate.write_bytes(b"incumbent")
+
+            with patch(
+                "duplicate_transfer_manager.services.duplicate_workflow.shutil.move",
+                side_effect=OSError("forced restore failure"),
+            ):
+                restored = service.restore_record(result.records[0], conflict_policy="replace")
+
+            self.assertEqual(len(restored.failures), 1)
+            self.assertEqual(duplicate.read_bytes(), b"incumbent")
+            self.assertTrue(Path(result.records[0].stored_path).exists())
+
+    def test_quarantine_initial_manifest_survives_interrupted_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            keep = root / "keep.bin"
+            first = root / "first.bin"
+            second = root / "second.bin"
+            for path in (keep, first, second):
+                path.write_bytes(b"same")
+            paths = get_runtime_paths(root / "data")
+            review = build_duplicate_review(
+                [[
+                    FileInfo(str(keep), 4, 100),
+                    FileInfo(str(first), 4, 200),
+                    FileInfo(str(second), 4, 300),
+                ]],
+                thumbnail_root=root / "thumbs",
+            )
+            service = DuplicateQuarantineService(paths)
+            original_write = service._write_manifest
+            calls = 0
+
+            def interrupt_checkpoint(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("simulated crash")
+                return original_write(*args, **kwargs)
+
+            with patch.object(service, "_write_manifest", side_effect=interrupt_checkpoint):
+                with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                    service.quarantine(review, review.groups[0].selected_item_ids, operation_id="op-interrupted")
+
+            records = service.list_records()
+            moved = next(record for record in records if Path(record.stored_path).is_file())
+            self.assertEqual(moved.operation_id, "op-interrupted")
+            restored = service.restore_record(moved)
+            self.assertEqual(len(restored.restored), 1)
+
+    def test_truncated_quarantine_manifest_is_reported(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = get_runtime_paths(Path(temp_dir) / "data")
+            operation = paths.quarantine / "op-truncated"
+            operation.mkdir(parents=True)
+            (operation / "manifest.json").write_text('{"records": [', encoding="utf-8")
+
+            with self.assertRaises(ServiceError):
+                DuplicateQuarantineService(paths).list_records()
+
     def test_review_defaults_to_keeping_oldest_and_estimates_recoverable_size(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

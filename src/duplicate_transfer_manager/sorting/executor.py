@@ -197,6 +197,8 @@ class SortExecutor:
         journal = self.load_run(run_id)
         failures: list[str] = []
         completed = skipped = 0
+        transaction_backups: list[Path] = []
+        run_root = journal_path.parent
         for record in reversed(journal.get("records", [])):
             if record.get("status") != "completed" or record.get("undone_at"):
                 continue
@@ -220,8 +222,14 @@ class SortExecutor:
                         skipped += 1
                         continue
                     if not dry_run:
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(destination), str(target))
+                        backup = self._restore_for_undo(
+                            destination,
+                            target,
+                            str(record.get("fingerprint", "")),
+                            run_root,
+                        )
+                        if backup is not None:
+                            transaction_backups.append(backup)
                 elif action == SortAction.RECYCLE:
                     skipped += 1
                     continue
@@ -240,6 +248,9 @@ class SortExecutor:
             journal["status"] = "undone_with_errors" if failures else "undone"
             journal["updated_at"] = _now()
             self._write_journal(journal_path, journal)
+            if not failures:
+                for backup in transaction_backups:
+                    backup.unlink(missing_ok=True)
         return SortExecutionResult(run_id, "preview" if dry_run else journal.get("status", "undone"), str(journal_path), completed, skipped, len(failures), completed, failures=tuple(failures), undo_available=False)
 
     def list_runs(self) -> list[dict]:
@@ -369,7 +380,7 @@ class SortExecutor:
     def _validate_space(items: list[SortPlanItem]) -> None:
         required_by_root: dict[Path, int] = {}
         for item in items:
-            if not item.destination or item.action in {SortAction.IGNORE, SortAction.RECYCLE, SortAction.RENAME}:
+            if not item.destination or item.action in {SortAction.IGNORE, SortAction.RECYCLE}:
                 continue
             source = Path(item.metadata.path)
             destination = Path(item.destination)
@@ -443,6 +454,45 @@ class SortExecutor:
         if expected and self._fingerprint(path) != expected:
             raise OSError("File verification failed after sorting.")
 
+    def _restore_for_undo(
+        self,
+        destination: Path,
+        target: Path,
+        expected: str,
+        run_root: Path,
+    ) -> Path | None:
+        """Restore without removing an incumbent until promotion can succeed."""
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup = None
+        if target.exists():
+            backup_dir = run_root / "undo_backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup = backup_dir / f"{len(list(backup_dir.glob('*'))):06d}_{target.name}"
+            shutil.copy2(target, backup)
+            self._verify_fingerprint(backup, self._fingerprint(target))
+
+        handle, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".dtm-undo",
+            dir=target.parent,
+        )
+        os.close(handle)
+        os.remove(temporary_name)
+        temporary = Path(temporary_name)
+        try:
+            shutil.move(str(destination), str(temporary))
+            self._verify_fingerprint(temporary, expected)
+            os.replace(temporary, target)
+            return backup
+        except Exception:
+            if temporary.exists() and not destination.exists():
+                try:
+                    shutil.move(str(temporary), str(destination))
+                except OSError:
+                    pass
+            raise
+
     @staticmethod
     def _undo_target(source: Path, policy: ConflictPolicy) -> Path | None:
         if not source.exists():
@@ -450,7 +500,6 @@ class SortExecutor:
         if policy == ConflictPolicy.SKIP or policy == ConflictPolicy.REVIEW:
             return None
         if policy == ConflictPolicy.OVERWRITE:
-            source.unlink()
             return source
         index = 1
         candidate = source

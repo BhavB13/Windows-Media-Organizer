@@ -465,8 +465,7 @@ class SortWorkspace(QScrollArea):
     def _show_section(self, index: int) -> None:
         self._current_stage = max(self.SOURCE_STAGE, min(index, self.RESULTS_STAGE))
         if index == self.RULES_STAGE:
-            self.advanced_panel.toggle.setChecked(True)
-            self.advanced_panel._toggle(True)
+            self.advanced_panel.set_expanded(True)
             QTimer.singleShot(0, lambda: self._scroll_to_widget(self.advanced_panel))
         elif index == self.REVIEW_STAGE:
             self.review_page.show()

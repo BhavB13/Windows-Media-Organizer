@@ -35,6 +35,13 @@ class Phase6ReliabilitySecurityTests(unittest.TestCase):
         self.assertIn("<redacted:serial:", sanitized)
         self.assertIn("<redacted:hash:", sanitized)
 
+    def test_sanitizer_redacts_bare_filename_without_redacting_uppercase_word(self):
+        sanitized = sanitize_text("PERMISSION failed while reading IMG_1234.jpg")
+
+        self.assertIn("PERMISSION", sanitized)
+        self.assertNotIn("IMG_1234.jpg", sanitized)
+        self.assertIn("<redacted:filename:", sanitized)
+
     def test_diagnostics_are_sanitized_and_sentry_is_opt_in(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = get_runtime_paths(temp_dir)

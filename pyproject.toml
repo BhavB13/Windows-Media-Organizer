@@ -18,6 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "Pillow==11.3.0",
+    "packaging==26.2",
     "PySide6==6.9.1",
     "Send2Trash==1.8.3",
     "tkinterdnd2==0.4.3",

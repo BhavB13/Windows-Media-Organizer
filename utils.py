@@ -23,6 +23,7 @@ DEFAULT_EXCLUDES = [
     ".venv",
     ".media_organizer_staging",
     ".duplicate_transfer_manager_staging",
+    ".duplicate_transfer_manager_backups",
 ]
 
 class SessionLogger:

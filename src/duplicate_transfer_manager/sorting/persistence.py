@@ -118,13 +118,19 @@ class SortingProfileStore:
             old_policy = str(preset.get("conflict_policy", "rename"))
             policy = ConflictPolicy.OVERWRITE if old_policy == "replace" else ConflictPolicy(old_policy)
             extension_condition = SortCondition(ConditionField.SOURCE_PATH, ConditionOperator.CONTAINS, "")
+            destination_root = str(preset.get("destination_root", ""))
+            destination = (
+                destination_root
+                if mode == "flatten"
+                else str(Path(destination_root) / "{media_type}")
+            )
             association = Association(
                 name=f"{name} default",
                 conditions=(extension_condition,),
                 action=SortAction.MOVE,
-                destination=str(preset.get("destination_root", "")),
+                destination=destination,
                 conflict_policy=policy,
-                rename_template="{stem}{suffix}" if mode == "flatten" else f"{{media_type}}/{{stem}}{{suffix}}",
+                rename_template="{stem}{suffix}",
             )
             profile = self.save(SortingProfile(name=name, associations=(association,), ml_enabled=bool(preset.get("ml_auto_organize", False))))
             created.append(profile)

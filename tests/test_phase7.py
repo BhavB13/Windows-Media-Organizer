@@ -1,15 +1,22 @@
+import base64
 import hashlib
 import json
 import os
 import tempfile
 import unittest
+import importlib
 from pathlib import Path
 from unittest.mock import patch
 
 from duplicate_transfer_manager.core import ServiceError
-from duplicate_transfer_manager.core.security import sign_rsa_sha256_for_tests
+from duplicate_transfer_manager.core.security import (
+    canonical_json,
+    sign_rsa_sha256_for_tests,
+    verify_rsa_sha256_signature,
+)
 from duplicate_transfer_manager.runtime_paths import get_runtime_paths
 from duplicate_transfer_manager.services import UpdateService
+from duplicate_transfer_manager.services.support_services import _compare_versions, _resource_path
 
 
 PRIVATE_TEST_KEY = {
@@ -85,11 +92,15 @@ class Phase7PackagingUpdateTests(unittest.TestCase):
             paths = get_runtime_paths(temp_dir)
             service = UpdateService(paths)
             service.record_check({"checked": True})
+            original = json.loads((paths.updates / "last_check.json").read_text(encoding="utf-8"))["checked_at"]
 
-            result = service.check_manifest_url("https://example.invalid/manifest.json")
-
-        self.assertFalse(result["checked"])
-        self.assertIn("24 hours", result["reason"])
+            result = service.check_manifest_url("https://github.com/BhavB13/Windows-Media-Organizer/releases/latest/download/update.json")
+            self.assertFalse(result["checked"])
+            self.assertIn("24 hours", result["reason"])
+            self.assertEqual(
+                json.loads((paths.updates / "last_check.json").read_text(encoding="utf-8"))["checked_at"],
+                original,
+            )
 
     def test_download_requires_approval_and_verifies_downloaded_installer(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -109,8 +120,14 @@ class Phase7PackagingUpdateTests(unittest.TestCase):
                 def __exit__(self, *_args):
                     return False
 
-                def read(self):
+                def read(self, _size=-1):
+                    if getattr(self, "done", False):
+                        return b""
+                    self.done = True
                     return b"installer-bytes"
+
+                def geturl(self):
+                    return manifest["installer_url"]
 
             with patch(
                 "duplicate_transfer_manager.services.support_services.urlopen",
@@ -120,6 +137,94 @@ class Phase7PackagingUpdateTests(unittest.TestCase):
 
             self.assertTrue(downloaded.exists())
             self.assertEqual(downloaded.read_bytes(), b"installer-bytes")
+
+    def test_download_rejects_oversize_response_and_removes_partial(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = get_runtime_paths(temp_dir)
+            installer = paths.updates / "source-installer.exe"
+            installer.write_bytes(b"ok")
+            manifest = _signed_manifest(installer)
+            service = UpdateService(paths)
+
+            class Response:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+                def read(self, _size=-1):
+                    if getattr(self, "done", False):
+                        return b""
+                    self.done = True
+                    return b"too large"
+
+                def geturl(self):
+                    return manifest["installer_url"]
+
+            with patch("duplicate_transfer_manager.services.support_services.urlopen", return_value=Response()):
+                with self.assertRaises(ServiceError):
+                    service.download_installer(manifest, approved=True)
+
+            target = paths.updates / f"DuplicateTransferManagerSetup-{manifest['version']}.exe.partial"
+            self.assertFalse(target.exists())
+
+    def test_update_urls_require_https_and_approved_hosts_including_redirects(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = UpdateService(get_runtime_paths(temp_dir))
+            for url in ("http://github.com/update.json", "file:///tmp/update.json", "https://example.com/update.json"):
+                with self.assertRaises(ServiceError):
+                    service.check_manifest_url(url, force=True)
+
+            class Redirected:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+                def geturl(self):
+                    return "https://example.com/redirected.json"
+
+            with patch("duplicate_transfer_manager.services.support_services.urlopen", return_value=Redirected()):
+                with self.assertRaises(ServiceError):
+                    service.check_manifest_url(
+                        "https://github.com/BhavB13/Windows-Media-Organizer/releases/latest/download/update.json",
+                        force=True,
+                    )
+
+    def test_missing_resource_path_fails_instead_of_searching_working_directory(self):
+        with self.assertRaises(FileNotFoundError):
+            _resource_path("packaging/definitely-missing-update-key.json")
+
+    def test_manifest_requires_nonempty_publisher_thumbprint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = get_runtime_paths(temp_dir)
+            installer = paths.updates / "installer.exe"
+            installer.write_bytes(b"installer")
+            manifest = _signed_manifest(installer)
+            manifest["authenticode_thumbprint"] = ""
+            manifest["signature"] = sign_rsa_sha256_for_tests(manifest, PRIVATE_TEST_KEY)
+
+            with self.assertRaises(ServiceError):
+                UpdateService(paths).verify_manifest(manifest)
+
+    def test_version_comparison_respects_prerelease_ordering(self):
+        self.assertLess(_compare_versions("0.9.0rc1", "0.9"), 0)
+        self.assertGreater(_compare_versions("1.0", "1.0rc1"), 0)
+
+    def test_signature_verifier_rejects_non_ff_padding(self):
+        payload = {"version": "1.0", "signature": ""}
+        modulus = int(PRIVATE_TEST_KEY["n"], 16)
+        private_exponent = int(PRIVATE_TEST_KEY["d"], 16)
+        key_size = (modulus.bit_length() + 7) // 8
+        digest_info = bytes.fromhex("3031300d060960864801650304020105000420") + hashlib.sha256(canonical_json(payload)).digest()
+        padding_length = key_size - len(digest_info) - 3
+        encoded = b"\x00\x01" + b"\xff" + b"\xfe" + (b"\xff" * (padding_length - 2)) + b"\x00" + digest_info
+        signature = pow(int.from_bytes(encoded, "big"), private_exponent, modulus).to_bytes(key_size, "big")
+        payload["signature"] = base64.b64encode(signature).decode("ascii")
+
+        self.assertFalse(verify_rsa_sha256_signature(payload, {"n": PRIVATE_TEST_KEY["n"], "e": 65537}))
 
     def test_launch_verified_installer_preserves_state_and_requires_approval(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -159,6 +264,12 @@ class Phase7PackagingUpdateTests(unittest.TestCase):
 
         for path in expected:
             self.assertTrue(path.exists(), path)
+
+    def test_release_runtime_requirements_include_working_recycle_dependency(self):
+        root = Path(__file__).resolve().parents[1]
+        requirements = (root / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("Send2Trash==1.8.3", requirements)
+        self.assertIsNotNone(importlib.import_module("send2trash"))
 
     def test_manifest_example_contains_required_phase7_fields(self):
         root = Path(__file__).resolve().parents[1]

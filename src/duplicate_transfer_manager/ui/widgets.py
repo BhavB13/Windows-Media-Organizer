@@ -492,7 +492,7 @@ class DisclosurePanel(QWidget):
         self.toggle.setCheckable(True)
         self.toggle.setProperty("variant", "quiet")
         self.toggle.setAccessibleName(title)
-        self.toggle.clicked.connect(self._toggle)
+        self.toggle.clicked.connect(self.set_expanded)
         self.body = Card(subtle=True)
         self.body_layout = QVBoxLayout(self.body)
         self.body_layout.setContentsMargins(
@@ -506,7 +506,10 @@ class DisclosurePanel(QWidget):
         layout.addWidget(self.toggle, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self.body)
 
-    def _toggle(self, expanded: bool) -> None:
+    def set_expanded(self, expanded: bool) -> None:
+        self.toggle.blockSignals(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.blockSignals(False)
         self.toggle.setText(
             ("⌄  " if expanded else "›  ") + self.toggle.text()[3:]
         )

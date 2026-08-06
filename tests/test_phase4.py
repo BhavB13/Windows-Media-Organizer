@@ -1,9 +1,11 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from duplicate_transfer_manager.core import CancellationToken, OperationPhase, OperationReporter, OperationState
+from duplicate_transfer_manager.runtime_paths import get_runtime_paths
 from duplicate_transfer_manager.services import (
     TRANSFER_PROFILES,
     TransferService,
@@ -157,7 +159,7 @@ class Phase4ImportWorkflowTests(unittest.TestCase):
             "duplicate_transfer_manager.services.transfer_service.execute_smart_transfer",
             side_effect=fake_execute,
         ):
-            result = TransferService(HashCache("unused.json")).run(
+            result = TransferService(HashCache(os.devnull)).run(
                 settings,
                 CancellationToken(),
                 OperationReporter(events.append, states.append),
@@ -181,13 +183,17 @@ class Phase4ImportWorkflowTests(unittest.TestCase):
         self.assertEqual(summary["Report location"], "report.json")
 
     def test_partial_cleanup_helper_removes_transfer_partials(self):
-        from transfer_safety import cleanup_partial_files
+        from transfer_safety import APP_STAGING_DIRECTORY, TransferJournal, cleanup_partial_files
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            partial = root / "photo.jpg.partial"
+            user_partial = root / "download.partial"
+            staging = root / APP_STAGING_DIRECTORY
+            staging.mkdir()
+            partial = staging / "photo.jpg.dtm-partial"
             keep = root / "photo.jpg"
             partial.write_bytes(b"incomplete")
+            user_partial.write_bytes(b"user data")
             keep.write_bytes(b"complete")
 
             preview = cleanup_partial_files(str(root), dry_run=True)
@@ -199,7 +205,19 @@ class Phase4ImportWorkflowTests(unittest.TestCase):
 
             self.assertEqual(removed, [str(partial)])
             self.assertFalse(partial.exists())
+            self.assertEqual(user_partial.read_bytes(), b"user data")
             self.assertTrue(keep.exists())
+
+            journal_partial = root / "journal-owned.dtm-partial"
+            journal_partial.write_bytes(b"incomplete")
+            paths = get_runtime_paths(root / "data")
+            journal = TransferJournal(str(paths.journals / "cleanup.journal.json"))
+            journal.fail("source", "interrupted", str(journal_partial))
+            journal.save(force=True)
+            with patch("transfer_safety.get_runtime_paths", return_value=paths):
+                removed = cleanup_partial_files(str(root))
+            self.assertEqual(removed, [str(journal_partial)])
+            self.assertFalse(journal_partial.exists())
 
     def test_transfer_service_explains_preflight_failure_as_recoverable(self):
         settings = build_import_settings(
@@ -223,7 +241,7 @@ class Phase4ImportWorkflowTests(unittest.TestCase):
             "duplicate_transfer_manager.services.transfer_service.execute_smart_transfer",
             return_value=raw,
         ):
-            result = TransferService(HashCache("unused.json")).run(
+            result = TransferService(HashCache(os.devnull)).run(
                 settings,
                 CancellationToken(),
                 OperationReporter(),

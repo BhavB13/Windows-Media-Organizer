@@ -31,8 +31,13 @@ SENSITIVE_KEYS = {
 PATH_PATTERN = re.compile(
     r"(?P<path>(?:[A-Za-z]:\\|\\\\|/)(?:[^\s,;:'\"]+[\\/])*[^\s,;:'\"]+)"
 )
+FILENAME_PATTERN = re.compile(
+    r"(?<![\w.])(?P<filename>[^\s,;:'\"\\/]+\.[A-Za-z][A-Za-z0-9]{0,9})(?![\w.])"
+)
 HASH_PATTERN = re.compile(r"\b[a-fA-F0-9]{32,128}\b")
-ANDROID_SERIAL_PATTERN = re.compile(r"\b[A-Z0-9]{6,}:[0-9]{4,5}\b|\b[A-Z0-9]{8,}\b")
+ANDROID_SERIAL_PATTERN = re.compile(
+    r"\b[A-Z0-9]{6,}:[0-9]{4,5}\b|\b(?=[A-Z0-9]{8,}\b)(?=[A-Z0-9]*[0-9])[A-Z0-9]+\b"
+)
 _SHA256_DIGEST_INFO_PREFIX = bytes.fromhex(
     "3031300d060960864801650304020105000420"
 )
@@ -50,6 +55,10 @@ def sanitize_text(value: str) -> str:
         return f"<redacted:path:{correlation_id(match.group('path'), prefix='p')}>"
 
     sanitized = PATH_PATTERN.sub(path_replacement, value)
+    sanitized = FILENAME_PATTERN.sub(
+        lambda match: f"<redacted:filename:{correlation_id(match.group('filename'), prefix='f')}>",
+        sanitized,
+    )
     sanitized = HASH_PATTERN.sub(
         lambda match: f"<redacted:hash:{correlation_id(match.group(0), prefix='h')}>",
         sanitized,
@@ -119,6 +128,8 @@ def verify_rsa_sha256_signature(payload: Mapping[str, Any], public_key: Mapping[
         return False
     separator_index = decoded.find(b"\x00", 2)
     if separator_index < 10:
+        return False
+    if decoded[2:separator_index] != b"\xff" * (separator_index - 2):
         return False
     return hmac.compare_digest(decoded[separator_index + 1 :], expected_tail)
 

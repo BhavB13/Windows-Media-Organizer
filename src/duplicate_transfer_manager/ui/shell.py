@@ -8,6 +8,7 @@ from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -21,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core import AppSettings
+from ..core import AppSettings, ErrorCode, ServiceError
 from ..runtime_paths import RuntimePaths
 from ..services import (
     DashboardService,
@@ -349,6 +350,34 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         self.settings_service.save(self.settings)
         super().closeEvent(event)
+
+    def launch_verified_update(self, service, manifest: dict, installer_path: str, *, approved: bool) -> dict:
+        """Launch an approved installer only after foreground operations quiesce."""
+
+        controllers = (
+            self.pages["duplicates"].controller,
+            self.pages["import"].controller,
+            self.pages["sort"].controller,
+        )
+        if any(controller.busy for controller in controllers):
+            raise ServiceError(
+                ErrorCode.OPERATION_IN_PROGRESS,
+                "Finish or cancel the active operation before installing an update.",
+                recoverable=True,
+            )
+        result = service.launch_verified_installer(
+            manifest,
+            installer_path,
+            approved=approved,
+        )
+        if not result.get("launched"):
+            return result
+        self.settings_service.save(self.settings)
+        self.close()
+        application = QApplication.instance()
+        if application is not None:
+            application.quit()
+        return result
 
     def _show_onboarding(self) -> None:
         dialog = FirstRunOnboardingDialog(self.settings, self.settings_service, self)
