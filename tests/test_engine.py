@@ -52,11 +52,82 @@ class EngineTests(unittest.TestCase):
             journal = TransferJournal(os.path.join(temp_dir, "journal.json"))
             digest = hashlib.sha256(b"original").hexdigest()
             journal.complete("source", target, 8, digest, hash_algo="sha256", hash_mode="full")
+            recorded = journal.data["completed"]["source"]["target_mtime"]
             self.assertTrue(journal.is_complete("source", 8))
 
             with open(target, "wb") as handle:
                 handle.write(b"modified")
+            # Set the timestamp explicitly rather than relying on the rewrite to
+            # move it. The Windows clock only ticks about every 16 ms, so two
+            # writes inside one tick can share an mtime and make this flaky.
+            os.utime(target, (recorded + 60, recorded + 60))
             self.assertFalse(journal.is_complete("source", 8))
+
+    def test_resume_trusts_matching_timestamp_without_rereading_content(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "target.bin")
+            with open(target, "wb") as handle:
+                handle.write(b"original")
+            journal = TransferJournal(os.path.join(temp_dir, "journal.json"))
+            digest = hashlib.sha256(b"original").hexdigest()
+            journal.complete("source", target, 8, digest, hash_algo="sha256", hash_mode="full")
+
+            # Re-reading a 200 GB destination on every resume is the cost this
+            # fast path exists to avoid, so the hash must not be recomputed.
+            with mock.patch(
+                "transfer_safety._hash_local_file",
+                side_effect=AssertionError("resume re-read a file it should have trusted"),
+            ):
+                self.assertTrue(journal.is_complete("source", 8))
+
+    def test_resume_verifies_content_when_timestamp_changed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "target.bin")
+            with open(target, "wb") as handle:
+                handle.write(b"original")
+            journal = TransferJournal(os.path.join(temp_dir, "journal.json"))
+            digest = hashlib.sha256(b"original").hexdigest()
+            journal.complete("source", target, 8, digest, hash_algo="sha256", hash_mode="full")
+            recorded = journal.data["completed"]["source"]["target_mtime"]
+
+            # Same size, same timestamp, different bytes: only a content read
+            # can tell these apart, so the timestamp must be moved for the
+            # fall-through path to be exercised.
+            with open(target, "wb") as handle:
+                handle.write(b"modified")
+            os.utime(target, (recorded + 60, recorded + 60))
+            self.assertFalse(journal.is_complete("source", 8))
+
+            # A touched but unmodified file verifies by content and is kept,
+            # rather than being needlessly transferred again.
+            with open(target, "wb") as handle:
+                handle.write(b"original")
+            os.utime(target, (recorded + 120, recorded + 120))
+            self.assertTrue(journal.is_complete("source", 8))
+
+    def test_resume_full_verification_is_available_and_legacy_entries_still_hash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "target.bin")
+            with open(target, "wb") as handle:
+                handle.write(b"original")
+            journal = TransferJournal(os.path.join(temp_dir, "journal.json"))
+            digest = hashlib.sha256(b"original").hexdigest()
+            journal.complete("source", target, 8, digest, hash_algo="sha256", hash_mode="full")
+
+            with mock.patch(
+                "transfer_safety._hash_local_file", return_value=digest
+            ) as hashed:
+                self.assertTrue(journal.is_complete("source", 8, verify_content=True))
+            self.assertEqual(hashed.call_count, 1)
+
+            # A journal written before timestamps were recorded must keep
+            # verifying by content instead of trusting the entry.
+            journal.data["completed"]["source"].pop("target_mtime")
+            with mock.patch(
+                "transfer_safety._hash_local_file", return_value=digest
+            ) as legacy_hashed:
+                self.assertTrue(journal.is_complete("source", 8))
+            self.assertEqual(legacy_hashed.call_count, 1)
 
     def test_rename_promotion_does_not_clobber_target_created_after_resolution(self):
         with tempfile.TemporaryDirectory() as temp_dir:

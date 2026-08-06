@@ -106,6 +106,7 @@ def build_import_settings(
     reconnect_timeout: int = 300,
     stall_timeout: int = 180,
     destination_template: str = "preserve",
+    verify_resumed_files: bool = False,
     dry_run: bool = False,
 ) -> TransferSettings:
     profile_values = TRANSFER_PROFILES.get(profile, TRANSFER_PROFILES["Balanced"])
@@ -140,6 +141,7 @@ def build_import_settings(
         reconnect_timeout=reconnect_timeout,
         stall_timeout=stall_timeout,
         destination_template=destination_template if destination_template in {"preserve", "date"} else "preserve",
+        verify_resumed_files=verify_resumed_files,
     )
 
 

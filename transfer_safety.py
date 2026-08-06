@@ -80,6 +80,12 @@ class TransferJournal:
         self.data["completed"][source] = {
             "target": target, "size": size, "hash": digest, "completed_at": time.time()
         }
+        try:
+            self.data["completed"][source]["target_mtime"] = os.path.getmtime(target)
+        except OSError:
+            # Without a recorded timestamp, resume falls back to full content
+            # verification for this entry.
+            pass
         if replaced_backup:
             self.data["completed"][source]["replaced_backup"] = replaced_backup
         if hash_algo:
@@ -98,7 +104,18 @@ class TransferJournal:
         self._dirty_entries += 1
         self.save()
 
-    def is_complete(self, source, size):
+    def is_complete(self, source, size, verify_content=False):
+        """Report whether a journalled file is still safely complete.
+
+        Size and the modification time recorded at completion are checked
+        first. Re-reading every finished file is prohibitively slow when
+        resuming a large library, so a target that still matches both is
+        trusted. Anything that rewrites a file changes its timestamp, and a
+        mismatch falls through to full content verification rather than an
+        immediate re-transfer. Callers that need certainty against silent
+        corruption pass ``verify_content=True``.
+        """
+
         entry = self.data["completed"].get(source)
         if not entry:
             return False
@@ -109,11 +126,36 @@ class TransferJournal:
             expected = str(entry.get("hash", ""))
             if not expected:
                 return False
+            if not verify_content and _target_timestamp_matches(target, entry.get("target_mtime")):
+                return True
             algorithm = str(entry.get("hash_algo", "")) or _infer_hash_algorithm(expected)
             mode = str(entry.get("hash_mode", "full"))
             return _hash_local_file(target, algorithm, mode) == expected
         except (OSError, ValueError):
             return False
+
+
+def _target_timestamp_matches(target, recorded_mtime):
+    """Compare a target's timestamp with the one stored at completion.
+
+    The comparison is deliberately exact. Both values come from
+    ``os.path.getmtime`` on the same file, so a coarse filesystem such as
+    FAT32 or exFAT truncates the recorded and observed values identically and
+    still matches. A tolerance window would instead let a rewrite that lands
+    inside the window pass as unchanged. Any mismatch, including the one-hour
+    FAT/DST shift Windows can produce, falls through to content verification
+    rather than being trusted, so drift costs time and never safety.
+
+    Journals written before timestamps were recorded return False, keeping
+    those entries on full content verification.
+    """
+
+    if recorded_mtime is None:
+        return False
+    try:
+        return abs(os.path.getmtime(target) - float(recorded_mtime)) < 1e-6
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def _infer_hash_algorithm(digest):

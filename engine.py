@@ -637,6 +637,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         )
         journal = TransferJournal(journal_path)
         logger.log(f"Resume journal: {journal_path}")
+    verify_resumed_files = bool(getattr(settings, "verify_resumed_files", False))
     previous_stay_awake = None
     if getattr(settings, "source_is_adb", False) and getattr(settings, "keep_device_awake", True):
         previous_stay_awake = ADBBridge.enable_usb_stay_awake(getattr(settings, "adb_serial", ""))
@@ -651,10 +652,13 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         bytes_before = source_byte_offsets[i]
         staged_path = ""
         partial_path = ""
-        if journal and journal.is_complete(f.path, f.size):
+        if journal and journal.is_complete(f.path, f.size, verify_resumed_files):
             resumed += 1
             if resumed == 1 or resumed % 100 == 0:
-                logger.log(f"RESUME: {resumed} previously completed file(s) verified by size.")
+                logger.log(
+                    f"RESUME: {resumed} previously completed file(s) verified by "
+                    f"{'full content' if verify_resumed_files else 'size and timestamp'}."
+                )
             continue
         if progress_callback:
             progress_callback(i, total_src, f"Checking {i}/{total_src}: {filename[:20]} | Copied {transferred}")

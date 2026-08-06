@@ -62,3 +62,4 @@ class TransferSettings:
     reconnect_timeout: int = 300
     stall_timeout: int = 180
     destination_template: str = "preserve"
+    verify_resumed_files: bool = False

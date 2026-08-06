@@ -1247,6 +1247,14 @@ class ImportPage(BasePage):
         self.use_adb_cache.setChecked(True)
         self.keep_awake = QCheckBox("Keep Android awake during transfer")
         self.keep_awake.setChecked(True)
+        self.verify_resumed = QCheckBox("Re-read every resumed file to verify it")
+        self.verify_resumed.setChecked(False)
+        self.verify_resumed.setToolTip(
+            "Resuming normally trusts files whose size and timestamp still match the "
+            "journal. Turn this on to hash every already-copied file again. It detects "
+            "silent corruption but re-reads the whole destination, which is slow on "
+            "large libraries."
+        )
         self.reconnect_timeout = QSpinBox()
         self.reconnect_timeout.setRange(30, 3600)
         self.reconnect_timeout.setValue(300)
@@ -1267,7 +1275,7 @@ class ImportPage(BasePage):
         ):
             advanced.body_layout.addWidget(QLabel(label))
             advanced.body_layout.addWidget(widget)
-        for widget in (self.dry_run, self.dry_run_cleanup, self.use_cache, self.update_cache, self.use_adb_cache, self.keep_awake):
+        for widget in (self.dry_run, self.dry_run_cleanup, self.use_cache, self.update_cache, self.use_adb_cache, self.keep_awake, self.verify_resumed):
             widget.toggled.connect(lambda _checked: self._invalidate_review())
             advanced.body_layout.addWidget(widget)
         advanced.body_layout.addWidget(self.reconnect_timeout)
@@ -1457,6 +1465,7 @@ class ImportPage(BasePage):
             reconnect_timeout=self.reconnect_timeout.value(),
             stall_timeout=self.stall_timeout.value(),
             destination_template=self.destination_template.currentData(),
+            verify_resumed_files=self.verify_resumed.isChecked(),
             dry_run=self.dry_run.isChecked(),
         )
 
@@ -1478,6 +1487,7 @@ class ImportPage(BasePage):
             "update_cache": self.update_cache.isChecked(),
             "use_adb_cache": self.use_adb_cache.isChecked(),
             "keep_awake": self.keep_awake.isChecked(),
+            "verify_resumed": self.verify_resumed.isChecked(),
             "reconnect_timeout": self.reconnect_timeout.value(),
             "stall_timeout": self.stall_timeout.value(),
             "dry_run": self.dry_run.isChecked(),
@@ -1511,6 +1521,7 @@ class ImportPage(BasePage):
         self.update_cache.setChecked(bool(setup.get("update_cache", True)))
         self.use_adb_cache.setChecked(bool(setup.get("use_adb_cache", True)))
         self.keep_awake.setChecked(bool(setup.get("keep_awake", True)))
+        self.verify_resumed.setChecked(bool(setup.get("verify_resumed", False)))
         self.reconnect_timeout.setValue(int(setup.get("reconnect_timeout", 300) or 300))
         self.stall_timeout.setValue(int(setup.get("stall_timeout", 180) or 180))
         self.dry_run.setChecked(bool(setup.get("dry_run", False)))
