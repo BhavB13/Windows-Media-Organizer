@@ -6,6 +6,14 @@ from models import FileInfo
 CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
 ADB_QUICK_TIMEOUT = 3
 ADB_PROBE_TIMEOUT = 8
+# How often a running pull is checked for completion. A phone photo transfers
+# in well under a second, so this interval is the floor on per-file wall clock
+# for an import of many small files and is kept short deliberately.
+ADB_PULL_POLL_INTERVAL = 0.05
+# How often the destination is stat-ed and progress is reported. Decoupled from
+# the completion check so that shortening the poll does not stat the file or
+# repaint the UI twenty times a second.
+ADB_PULL_PROGRESS_INTERVAL = 0.5
 
 
 class ADBOperationError(RuntimeError):
@@ -344,29 +352,33 @@ class ADBBridge:
         )
         last_size = -1
         last_progress = time.monotonic()
+        last_report = None
         while process.poll() is None:
-            current_size = 0
-            try:
-                current_size = os.path.getsize(dst) if os.path.exists(dst) else 0
-            except OSError:
-                pass
-            if current_size != last_size:
-                last_size = current_size
-                last_progress = time.monotonic()
-            elif stall_timeout and time.monotonic() - last_progress >= stall_timeout:
-                process.terminate()
+            now = time.monotonic()
+            if last_report is None or now - last_report >= ADB_PULL_PROGRESS_INTERVAL:
+                last_report = now
+                current_size = 0
                 try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                raise ADBOperationError(
-                    "Pull",
-                    src,
-                    f"No transfer progress for {stall_timeout} seconds; the stalled command was restarted.",
-                )
-            if progress_callback:
-                progress_callback(current_size)
-            time.sleep(0.5)
+                    current_size = os.path.getsize(dst) if os.path.exists(dst) else 0
+                except OSError:
+                    pass
+                if current_size != last_size:
+                    last_size = current_size
+                    last_progress = now
+                elif stall_timeout and now - last_progress >= stall_timeout:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    raise ADBOperationError(
+                        "Pull",
+                        src,
+                        f"No transfer progress for {stall_timeout} seconds; the stalled command was restarted.",
+                    )
+                if progress_callback:
+                    progress_callback(current_size)
+            time.sleep(ADB_PULL_POLL_INTERVAL)
         stdout, stderr = process.communicate()
         returncode = process.returncode
         detail = stderr.strip() or stdout.strip()

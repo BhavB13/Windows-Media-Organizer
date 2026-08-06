@@ -62,7 +62,9 @@ class TransferJournal:
         self.data["updated_at"] = time.time()
         temp_path = f"{self.path}.tmp"
         with open(temp_path, "w", encoding="utf-8") as handle:
-            json.dump(self.data, handle, indent=2)
+            # The journal is machine-read only and is rewritten in full every
+            # few seconds during a large import, so it is stored compactly.
+            json.dump(self.data, handle, separators=(",", ":"))
         os.replace(temp_path, self.path)
         self._dirty_entries = 0
         self._last_save = time.monotonic()

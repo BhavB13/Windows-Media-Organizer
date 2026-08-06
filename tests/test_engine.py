@@ -6,6 +6,7 @@ import threading
 import unittest
 from unittest import mock
 
+import adb_bridge
 import engine as engine_module
 from adb_bridge import ADBBridge
 from discovery import (
@@ -62,6 +63,99 @@ class EngineTests(unittest.TestCase):
             # writes inside one tick can share an mtime and make this flaky.
             os.utime(target, (recorded + 60, recorded + 60))
             self.assertFalse(journal.is_complete("source", 8))
+
+    def test_pull_notices_a_fast_transfer_without_waiting_for_the_progress_tick(self):
+        # A phone photo finishes far inside one progress interval. The old
+        # loop slept a full interval before noticing, which set the floor on
+        # per-file wall clock for an import of thousands of small files.
+        self.assertLess(adb_bridge.ADB_PULL_POLL_INTERVAL, adb_bridge.ADB_PULL_PROGRESS_INTERVAL / 4)
+
+        class FakeProcess:
+            def __init__(self, polls_until_exit):
+                self.remaining = polls_until_exit
+                self.returncode = None
+
+            def poll(self):
+                if self.remaining > 0:
+                    self.remaining -= 1
+                    return None
+                self.returncode = 0
+                return 0
+
+            def communicate(self):
+                return "", ""
+
+        sleeps = []
+        process = FakeProcess(polls_until_exit=2)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = os.path.join(temp_dir, "photo.jpg")
+            with open(destination, "wb") as handle:
+                handle.write(b"x" * 1024)
+            with mock.patch.object(adb_bridge.subprocess, "Popen", return_value=process), mock.patch.object(
+                adb_bridge.time, "sleep", side_effect=sleeps.append
+            ):
+                ADBBridge.pull("/sdcard/DCIM/photo.jpg", destination, serial="serial")
+
+        self.assertTrue(sleeps)
+        self.assertTrue(all(value == adb_bridge.ADB_PULL_POLL_INTERVAL for value in sleeps))
+        self.assertLessEqual(sum(sleeps), adb_bridge.ADB_PULL_PROGRESS_INTERVAL)
+
+    def test_pull_progress_reporting_stays_throttled_while_polling_quickly(self):
+        # Shortening the completion check must not stat the destination or
+        # repaint the UI on every poll.
+        clock = {"now": 1000.0}
+        reported = []
+
+        class FakeProcess:
+            def __init__(self):
+                self.calls = 0
+                self.returncode = None
+
+            def poll(self):
+                self.calls += 1
+                if self.calls <= 40:
+                    clock["now"] += adb_bridge.ADB_PULL_POLL_INTERVAL
+                    return None
+                self.returncode = 0
+                return 0
+
+            def communicate(self):
+                return "", ""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            destination = os.path.join(temp_dir, "clip.mp4")
+            with open(destination, "wb") as handle:
+                handle.write(b"x" * 4096)
+            with mock.patch.object(adb_bridge.subprocess, "Popen", return_value=FakeProcess()), mock.patch.object(
+                adb_bridge.time, "sleep", lambda _seconds: None
+            ), mock.patch.object(adb_bridge.time, "monotonic", lambda: clock["now"]):
+                ADBBridge.pull(
+                    "/sdcard/DCIM/clip.mp4",
+                    destination,
+                    serial="serial",
+                    progress_callback=reported.append,
+                )
+
+        # 40 polls advance the clock by two seconds, so the half-second
+        # cadence reports at 0.0, 0.5, 1.0, and 1.5 rather than on all 40.
+        self.assertEqual(len(reported), 4)
+
+    def test_transfer_journal_is_written_compactly(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "target.bin")
+            with open(target, "wb") as handle:
+                handle.write(b"original")
+            journal_path = os.path.join(temp_dir, "journal.json")
+            journal = TransferJournal(journal_path)
+            journal.complete("source", target, 8, hashlib.sha256(b"original").hexdigest())
+            journal.save(force=True)
+
+            with open(journal_path, encoding="utf-8") as handle:
+                raw = handle.read()
+            self.assertNotIn("\n", raw)
+            # Still valid JSON that a later run can resume from.
+            self.assertEqual(json.loads(raw)["completed"]["source"]["size"], 8)
+            self.assertTrue(TransferJournal(journal_path).is_complete("source", 8))
 
     def test_resume_trusts_matching_timestamp_without_rereading_content(self):
         with tempfile.TemporaryDirectory() as temp_dir:
