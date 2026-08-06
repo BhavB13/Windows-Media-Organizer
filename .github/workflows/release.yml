@@ -1,0 +1,133 @@
+name: signed-windows-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, for example 0.8.0
+        required: true
+      channel:
+        description: Update channel
+        required: true
+        default: stable
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore signing certificate
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
+          WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_SIGNING_CERT_BASE64) { throw "WINDOWS_SIGNING_CERT_BASE64 is required" }
+          $certPath = Join-Path $env:RUNNER_TEMP "dtm-signing.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT_BASE64))
+          $securePassword = ConvertTo-SecureString $env:WINDOWS_SIGNING_CERT_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath $certPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword | Out-Null
+
+      - name: Build installer
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERT_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_CERT_THUMBPRINT }}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m unittest discover -s tests -v
+          python scripts\create_app_icon.py
+          pyinstaller --noconfirm packaging\duplicate_transfer_manager.spec
+
+      - name: Sign application executable
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERT_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_CERT_THUMBPRINT }}
+        run: |
+          $signtool = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\x64\signtool.exe"
+          if (-not (Test-Path $signtool)) { $signtool = "signtool.exe" }
+          & $signtool sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /sha1 $env:WINDOWS_SIGNING_CERT_THUMBPRINT "dist\DuplicateTransferManager\DuplicateTransferManager.exe"
+          & $signtool verify /pa /v "dist\DuplicateTransferManager\DuplicateTransferManager.exe"
+
+      - name: Bundle Android Platform Tools
+        shell: pwsh
+        run: |
+          $manifest = Get-Content -Raw packaging\android_platform_tools_manifest.json | ConvertFrom-Json
+          $zip = Join-Path $env:RUNNER_TEMP "platform-tools.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "platform-tools"
+          Invoke-WebRequest -Uri $manifest.download_url -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+          $adb = Join-Path $extract "platform-tools\adb.exe"
+          if (-not (Test-Path $adb)) { throw "Downloaded Android Platform Tools did not contain adb.exe" }
+          $adbVersion = & $adb version
+          if ($adbVersion -notmatch [regex]::Escape($manifest.version)) {
+            throw "Downloaded Android Platform Tools version did not match pinned version $($manifest.version): $adbVersion"
+          }
+          Copy-Item -Recurse -Force (Join-Path $extract "platform-tools") "dist\DuplicateTransferManager\platform-tools"
+
+      - name: Build and sign installer
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERT_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_CERT_THUMBPRINT }}
+        run: |
+          choco install innosetup --yes --no-progress
+          $env:DTM_VERSION = "${{ inputs.version }}"
+          $signtool = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\x64\signtool.exe"
+          if (-not (Test-Path $signtool)) { $signtool = "signtool.exe" }
+          $signCommand = "`"$signtool`" sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /sha1 $env:WINDOWS_SIGNING_CERT_THUMBPRINT `$f"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/Ssigntool=$signCommand" packaging\installer.iss
+          $installer = "dist\installer\DuplicateTransferManagerSetup-${{ inputs.version }}.exe"
+          & $signtool verify /pa /v $installer
+
+      - name: Verify installer signature
+        shell: pwsh
+        run: |
+          $installer = "dist\installer\DuplicateTransferManagerSetup-${{ inputs.version }}.exe"
+          $sig = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($sig.Status -ne "Valid") { throw "Installer signature is not valid: $($sig.Status)" }
+
+      - name: Generate signed update manifest
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERT_THUMBPRINT: ${{ secrets.WINDOWS_SIGNING_CERT_THUMBPRINT }}
+          UPDATE_MANIFEST_PRIVATE_KEY_PEM: ${{ secrets.UPDATE_MANIFEST_PRIVATE_KEY_PEM }}
+        run: |
+          if (-not $env:UPDATE_MANIFEST_PRIVATE_KEY_PEM) { throw "UPDATE_MANIFEST_PRIVATE_KEY_PEM is required" }
+          $installer = "dist\installer\DuplicateTransferManagerSetup-${{ inputs.version }}.exe"
+          $manifestPath = "dist\installer\update-manifest-${{ inputs.version }}.json"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash.ToLowerInvariant()
+          $size = (Get-Item -LiteralPath $installer).Length
+          $manifest = [ordered]@{
+            version = "${{ inputs.version }}"
+            channel = "${{ inputs.channel }}"
+            installer_url = "https://github.com/BhavB13/Windows-Media-Organizer/releases/download/v${{ inputs.version }}/DuplicateTransferManagerSetup-${{ inputs.version }}.exe"
+            size = $size
+            sha256 = $hash
+            release_notes_url = "https://github.com/BhavB13/Windows-Media-Organizer/releases/tag/v${{ inputs.version }}"
+            minimum_supported_version = "0.6.0"
+            signature_algorithm = "RSASSA-PKCS1-v1_5-SHA256"
+            signature = ""
+            authenticode_thumbprint = $env:WINDOWS_SIGNING_CERT_THUMBPRINT
+            publisher = "BhavB13"
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 $manifestPath
+          $keyPath = Join-Path $env:RUNNER_TEMP "update-manifest-private.pem"
+          $env:UPDATE_MANIFEST_PRIVATE_KEY_PEM | Set-Content -Encoding ASCII $keyPath
+          python scripts\sign_update_manifest.py $manifestPath $keyPath
+
+      - name: Upload release artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          draft: true
+          files: |
+            dist/installer/DuplicateTransferManagerSetup-${{ inputs.version }}.exe
+            dist/installer/update-manifest-${{ inputs.version }}.json

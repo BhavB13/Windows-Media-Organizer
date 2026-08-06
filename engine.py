@@ -4,6 +4,7 @@ import time
 import hashlib
 import shutil
 import subprocess
+from datetime import UTC, datetime
 from copy import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from adb_bridge import ADBBridge, ADBOperationError
@@ -87,8 +88,26 @@ def build_relative_path(source_path, source_root, is_adb=False):
     except ValueError:
         return ""
 
-def build_target_path(source_path, source_root, dest_root, preserve_structure, is_adb=False, avoid_collisions=True):
+def build_target_path(
+    source_path,
+    source_root,
+    dest_root,
+    preserve_structure,
+    is_adb=False,
+    avoid_collisions=True,
+    destination_template="preserve",
+    source_timestamp=0,
+):
     filename = os.path.basename(source_path)
+    if destination_template == "date":
+        try:
+            # Use UTC so the folder is stable across machines and daylight-saving changes.
+            dated_folder = datetime.fromtimestamp(float(source_timestamp), UTC).strftime("%Y/%m")
+        except (OSError, OverflowError, TypeError, ValueError):
+            dated_folder = "Unknown date"
+        target_path = os.path.join(dest_root, *dated_folder.split("/"), filename)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        return ensure_unique_path(target_path) if avoid_collisions else target_path
     if preserve_structure and source_root:
         rel_path = build_relative_path(source_path, source_root, is_adb=is_adb)
         if rel_path:
@@ -330,7 +349,10 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
             progress_callback(0, 1, "Preflight failed")
         return {
             "transferred": 0, "duplicates": 0, "isolated": 0, "skipped": 0,
-            "errors": len(preflight_errors), "preflight_failed": True,
+            "errors": len(preflight_errors),
+            "preflight_failed": True,
+            "preflight_errors": list(preflight_errors),
+            "preflight_warnings": list(preflight_warnings),
         }
     logger.log("Preflight passed: device, destination access, and free space checked.")
     sleep_inhibited = prevent_windows_sleep()
@@ -593,6 +615,8 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                 hash_settings.preserve_structure,
                 is_adb=f.is_adb,
                 avoid_collisions=False,
+                destination_template=getattr(settings, "destination_template", "preserve"),
+                source_timestamp=f.created,
             )
             target_path = resolve_conflict_path(target_path, getattr(settings, "conflict_policy", "rename"))
             if not target_path:

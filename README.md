@@ -13,27 +13,45 @@ is tracked in [OVERHAUL_PLAN.md](OVERHAUL_PLAN.md).
 ## Current capabilities
 
 - Recursively discover local or Android files.
+- Include HEIC and common camera RAW formats in the Pictures category; files without a native preview retain metadata-based review.
 - Confirm duplicates by content hash.
 - Review duplicate groups, choose which copy to keep, estimate recoverable
-  space, and move selected duplicates into app-managed quarantine.
+  space, choose oldest/newest/highest-resolution keep preferences, and move selected duplicates into app-managed quarantine.
 - Restore quarantined local files individually or by operation with
   rename/skip/replace conflict choices.
 - Start from an overview dashboard with primary duplicate/import actions,
   connected Android devices, recent operations, interrupted work, and local
   storage summaries.
 - Review local activity records and existing transfer reports; reports can be
-  opened, exported, or removed from the app data folder.
+  opened, exported, or removed from the app data folder. A separate local,
+  append-only audit history remains available after activity-record cleanup.
 - Search and filter quarantine records with operation grouping, recoverable-size
   summaries, and restore controls.
+- Sort pictures, videos, audio, documents, archives, or selected extensions with
+  a simple Import-style review flow. Advanced profiles, priority associations,
+  additional actions, local ML suggestions, monitoring, verification, history,
+  and undo remain available when needed.
+  every live move writes a reversible 90-day manifest and can be rolled back.
 - Compare a source against an existing library and copy only new files.
 - Use a guided import workflow with phone, folder, or drive sources; plain
-  Reliable/Balanced/Fast profiles; review-before-run; live stages; and summary
+  Reliable/Balanced/Fast profiles; saved local locations; optional UTC date-folder
+  organization; review-before-run; live stages; and summary
   cards.
+- Schedule a daily or weekly **read-only** duplicate scan from Advanced Settings.
+  Scheduled runs only record duplicate findings locally; they never quarantine,
+  move, or delete files.
+- Monitor folders through local change polling or profile-scoped Windows
+  schedules. Automation defaults to dry run; live automation requires explicit
+  approval and never processes unresolved review items.
 - Configure theme, Simple/Advanced mode, default categories, default transfer
   profile, cache management, Android behavior, diagnostics consent, and update
   channel.
 - Complete first-run onboarding for local scans, Android authorization, privacy,
   diagnostics consent, and update behavior.
+- Keep diagnostic and crash reports sanitized with local correlation IDs instead
+  of filenames, paths, hashes, or device serials.
+- Verify signed update manifests, installer size, SHA-256 checksums, downgrade
+  protection, and Windows Authenticode signatures before update launch.
 - Preserve source directory structure.
 - Resume interrupted transfers with journals.
 - Use reusable local and Android hash caches.
@@ -76,16 +94,49 @@ It can also be launched from the repository with:
 python main.py
 ```
 
+If `python` points to another bundled runtime or reports `No module named pip`,
+install/register Python 3.12 first and use the Windows launcher explicitly:
+
+```powershell
+winget install --id Python.Python.3.12 -e --source winget
+py -0p
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe main.py
+```
+
 The previous Tkinter interface remains temporarily available for compatibility:
 
 ```powershell
 python legacy_main.py
 ```
 
+## Windows release build
+
+Release packaging requires Windows, Python 3.12, Inno Setup 6, Windows SDK
+`signtool`, a code-signing certificate, and a protected update-manifest private
+key.
+
+```powershell
+.\scripts\build_release.ps1 -Version 0.8.0 -Channel stable
+```
+
+The GitHub Actions workflow in `.github/workflows/release.yml` builds the
+PyInstaller app, signs the executable, builds and signs the Inno installer,
+generates a signed update manifest, and uploads a draft GitHub Release.
+
+See [docs/PHASE_6_7_AUDIT.md](docs/PHASE_6_7_AUDIT.md) for the Phase 6-7
+completion audit and the remaining external release gates.
+See [docs/TARGETED_FIX_MANUAL_CHECKLIST.md](docs/TARGETED_FIX_MANUAL_CHECKLIST.md)
+for Windows/device manual checks covering local scans, ADB paths, dry runs,
+quarantine restore, reports, themes, and the iOS placeholder.
+
 ## Tests
 
 ```powershell
 python -m unittest discover -s tests -v
+python scripts\smoke_ui.py
 ```
 
 Runtime caches, reports, journals, logs, quarantine data, and updates are stored
@@ -112,6 +163,8 @@ Use `dtm-build-cache --help` for Android and custom-cache options.
   cancellation, reporting, and structured errors
 - `src/duplicate_transfer_manager/services/` — UI-independent operation and
   support services
+- `src/duplicate_transfer_manager/sorting/` — profile persistence, metadata,
+  rule/ML decisions, planning, monitoring, journaled execution, and migration
 - `src/duplicate_transfer_manager/controllers/` — Qt worker and signal
   controllers
 - `tests/` — automated tests

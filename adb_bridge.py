@@ -4,6 +4,8 @@ import time
 from models import FileInfo
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
+ADB_QUICK_TIMEOUT = 3
+ADB_PROBE_TIMEOUT = 8
 
 
 class ADBOperationError(RuntimeError):
@@ -27,6 +29,7 @@ class ADBBridge:
                 check=False,
                 capture_output=True,
                 creationflags=CREATE_NO_WINDOW,
+                timeout=ADB_QUICK_TIMEOUT,
             )
         except Exception:
             pass
@@ -60,6 +63,10 @@ class ADBBridge:
             path = "/sdcard"
         elif path.startswith("/storage/self/primary/"):
             path = f"/sdcard/{path[len('/storage/self/primary/'):]}"
+        elif path == "/storage/emulated/0":
+            path = "/sdcard"
+        elif path.startswith("/storage/emulated/0/"):
+            path = f"/sdcard/{path[len('/storage/emulated/0/'):]}"
 
         parts = path.split("/")
         if len(parts) > 2 and parts[1] == "sdcard":
@@ -92,6 +99,7 @@ class ADBBridge:
                 ADBBridge._adb_command("exec-out", "sh", "-c", script, serial=serial),
                 stderr=subprocess.STDOUT,
                 creationflags=CREATE_NO_WINDOW,
+                timeout=ADB_PROBE_TIMEOUT,
             ).decode(errors="replace").strip()
             return output.splitlines()[-1] if output else "missing"
         except Exception:
@@ -105,6 +113,7 @@ class ADBBridge:
             output = subprocess.check_output(
                 ADBBridge._adb_command("devices", "-l"),
                 creationflags=CREATE_NO_WINDOW,
+                timeout=ADB_QUICK_TIMEOUT,
             ).decode(errors="replace").splitlines()
         except Exception:
             return devices
@@ -127,6 +136,7 @@ class ADBBridge:
                     model = subprocess.check_output(
                         ADBBridge._adb_command("shell", "getprop", "ro.product.model", serial=serial),
                         creationflags=CREATE_NO_WINDOW,
+                        timeout=ADB_QUICK_TIMEOUT,
                     ).decode(errors="replace").strip() or serial
                 except Exception:
                     model = serial
@@ -143,6 +153,7 @@ class ADBBridge:
                 ADBBridge._adb_command("exec-out", "sh", "-c", "echo __adb_ready__", serial=serial),
                 stderr=subprocess.STDOUT,
                 creationflags=CREATE_NO_WINDOW,
+                timeout=ADB_PROBE_TIMEOUT,
             )
             return True, ""
         except subprocess.CalledProcessError as exc:
@@ -173,12 +184,14 @@ class ADBBridge:
                 ),
                 stderr=subprocess.STDOUT,
                 creationflags=CREATE_NO_WINDOW,
+                timeout=ADB_PROBE_TIMEOUT,
             ).decode(errors="replace").strip()
             subprocess.run(
                 ADBBridge._adb_command("shell", "svc", "power", "stayon", "usb", serial=serial),
                 check=False,
                 capture_output=True,
                 creationflags=CREATE_NO_WINDOW,
+                timeout=ADB_PROBE_TIMEOUT,
             )
             return previous
         except Exception:
@@ -188,18 +201,22 @@ class ADBBridge:
     def restore_stay_awake(serial, previous):
         if previous is None:
             return
-        subprocess.run(
-            ADBBridge._adb_command(
-                "exec-out",
-                "sh",
-                "-c",
-                f"settings put global stay_on_while_plugged_in {ADBBridge._shell_quote(previous)}",
-                serial=serial,
-            ),
-            check=False,
-            capture_output=True,
-            creationflags=CREATE_NO_WINDOW,
-        )
+        try:
+            subprocess.run(
+                ADBBridge._adb_command(
+                    "exec-out",
+                    "sh",
+                    "-c",
+                    f"settings put global stay_on_while_plugged_in {ADBBridge._shell_quote(previous)}",
+                    serial=serial,
+                ),
+                check=False,
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=ADB_PROBE_TIMEOUT,
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def get_device_state(serial):
@@ -228,6 +245,7 @@ class ADBBridge:
                 model = subprocess.check_output(
                     ADBBridge._adb_command("shell", "getprop", "ro.product.model", serial=serial),
                     creationflags=CREATE_NO_WINDOW,
+                    timeout=ADB_QUICK_TIMEOUT,
                 ).decode(errors="replace").strip()
             return {"model": model or serial, "status": "Connected", "serial": serial}
         except Exception:
@@ -240,6 +258,7 @@ class ADBBridge:
             out = subprocess.check_output(
                 ADBBridge._adb_command("shell", "df /sdcard", serial=serial),
                 creationflags=CREATE_NO_WINDOW,
+                timeout=ADB_PROBE_TIMEOUT,
             ).decode(errors="replace").splitlines()[1].split()
             total, used = int(out[1]) * 1024, int(out[2]) * 1024
             return used, total, (used / total)
@@ -252,7 +271,11 @@ class ADBBridge:
         quoted_path = ADBBridge._shell_quote(remote_path)
         cmd = ADBBridge._adb_command("shell", f"ls -p {quoted_path}", serial=serial)
         try:
-            output = subprocess.check_output(cmd, creationflags=CREATE_NO_WINDOW).decode(errors="replace").splitlines()
+            output = subprocess.check_output(
+                cmd,
+                creationflags=CREATE_NO_WINDOW,
+                timeout=ADB_PROBE_TIMEOUT,
+            ).decode(errors="replace").splitlines()
             dirs = [{"name": i.strip('/'), "path": f"{remote_path.rstrip('/')}/{i.strip('/')}"} for i in output if i.endswith('/')]
             return sorted(dirs, key=lambda x: x['name'].lower())
         except Exception:

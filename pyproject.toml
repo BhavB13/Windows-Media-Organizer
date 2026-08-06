@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duplicate-transfer-manager"
-version = "0.6.0"
+version = "0.8.0"
 description = "Find duplicate files and safely import new media on Windows."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -19,6 +19,7 @@ classifiers = [
 dependencies = [
     "Pillow==11.3.0",
     "PySide6==6.9.1",
+    "Send2Trash==1.8.3",
     "tkinterdnd2==0.4.3",
 ]
 
@@ -29,6 +30,9 @@ Roadmap = "https://github.com/BhavB13/Windows-Media-Organizer/blob/main/OVERHAUL
 [project.scripts]
 duplicate-transfer-manager = "main:main"
 dtm-build-cache = "drive_cache:main"
+dtm-scheduled-scan = "duplicate_transfer_manager.scheduled_scan:main"
+dtm-scheduled-organizer = "duplicate_transfer_manager.scheduled_organizer:main"
+dtm-scheduled-sort = "duplicate_transfer_manager.scheduled_sort:main"
 
 [tool.setuptools]
 packages = [
@@ -36,6 +40,7 @@ packages = [
     "duplicate_transfer_manager.controllers",
     "duplicate_transfer_manager.core",
     "duplicate_transfer_manager.services",
+    "duplicate_transfer_manager.sorting",
     "duplicate_transfer_manager.ui",
 ]
 package-dir = {duplicate_transfer_manager = "src/duplicate_transfer_manager"}

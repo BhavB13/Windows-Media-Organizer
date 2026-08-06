@@ -17,13 +17,18 @@ if str(SOURCE_ROOT) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from duplicate_transfer_manager.core import AppSettings
+from duplicate_transfer_manager.runtime_paths import get_runtime_paths
+from duplicate_transfer_manager.services import SettingsService
 from duplicate_transfer_manager.ui.app import create_application
 from PySide6.QtTest import QTest
 
 
 def render(output: Path, width: int, height: int, theme: str, route: str) -> Path:
-    os.environ["DTM_DATA_DIR"] = str(output / ".runtime")
-    application, window = create_application([], legacy_root=PROJECT_ROOT)
+    runtime_root = output / ".runtime"
+    os.environ["DTM_DATA_DIR"] = str(runtime_root)
+    SettingsService(get_runtime_paths(runtime_root)).save(AppSettings(onboarding_completed=True))
+    application, window = create_application([], legacy_root=PROJECT_ROOT, data_root=runtime_root)
     window.set_theme(theme)
     window.navigate(route)
     window.resize(width, height)
@@ -51,6 +56,7 @@ def main() -> int:
             "overview",
             "duplicates",
             "import",
+            "sort",
             "activity",
             "quarantine",
             "settings",

@@ -65,6 +65,9 @@ class TransferService:
             elif stage == "comparison":
                 state = OperationState.COMPARING
                 phase = OperationPhase.COMPARISON
+            elif stage == "preflight":
+                state = OperationState.VALIDATING
+                phase = OperationPhase.PREFLIGHT
             elif stage == "verification":
                 state = OperationState.TRANSFERRING
                 phase = OperationPhase.VERIFICATION
@@ -96,13 +99,26 @@ class TransferService:
             status = OperationState.COMPLETED
 
         error_count = int(raw.get("errors", 0))
+        preflight_failed = bool(raw.get("preflight_failed"))
         failures = ()
         if error_count:
+            preflight_details = "; ".join(str(value) for value in raw.get("preflight_errors", []))
+            message = (
+                f"Transfer did not start: {preflight_details or 'its safety checks found an issue.'}"
+                if preflight_failed
+                else f"{error_count} file operation(s) could not be completed."
+            )
+            technical_detail = (
+                preflight_details
+                or "Review the destination, available space, and device connection before trying again."
+                if preflight_failed
+                else "See the transfer report and activity log for item-level details."
+            )
             failures = (
                 OperationFailure(
-                    code="transfer_errors",
-                    message=f"{error_count} file operation(s) could not be completed.",
-                    technical_detail="See the transfer report and activity log for item-level details.",
+                    code="preflight_failed" if preflight_failed else "transfer_errors",
+                    message=message,
+                    technical_detail=technical_detail,
                     recoverable=True,
                 ),
             )
@@ -129,8 +145,12 @@ class TransferService:
                 "errors": error_count,
             },
             duration_seconds=time.monotonic() - started,
+            warnings=tuple(str(value) for value in raw.get("preflight_warnings", [])),
             failures=failures,
             report_path=str(raw.get("report_path", "")),
-            resume_information={"resumed_files": int(raw.get("resumed", 0))},
+            resume_information={
+                "resumed_files": int(raw.get("resumed", 0)),
+                "can_resume": status in {OperationState.CANCELLED, OperationState.FAILED},
+            },
             data={"engine_result": raw},
         )

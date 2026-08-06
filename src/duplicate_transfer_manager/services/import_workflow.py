@@ -9,7 +9,10 @@ from models import TransferSettings
 from utils import DEFAULT_EXCLUDES, DEFAULT_MEDIA_EXTS
 
 
-PICTURE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".heic", ".webp"]
+PICTURE_EXTENSIONS = [
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".heic", ".webp",
+    ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2",
+]
 VIDEO_EXTENSIONS = [".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".mpeg", ".mpg", ".3gp", ".mts", ".m2ts", ".hevc"]
 AUDIO_EXTENSIONS = [".mp3", ".aac", ".m4a", ".wav", ".flac", ".ogg"]
 DOCUMENT_EXTENSIONS = [".pdf", ".txt", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"]
@@ -43,6 +46,7 @@ TRANSFER_PROFILES = {
 STAGE_LABELS = {
     "validation": "Validation",
     "discovery": "Discovery",
+    "preflight": "Safety checks",
     "comparison": "Comparison",
     "transfer": "Copying",
     "verification": "Verification",
@@ -101,6 +105,8 @@ def build_import_settings(
     adb_serial: str = "",
     reconnect_timeout: int = 300,
     stall_timeout: int = 180,
+    destination_template: str = "preserve",
+    dry_run: bool = False,
 ) -> TransferSettings:
     profile_values = TRANSFER_PROFILES.get(profile, TRANSFER_PROFILES["Balanced"])
     only_media, extensions = selected_extensions(categories)
@@ -117,7 +123,7 @@ def build_import_settings(
         min_size_kb=0,
         exclude_dirs=list(DEFAULT_EXCLUDES),
         skip_hidden_system=True,
-        dry_run=False,
+        dry_run=dry_run,
         preserve_structure=True,
         max_hash_workers=max_hash_workers or int(profile_values["max_hash_workers"]),
         transfer_mode="copy",
@@ -133,6 +139,7 @@ def build_import_settings(
         keep_device_awake=keep_device_awake,
         reconnect_timeout=reconnect_timeout,
         stall_timeout=stall_timeout,
+        destination_template=destination_template if destination_template in {"preserve", "date"} else "preserve",
     )
 
 
@@ -161,6 +168,7 @@ def build_import_review(
         advanced_summary=(
             f"{settings.hash_mode} hashing, {settings.max_hash_workers} worker(s), "
             f"{settings.retry_attempts} retry attempt(s), conflict policy: {settings.conflict_policy}"
+            f", organization: {'date folders' if settings.destination_template == 'date' else 'preserve source folders'}"
         ),
     )
 
@@ -189,6 +197,8 @@ def summarize_transfer_result(result) -> dict[str, str]:
 
 def classify_transfer_stage(message: str) -> str:
     lowered = message.lower()
+    if "preflight" in lowered or "free space" in lowered or "destination access" in lowered:
+        return "preflight"
     if "authorization lost" in lowered or "waiting" in lowered or "reconnect" in lowered:
         return "reconnect"
     if "verify" in lowered or "verification" in lowered or "post-transfer hash" in lowered:

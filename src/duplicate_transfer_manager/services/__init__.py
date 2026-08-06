@@ -23,7 +23,9 @@ from .import_workflow import (
     selected_extensions,
     summarize_transfer_result,
 )
+from .ios_transfer import IOSDevice, IOSDeviceProvider, IOSImportAdapter, IOSTransferService
 from .support_services import (
+    CrashReportService,
     DashboardService,
     DeviceService,
     DiagnosticsService,
@@ -31,12 +33,15 @@ from .support_services import (
     QuarantineService,
     ReportService,
     SettingsService,
+    ScheduledScanService,
     UpdateService,
 )
 from .transfer_service import TransferService
+from .organizer_service import FileOrganizerService
 
 __all__ = [
     "DeviceService",
+    "CrashReportService",
     "DashboardService",
     "DiagnosticsService",
     "DuplicateScanService",
@@ -45,13 +50,19 @@ __all__ = [
     "DuplicateQuarantineService",
     "DuplicateReview",
     "ImportReview",
+    "IOSDevice",
+    "IOSDeviceProvider",
+    "IOSImportAdapter",
+    "IOSTransferService",
     "QuarantineService",
     "OperationRecordService",
     "QuarantineResult",
     "ReportService",
     "RestoreResult",
     "SettingsService",
+    "ScheduledScanService",
     "TransferService",
+    "FileOrganizerService",
     "STAGE_LABELS",
     "TRANSFER_PROFILES",
     "UpdateService",

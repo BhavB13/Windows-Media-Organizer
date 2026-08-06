@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..services import DuplicateScanService, TransferService
+from ..services import DuplicateScanService, FileOrganizerService, TransferService
+from ..sorting import HybridSortService, SortExecutionControl
+from ..core import OperationPhase, OperationResult, OperationState
 from .base import BaseOperationController
 from .qt_compat import QObject, QThreadPool
 
@@ -47,3 +49,103 @@ class TransferController(BaseOperationController):
                 reporter,
             )
         )
+
+
+class FileOrganizerController(BaseOperationController):
+    def __init__(
+        self,
+        service: FileOrganizerService | None = None,
+        thread_pool: QThreadPool | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(thread_pool, parent)
+        self.service = service or FileOrganizerService()
+
+    def plan(self, settings: Any) -> bool:
+        def task(cancellation, reporter):
+            reporter.set_state(OperationState.SCANNING, phase=OperationPhase.DISCOVERY, message="Discovering files to organize…")
+            plan = self.service.build_plan(settings, cancellation, reporter)
+            reporter.set_state(OperationState.COMPLETED, phase=OperationPhase.FINALIZATION, message="Organization plan ready.")
+            return OperationResult(
+                status=OperationState.COMPLETED,
+                counts={"planned": len(plan)},
+                data={"plan": plan},
+            )
+        return self.start_task(task)
+
+    def organize(self, settings: Any, selected_sources: list[str], reviewed_plan: list[Any]) -> bool:
+        return self.start_task(
+            lambda cancellation, reporter: self.service.organize(
+                settings,
+                selected_sources,
+                cancellation,
+                reporter,
+                reviewed_plan=reviewed_plan,
+            )
+        )
+
+
+class SortController(BaseOperationController):
+    """Qt worker boundary for the new hybrid sorting pipeline."""
+
+    def __init__(
+        self,
+        service: HybridSortService | None = None,
+        thread_pool: QThreadPool | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(thread_pool, parent)
+        self.service = service or HybridSortService()
+        self.execution_control: SortExecutionControl | None = None
+
+    def preview(self, profile: Any, sources: list[str], *, default_destination: str = "", dry_run: bool = True) -> bool:
+        return self.start_task(
+            lambda cancellation, reporter: OperationResult(
+                status=OperationState.COMPLETED,
+                data={"sort_plan": self.service.prepare(
+                    profile, sources, default_destination=default_destination, dry_run=dry_run,
+                    cancellation=cancellation, reporter=reporter,
+                )},
+            )
+        )
+
+    def execute(self, plan: Any, approved_sources: list[str], *, confirmed: bool, retry_attempts: int = 1) -> bool:
+        def task(cancellation, reporter):
+            self.execution_control = SortExecutionControl(cancellation)
+            result = self.service.execute(
+                plan, approved_sources=approved_sources, confirmed=confirmed,
+                control=self.execution_control, reporter=reporter, retry_attempts=retry_attempts,
+            )
+            status = OperationState.CANCELLED if result.status == "cancelled" else OperationState.COMPLETED
+            return OperationResult(
+                status=status,
+                counts={"completed": result.completed, "skipped": result.skipped, "errors": result.failed, "verified": result.verified},
+                warnings=result.failures, report_path=result.journal_path,
+                resume_information={"undo_available": result.undo_available}, data={"sort_result": result},
+            )
+        return self.start_task(task)
+
+    def pause(self) -> bool:
+        if not self.execution_control or not self.busy:
+            return False
+        self.execution_control.pause()
+        self._set_state(OperationState.PAUSED)
+        return True
+
+    def resume(self) -> bool:
+        if not self.execution_control or not self.busy:
+            return False
+        self.execution_control.resume()
+        self._set_state(OperationState.TRANSFERRING)
+        return True
+
+    def skip_current(self, source_path: str) -> bool:
+        if not self.execution_control or not self.busy:
+            return False
+        self.execution_control.skip(source_path)
+        return True
+
+    def cancel(self) -> bool:
+        if self.execution_control:
+            self.execution_control.cancel()
+        return super().cancel()

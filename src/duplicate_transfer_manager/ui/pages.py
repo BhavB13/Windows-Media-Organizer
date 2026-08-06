@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections import deque
+import csv
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QTimer, Qt, Signal, QUrl
+from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -32,22 +33,26 @@ from PySide6.QtWidgets import (
     QWidget,
     QDialog,
     QDialogButtonBox,
+    QInputDialog,
 )
 
 from models import Settings
 from transfer_safety import cleanup_partial_files
 from utils import DEFAULT_EXCLUDES, DEFAULT_MEDIA_EXTS, HashCache
 
-from ..controllers import DuplicateScanController, TransferController
-from ..core import AppSettings
+from ..controllers import DuplicateScanController, FileOrganizerController, TransferController
+from ..core import AppSettings, OrganizerSettings
 from ..runtime_paths import get_runtime_paths
+from ..sorting import SortExecutor
 from ..services import (
     DiagnosticsService,
     DuplicateQuarantineService,
     DuplicateReview,
     DashboardService,
+    FileOrganizerService,
     OperationRecordService,
     ReportService,
+    ScheduledScanService,
     SettingsService,
     STAGE_LABELS,
     TRANSFER_PROFILES,
@@ -76,6 +81,7 @@ from .widgets import (
     SourcePicker,
     StepIndicator,
     ToastBanner,
+    format_eta,
 )
 
 
@@ -102,9 +108,9 @@ class BasePage(QScrollArea):
         )
         self.content = QVBoxLayout(self.canvas)
         self.content.setContentsMargins(
-            Spacing.XXL,
             Spacing.XL,
-            Spacing.XXL,
+            Spacing.XL,
+            Spacing.XL,
             Spacing.XXL,
         )
         self.content.setSpacing(Spacing.LG)
@@ -116,6 +122,48 @@ class BasePage(QScrollArea):
 
     def finish(self) -> None:
         self.content.addStretch(1)
+
+
+class DashboardListCard(Card):
+    """Compact overview card for recent work, attention items, and storage."""
+
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMaximumHeight(360)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
+        layout.setSpacing(Spacing.MD)
+        self.heading = QLabel(title)
+        self.heading.setProperty("role", "section")
+        self.heading.setProperty("status", "success")
+        self.rows = QVBoxLayout()
+        self.rows.setSpacing(Spacing.SM)
+        layout.addWidget(self.heading)
+        layout.addLayout(self.rows)
+        layout.addStretch(1)
+
+    def set_items(self, values: list[tuple[str, str]]) -> None:
+        while self.rows.count():
+            item = self.rows.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for label, value in values:
+            row = QFrame()
+            row.setProperty("subtleCard", True)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(Spacing.MD, Spacing.SM, Spacing.MD, Spacing.SM)
+            row_layout.setSpacing(Spacing.SM)
+            title = QLabel(label)
+            title.setProperty("role", "section")
+            title.setWordWrap(True)
+            detail = QLabel(value)
+            detail.setProperty("muted", True)
+            detail.setWordWrap(True)
+            detail.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            row_layout.addWidget(title, 2)
+            row_layout.addWidget(detail, 1)
+            self.rows.addWidget(row)
 
 
 class OverviewPage(BasePage):
@@ -132,27 +180,36 @@ class OverviewPage(BasePage):
             parent,
         )
         self.dashboard_service = dashboard_service or DashboardService()
+        self.canvas.setMaximumWidth(1240)
+        self.content.setContentsMargins(
+            Spacing.XL,
+            Spacing.LG,
+            Spacing.XL,
+            Spacing.XL,
+        )
+        self.content.setSpacing(Spacing.MD)
+        self.content.setAlignment(Qt.AlignmentFlag.AlignTop)
+
         hero = Card()
         hero_layout = QVBoxLayout(hero)
         hero_layout.setContentsMargins(
-            Spacing.XXL,
-            Spacing.XXL,
-            Spacing.XXL,
-            Spacing.XXL,
+            Spacing.LG,
+            Spacing.LG,
+            Spacing.LG,
+            Spacing.LG,
         )
-        hero_layout.setSpacing(0)
+        hero_layout.setSpacing(Spacing.SM)
         hero_text = QWidget()
         text = QVBoxLayout(hero_text)
         text.setContentsMargins(0, 0, 0, 0)
         text.setSpacing(Spacing.SM)
         eyebrow = QLabel("SAFE, LOCAL FILE MANAGEMENT")
         eyebrow.setProperty("muted", True)
-        heading = QLabel("Bring order to your files\nwithout risking the originals.")
-        heading.setProperty("role", "display")
+        heading = QLabel("Review, import, and recover files with confidence.")
+        heading.setProperty("role", "title")
         heading.setWordWrap(True)
         detail = QLabel(
-            "Find byte-for-byte duplicates or import only files that are not "
-            "already in your library. Processing stays on this PC."
+            "Find byte-for-byte duplicates, import only new files, and restore quarantined copies without leaving your PC."
         )
         detail.setProperty("role", "subtitle")
         detail.setWordWrap(True)
@@ -165,8 +222,13 @@ class OverviewPage(BasePage):
         import_button.setIconSize(icon_size())
         find_button.clicked.connect(lambda: self.navigate_requested.emit("duplicates"))
         import_button.clicked.connect(lambda: self.navigate_requested.emit("import"))
+        organize_button = QPushButton("Sort files")
+        organize_button.setIcon(icon("folder"))
+        organize_button.setIconSize(icon_size())
+        organize_button.clicked.connect(lambda: self.navigate_requested.emit("sort"))
         actions.addWidget(find_button)
         actions.addWidget(import_button)
+        actions.addWidget(organize_button)
         actions.addStretch()
         text.addWidget(eyebrow)
         text.addWidget(heading)
@@ -177,19 +239,19 @@ class OverviewPage(BasePage):
         safety = Card(subtle=True)
         safety_layout = QVBoxLayout(safety)
         safety_layout.setContentsMargins(
-            Spacing.XL,
-            Spacing.XL,
-            Spacing.XL,
-            Spacing.XL,
+            Spacing.LG,
+            Spacing.LG,
+            Spacing.LG,
+            Spacing.LG,
         )
+        safety_layout.setSpacing(Spacing.SM)
         safety_icon = QLabel()
-        safety_icon.setPixmap(icon("quarantine", "#17803D", 32).pixmap(32, 32))
-        safety_title = QLabel("Designed for safe decisions")
+        safety_icon.setPixmap(icon("quarantine", "#17803D", 24).pixmap(24, 24))
+        safety_title = QLabel("Ready for careful cleanup")
         safety_title.setProperty("role", "section")
         safety_title.setWordWrap(True)
         safety_text = QLabel(
-            "Transfers are copy-only. Duplicate cleanup uses recoverable "
-            "quarantine and always includes a review step."
+            "Copy-only imports • Review before scan • Recoverable quarantine • Local reports"
         )
         safety_text.setProperty("muted", True)
         safety_text.setWordWrap(True)
@@ -199,7 +261,7 @@ class OverviewPage(BasePage):
         hero_layout.addWidget(
             ResponsiveGrid(
                 [hero_text, safety],
-                min_column_width=420,
+                min_column_width=380,
                 max_columns=2,
             )
         )
@@ -215,18 +277,21 @@ class OverviewPage(BasePage):
                 MetricCard("0", "Interrupted transfers", "Operations that may need attention or resume."),
                 MetricCard("0", "Connected devices", "Android devices available for duplicate scans or imports."),
             ],
+            min_column_width=240,
             max_columns=4,
         )
         self.content.addWidget(self.metrics)
 
-        self.recent = CompletionSummary("Recent activity")
-        self.content.addWidget(self.recent)
-        self.interrupted = CompletionSummary("Interrupted or resumable work")
-        self.content.addWidget(self.interrupted)
-        self.storage = CompletionSummary("Local storage")
-        self.content.addWidget(self.storage)
+        self.recent = DashboardListCard("Recent activity")
+        self.interrupted = DashboardListCard("Needs attention")
+        self.storage = DashboardListCard("Local storage")
+        self.summary_sections = ResponsiveGrid(
+            [self.recent, self.interrupted, self.storage],
+            min_column_width=300,
+            max_columns=3,
+        )
+        self.content.addWidget(self.summary_sections)
         self.refresh()
-        self.finish()
 
     def refresh(self) -> None:
         summary = self.dashboard_service.summary()
@@ -237,7 +302,7 @@ class OverviewPage(BasePage):
         self.metrics.widgets[1].layout().itemAt(0).widget().setText(str(len(recent)))
         self.metrics.widgets[2].layout().itemAt(0).widget().setText(str(len(interrupted)))
         self.metrics.widgets[3].layout().itemAt(0).widget().setText(str(len(devices)))
-        self.recent.set_metrics(
+        self.recent.set_items(
             [
                 (
                     record.get("title", "Operation"),
@@ -247,7 +312,7 @@ class OverviewPage(BasePage):
             ]
             or [("No activity yet", "Run a scan or import to populate the dashboard.")]
         )
-        self.interrupted.set_metrics(
+        self.interrupted.set_items(
             [
                 (
                     record.get("title", "Operation"),
@@ -258,13 +323,12 @@ class OverviewPage(BasePage):
             or [("No interrupted transfers", "Nothing currently needs recovery.")]
         )
         storage = summary["storage"]
-        self.storage.set_metrics(
+        self.storage.set_items(
             [
                 ("Cache", format_duplicate_size(storage["cache_bytes"])),
                 ("Reports", format_duplicate_size(storage["reports_bytes"])),
                 ("Quarantine", format_duplicate_size(storage["quarantine_bytes"])),
                 ("Connected devices", ", ".join(str(device.get("serial", device)) for device in devices[:3]) or "None"),
-                ("Data root", summary["runtime_root"]),
             ]
         )
 
@@ -301,7 +365,7 @@ class DuplicatesPage(BasePage):
         self.adb_serial = ""
 
         self.content.addWidget(
-            StepIndicator(["Source", "Options", "Summary", "Scan", "Review", "Quarantine"])
+            StepIndicator(["Source", "Options", "Review", "Scan", "Results", "Quarantine"])
         )
         self.banner = ToastBanner(
             "Review the scan setup, then run the scan. Files are never moved during scanning.",
@@ -333,6 +397,7 @@ class DuplicatesPage(BasePage):
             "Subfolders are included automatically.",
         )
         self.path.browse_requested.connect(self._browse)
+        self.path.path_changed.connect(lambda _value: self._invalidate_review())
         self.source_picker.selection_changed.connect(self._source_changed)
         self.device_choice = QComboBox()
         self.device_choice.setAccessibleName("Android device")
@@ -340,6 +405,14 @@ class DuplicatesPage(BasePage):
         source_layout.addWidget(self.source_picker)
         source_layout.addWidget(self.device_choice)
         source_layout.addWidget(self.path)
+        self.favorite_location = QComboBox()
+        self.favorite_location.setAccessibleName("Saved scan locations")
+        self.favorite_location.addItem("Use a saved location…", "")
+        for location in self.app_settings.favorite_locations:
+            self.favorite_location.addItem(location, location)
+        self.favorite_location.currentIndexChanged.connect(self._choose_favorite_location)
+        self.favorite_location.setVisible(bool(self.app_settings.favorite_locations))
+        source_layout.addWidget(self.favorite_location)
         self.content.addWidget(source_card)
 
         options = Card()
@@ -349,7 +422,7 @@ class DuplicatesPage(BasePage):
         options_layout.addWidget(
             SectionHeader(
                 "2. Select file categories",
-                "Technical hashing and exclusion controls stay tucked inside Advanced options.",
+                "Pictures include HEIC and common camera RAW formats; unavailable previews fall back to file details.",
             )
         )
         filters = QHBoxLayout()
@@ -360,6 +433,7 @@ class DuplicatesPage(BasePage):
         self.audio = QCheckBox("Audio")
         self.other = QCheckBox("Other file types")
         for widget in (self.pictures, self.videos, self.audio, self.other):
+            widget.toggled.connect(lambda _checked: self._invalidate_review())
             filters.addWidget(widget)
         filters.addStretch()
         options_layout.addLayout(filters)
@@ -368,36 +442,51 @@ class DuplicatesPage(BasePage):
         keep_row.addWidget(QLabel("Default copy to keep:"))
         self.oldest = QRadioButton("Oldest")
         self.newest = QRadioButton("Newest")
+        self.quality = QRadioButton("Highest resolution")
         self.oldest.setChecked(True)
         self.oldest.toggled.connect(lambda checked: checked and self._apply_preference("oldest"))
         self.newest.toggled.connect(lambda checked: checked and self._apply_preference("newest"))
+        self.quality.toggled.connect(lambda checked: checked and self._apply_preference("quality"))
         keep_row.addWidget(self.oldest)
         keep_row.addWidget(self.newest)
+        keep_row.addWidget(self.quality)
         keep_row.addStretch()
         options_layout.addLayout(keep_row)
+
+        self.dry_run_quarantine = QCheckBox("Dry run quarantine — validate without moving files")
+        self.dry_run_quarantine.setToolTip(
+            "After the scan, confirm quarantine in preview mode: validate selected duplicates and write a manifest without moving local files or pulling Android copies."
+        )
+        self.dry_run_quarantine.toggled.connect(lambda _checked: self._refresh_review_summary())
+        options_layout.addWidget(self.dry_run_quarantine)
 
         advanced = DisclosurePanel()
         advanced.body_layout.addWidget(QLabel("Hash algorithm"))
         self.hash_choice = QComboBox()
         self.hash_choice.addItem("SHA-256 — recommended", "sha256")
         self.hash_choice.addItem("MD5 — compatibility", "md5")
+        self.hash_choice.currentIndexChanged.connect(lambda _index: self._invalidate_review())
         advanced.body_layout.addWidget(self.hash_choice)
         advanced.body_layout.addWidget(QLabel("Hash mode"))
         self.hash_mode = QComboBox()
         self.hash_mode.addItem("Full content — safest", "full")
         self.hash_mode.addItem("Fast — large-file sampling", "fast")
+        self.hash_mode.currentIndexChanged.connect(lambda _index: self._invalidate_review())
         advanced.body_layout.addWidget(self.hash_mode)
         self.threads = QSpinBox()
         self.threads.setRange(1, 16)
         self.threads.setValue(4)
         self.threads.setPrefix("Hash workers: ")
+        self.threads.valueChanged.connect(lambda _value: self._invalidate_review())
         advanced.body_layout.addWidget(self.threads)
         self.min_size = QSpinBox()
         self.min_size.setRange(0, 1024 * 1024)
         self.min_size.setSuffix(" KB minimum")
+        self.min_size.valueChanged.connect(lambda _value: self._invalidate_review())
         advanced.body_layout.addWidget(self.min_size)
         self.exclusions = QLineEdit(", ".join(DEFAULT_EXCLUDES))
         self.exclusions.setAccessibleName("Excluded folder names")
+        self.exclusions.textChanged.connect(lambda _value: self._invalidate_review())
         advanced.body_layout.addWidget(QLabel("Excluded folders"))
         advanced.body_layout.addWidget(self.exclusions)
         options_layout.addWidget(advanced)
@@ -406,7 +495,7 @@ class DuplicatesPage(BasePage):
         self.summary_card = Card()
         summary_layout = QVBoxLayout(self.summary_card)
         summary_layout.setContentsMargins(Spacing.XL, Spacing.XL, Spacing.XL, Spacing.XL)
-        summary_layout.addWidget(SectionHeader("3. Review scan summary"))
+        summary_layout.addWidget(SectionHeader("3. Review scan setup"))
         self.summary = QLabel("Choose a source and click Review scan setup.")
         self.summary.setWordWrap(True)
         summary_layout.addWidget(self.summary)
@@ -422,6 +511,7 @@ class DuplicatesPage(BasePage):
         self.scan_button.setIconSize(icon_size())
         self.scan_button.clicked.connect(self._start_scan)
         self.scan_button.setEnabled(False)
+        self.scan_button.hide()
         action_row.addWidget(self.review_button)
         action_row.addWidget(self.scan_button)
         self.content.addLayout(action_row)
@@ -437,13 +527,24 @@ class DuplicatesPage(BasePage):
         results_layout.setSpacing(Spacing.MD)
         results_layout.addWidget(
             SectionHeader(
-                "5. Review duplicate groups",
+                "5. Review duplicate results",
                 "The checked rows will be moved into app-managed quarantine. The selected Keep row stays in place.",
             )
         )
         self.recoverable_label = QLabel("Estimated recoverable space: 0 B")
         self.recoverable_label.setProperty("role", "section")
         results_layout.addWidget(self.recoverable_label)
+        selection_row = QHBoxLayout()
+        selection_row.setSpacing(Spacing.SM)
+        select_recommended = QPushButton("Select recommended copies")
+        select_recommended.setToolTip("Select every copy except the file chosen to keep in each duplicate group.")
+        select_recommended.clicked.connect(self._select_recommended_duplicates)
+        clear_selection = QPushButton("Clear selection")
+        clear_selection.clicked.connect(self._clear_duplicate_selection)
+        selection_row.addWidget(select_recommended)
+        selection_row.addWidget(clear_selection)
+        selection_row.addStretch()
+        results_layout.addLayout(selection_row)
         self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
             ["Group", "Keep", "Quarantine", "Preview", "Filename", "Path", "Size", "Date", "Device"]
@@ -453,7 +554,13 @@ class DuplicatesPage(BasePage):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
+        self.table.setMinimumHeight(360)
+        self.table.currentCellChanged.connect(lambda *_args: self._update_duplicate_detail())
         results_layout.addWidget(self.table)
+        self.duplicate_detail = QLabel("Select a duplicate row to inspect its file details.")
+        self.duplicate_detail.setWordWrap(True)
+        self.duplicate_detail.setProperty("muted", True)
+        results_layout.addWidget(self.duplicate_detail)
         confirm_row = QHBoxLayout()
         confirm_row.addStretch()
         self.quarantine_button = PrimaryButton("Confirm quarantine")
@@ -470,14 +577,72 @@ class DuplicatesPage(BasePage):
         self.controller.cancelled.connect(self._on_scan_cancelled)
         self.controller.recoverable_error.connect(self._on_scan_error)
         self.controller.failed.connect(self._on_scan_error)
+        self._apply_category_defaults()
         self.finish()
 
+    def _apply_category_defaults(self) -> None:
+        """Use the saved category preference for a new duplicate scan."""
+        selected = set(self.app_settings.default_file_categories)
+        for key, checkbox in (
+            ("pictures", self.pictures),
+            ("videos", self.videos),
+            ("audio", self.audio),
+            ("other", self.other),
+        ):
+            checkbox.setChecked(key in selected)
+
     def _browse(self) -> None:
+        if self.source_picker.selected_key() == "android":
+            self._browse_adb_path(self.path)
+            return
         selected = QFileDialog.getExistingDirectory(self, "Choose scan location")
         if selected:
             self.path.set_path(selected)
 
+    def _choose_favorite_location(self) -> None:
+        location = self.favorite_location.currentData()
+        if location:
+            self.path.set_path(str(location))
+
+    def update_preferences(self, settings: AppSettings) -> None:
+        self.app_settings = settings
+        self.favorite_location.blockSignals(True)
+        self.favorite_location.clear()
+        self.favorite_location.addItem("Use a saved location…", "")
+        for location in settings.favorite_locations:
+            self.favorite_location.addItem(location, location)
+        self.favorite_location.setCurrentIndex(0)
+        self.favorite_location.blockSignals(False)
+        self.favorite_location.setVisible(bool(settings.favorite_locations))
+
+    def _browse_adb_path(self, selector: PathSelector) -> None:
+        from adb_bridge import ADBBridge
+
+        serial = self.device_choice.currentData() or ""
+        if not serial:
+            self.path.set_error("Select an authorized Android device before browsing phone folders.")
+            return
+        current = ADBBridge.normalize_remote_path(selector.path() or "/sdcard")
+        folders = ADBBridge.get_directory_structure(current, serial=serial)
+        if not folders:
+            self.banner.set_message(f"No accessible Android subfolders found under {current}. You can type a nested path manually.", "warning")
+            self.banner.show()
+            return
+        labels = [f"{folder['name']} — {folder['path']}" for folder in folders]
+        choice, accepted = QInputDialog.getItem(
+            self,
+            "Choose Android folder",
+            f"Folders under {current}",
+            labels,
+            0,
+            False,
+        )
+        if accepted and choice:
+            selector.set_path(choice.rsplit(" — ", 1)[-1])
+            selector.set_error()
+
     def _source_changed(self, source: str) -> None:
+        self._invalidate_review()
         is_android = source == "android"
         self.device_choice.setVisible(is_android)
         if is_android:
@@ -487,6 +652,10 @@ class DuplicatesPage(BasePage):
         else:
             self.path.entry.setPlaceholderText("Choose a folder or drive")
             self.path.helper.setText("Subfolders are included automatically.")
+
+    def _invalidate_review(self) -> None:
+        self.scan_button.setEnabled(False)
+        self.scan_button.hide()
 
     def _refresh_devices(self) -> None:
         from adb_bridge import ADBBridge
@@ -502,7 +671,10 @@ class DuplicatesPage(BasePage):
     def _selected_categories(self) -> tuple[bool, list[str]]:
         extensions: list[str] = []
         if self.pictures.isChecked():
-            extensions.extend([".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".heic", ".webp"])
+            extensions.extend([
+                ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".heic", ".webp",
+                ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2",
+            ])
         if self.videos.isChecked():
             extensions.extend([".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".mpeg", ".mpg", ".3gp", ".mts", ".m2ts", ".hevc"])
         if self.audio.isChecked():
@@ -550,12 +722,18 @@ class DuplicatesPage(BasePage):
             f"Scope: {mode}; {len(extensions) if only_media else 'all'} extension(s)\n"
             f"Hashing: {self.hash_choice.currentText()}, {self.hash_mode.currentText()}, "
             f"{self.threads.value()} worker(s)\n"
+            f"Quarantine mode: {'Dry run — validate only' if self.dry_run_quarantine.isChecked() else 'Live — move selected local duplicates after confirmation'}\n"
             "Next step: run a read-only scan. Files cannot be moved until you review results and confirm quarantine."
         )
         self.summary_card.show()
         self.scan_button.setEnabled(True)
+        self.scan_button.show()
         self.banner.set_message("Scan setup reviewed. You can run the read-only duplicate scan now.", "success")
         self.banner.show()
+
+    def _refresh_review_summary(self) -> None:
+        if not self.summary_card.isHidden() and self.path.path():
+            self._review()
 
     def _start_scan(self) -> None:
         self.scan_button.setEnabled(False)
@@ -573,14 +751,14 @@ class DuplicatesPage(BasePage):
         detail = event.current_item or event.message
         total = event.total_items or event.total_bytes
         processed = event.processed_items or event.bytes_processed
-        metrics = f"{value}%  •  {processed}/{total or '—'}  •  ETA {int(event.eta_seconds) if event.eta_seconds else '—'}"
+        metrics = f"{value}%  •  {processed}/{total or '—'}  •  ETA {format_eta(event.eta_seconds)}"
         self.progress_panel.update_progress(value, event.message, detail, metrics)
 
     def _on_scan_completed(self, result) -> None:
         self.review_button.setEnabled(True)
         self.scan_button.setEnabled(True)
         self.progress_panel.hide()
-        prefer = "newest" if self.newest.isChecked() else "oldest"
+        prefer = "quality" if self.quality.isChecked() else "newest" if self.newest.isChecked() else "oldest"
         self.review = build_duplicate_review(
             result.data.get("groups", []),
             prefer=prefer,
@@ -662,7 +840,10 @@ class DuplicatesPage(BasePage):
             self.table.setCellWidget(row, 1, keep)
             check = QCheckBox()
             check.setChecked(item.id in group.selected_item_ids)
-            check.toggled.connect(self._refresh_recoverable)
+            check.setAccessibleName(f"Quarantine {item.filename}")
+            check.toggled.connect(
+                lambda _checked, item_id=item.id: self._duplicate_selection_changed(item_id)
+            )
             self.quarantine_checks[item.id] = check
             self.table.setCellWidget(row, 2, check)
             preview = QLabel()
@@ -689,6 +870,54 @@ class DuplicatesPage(BasePage):
             QTimer.singleShot(0, self._render_next_batch)
             return
         self._refresh_recoverable()
+        if self.table.rowCount() and self.table.currentRow() < 0:
+            self.table.selectRow(0)
+        self._update_duplicate_detail()
+
+    def _duplicate_selection_changed(self, item_id: str) -> None:
+        row = self.item_rows.get(item_id)
+        if row is not None:
+            self.table.selectRow(row)
+        self._refresh_recoverable()
+
+    def _select_recommended_duplicates(self) -> None:
+        for item_id, check in self.quarantine_checks.items():
+            if check.isEnabled():
+                check.setChecked(True)
+        self._refresh_recoverable()
+
+    def _clear_duplicate_selection(self) -> None:
+        for check in self.quarantine_checks.values():
+            if check.isEnabled():
+                check.setChecked(False)
+        self._refresh_recoverable()
+
+    def _update_duplicate_detail(self) -> None:
+        if not self.review:
+            self.duplicate_detail.setText("Select a duplicate row to inspect its file details.")
+            return
+        row = self.table.currentRow()
+        item_id = next((candidate for candidate, candidate_row in self.item_rows.items() if candidate_row == row), "")
+        item = next(
+            (
+                candidate
+                for group in self.review.groups
+                for candidate in group.items
+                if candidate.id == item_id
+            ),
+            None,
+        )
+        if item is None:
+            self.duplicate_detail.setText("Select a duplicate row to inspect its file details.")
+            return
+        group_id = self.item_groups.get(item.id, "")
+        keep = self.keep_buttons.get(item.id)
+        selected = self.quarantine_checks.get(item.id)
+        action = "Keep this file" if keep and keep.isChecked() else "Quarantine selected" if selected and selected.isChecked() else "Not selected"
+        self.duplicate_detail.setText(
+            f"Group {group_id or '—'} • {item.filename} • {format_duplicate_size(item.size)} • "
+            f"{item.path}\n{action} • {item.created_label} • {item.dimensions or 'Metadata unavailable'} • {item.device}"
+        )
 
     def _keep_item(self, item_id: str) -> None:
         group_id = self.item_groups.get(item_id, "")
@@ -702,6 +931,10 @@ class DuplicatesPage(BasePage):
                 check.setEnabled(other_id != item_id)
                 check.blockSignals(False)
         self._refresh_recoverable()
+        row = self.item_rows.get(item_id)
+        if row is not None:
+            self.table.selectRow(row)
+        self._update_duplicate_detail()
 
     def _apply_preference(self, prefer: str) -> None:
         if not self.review:
@@ -709,7 +942,21 @@ class DuplicatesPage(BasePage):
         rebuilt = []
         for group in self.review.groups:
             ordered = sorted(group.items, key=lambda item: (item.modified, item.path.lower()))
-            keep = ordered[-1] if prefer == "newest" else ordered[0]
+            if prefer == "newest":
+                keep = ordered[-1]
+            elif prefer == "quality":
+                def quality_key(item):
+                    pixels = 0
+                    if "×" in item.dimensions:
+                        try:
+                            width, height = (int(value.strip()) for value in item.dimensions.split("×", 1))
+                            pixels = max(0, width) * max(0, height)
+                        except ValueError:
+                            pass
+                    return pixels, max(0, item.size), item.modified, item.path.lower()
+                keep = max(group.items, key=quality_key)
+            else:
+                keep = ordered[0]
             rebuilt.append(
                 type(group)(
                     id=group.id,
@@ -753,18 +1000,26 @@ class DuplicatesPage(BasePage):
             self.banner.set_message("Choose at least one duplicate to quarantine.", "warning")
             self.banner.show()
             return
-        response = QMessageBox.question(
-            self,
-            "Confirm quarantine",
-            "Move the checked local duplicates into app-managed quarantine?\n\n"
-            "Android files are copied into quarantine; phone originals are left untouched.",
-        )
+        if self.dry_run_quarantine.isChecked():
+            title = "Dry run quarantine"
+            message = (
+                "Validate the checked duplicates and write a quarantine manifest without moving local files "
+                "or pulling Android copies?"
+            )
+        else:
+            title = "Confirm quarantine"
+            message = (
+                "Move the checked local duplicates into app-managed quarantine?\n\n"
+                "Android files are copied into quarantine; phone originals are left untouched."
+            )
+        response = QMessageBox.question(self, title, message)
         if response != QMessageBox.StandardButton.Yes:
             return
         result = self.quarantine_service.quarantine(
             self.review,
             selected,
             adb_serial=self.adb_serial,
+            dry_run=self.dry_run_quarantine.isChecked(),
         )
         self.operation_service.record(
             "duplicate_quarantine",
@@ -774,7 +1029,12 @@ class DuplicatesPage(BasePage):
             summary={"manifest_path": result.manifest_path},
             failures=list(result.failures),
         )
-        if result.failures:
+        if result.dry_run:
+            self.banner.set_message(
+                f"Dry run complete: {result.quarantined_count} file(s) validated, {len(result.failures)} issue(s).",
+                "info" if not result.failures else "warning",
+            )
+        elif result.failures:
             self.banner.set_message(
                 f"Quarantined {result.quarantined_count} file(s), with {len(result.failures)} item(s) needing attention.",
                 "warning",
@@ -792,6 +1052,7 @@ class ImportPage(BasePage):
         self,
         hash_cache: HashCache | None = None,
         operation_service: OperationRecordService | None = None,
+        settings: AppSettings | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(
@@ -804,6 +1065,7 @@ class ImportPage(BasePage):
         if hash_cache is None:
             self.hash_cache.load()
         self.operation_service = operation_service or OperationRecordService(self.paths)
+        self.app_settings = settings or AppSettings()
         self.controller = TransferController(self.hash_cache)
         self.current_settings = None
         self.activity_lines: list[str] = []
@@ -831,21 +1093,31 @@ class ImportPage(BasePage):
                 ("drive", "External drive", "USB or storage", "drive"),
             ]
         )
-        self.source_picker.select("phone")
+        self.source_picker.select("folder")
         self.source_picker.selection_changed.connect(self._source_changed)
         self.device_choice = QComboBox()
         self.device_choice.setAccessibleName("Android device")
         self.source_path = PathSelector(
             "Import from",
-            "/sdcard/DCIM",
+            "Choose a folder or drive",
             "Source files remain unchanged.",
         )
+        self.source_path.path_changed.connect(lambda _value: self._invalidate_review())
         self.source_path.browse_requested.connect(
             lambda: self._browse(self.source_path, "Choose import source")
         )
         source_layout.addWidget(self.source_picker)
         source_layout.addWidget(self.device_choice)
         source_layout.addWidget(self.source_path)
+        self.favorite_source = QComboBox()
+        self.favorite_source.setAccessibleName("Saved import source locations")
+        self.favorite_source.addItem("Use a saved location…", "")
+        for location in self.app_settings.favorite_locations:
+            self.favorite_source.addItem(location, location)
+        self.favorite_source.currentIndexChanged.connect(self._choose_favorite_source)
+        self.favorite_source.setVisible(bool(self.app_settings.favorite_locations))
+        source_layout.addWidget(self.favorite_source)
+        source_layout.addWidget(InlineMessage("iOS transfer support coming soon.", "info"))
         self.content.addWidget(source)
 
         destination = Card()
@@ -862,11 +1134,13 @@ class ImportPage(BasePage):
             "Existing library",
             "Choose the folder containing your current files",
         )
+        self.library_path.path_changed.connect(lambda _value: self._invalidate_review())
         self.output_path = PathSelector(
             "Save new files to",
             "Leave blank to save into the existing library",
             "When blank, new files are copied into the existing library while preserving source folders.",
         )
+        self.output_path.path_changed.connect(lambda _value: self._invalidate_review())
         self.library_path.browse_requested.connect(
             lambda: self._browse(self.library_path, "Choose existing library")
         )
@@ -874,6 +1148,14 @@ class ImportPage(BasePage):
             lambda: self._browse(self.output_path, "Choose save location")
         )
         destination_layout.addWidget(self.library_path)
+        self.favorite_library = QComboBox()
+        self.favorite_library.setAccessibleName("Saved existing library locations")
+        self.favorite_library.addItem("Use a saved location…", "")
+        for location in self.app_settings.favorite_locations:
+            self.favorite_library.addItem(location, location)
+        self.favorite_library.currentIndexChanged.connect(self._choose_favorite_library)
+        self.favorite_library.setVisible(bool(self.app_settings.favorite_locations))
+        destination_layout.addWidget(self.favorite_library)
         destination_layout.addWidget(SectionHeader("3. Choose where new files should be saved"))
         destination_layout.addWidget(self.output_path)
         self.same_location_message = InlineMessage(
@@ -882,6 +1164,14 @@ class ImportPage(BasePage):
             "info",
         )
         destination_layout.addWidget(self.same_location_message)
+        self.destination_template = QComboBox()
+        self.destination_template.addItem("Preserve source folders — recommended", "preserve")
+        self.destination_template.addItem("Organize into date folders — YYYY/MM", "date")
+        self.destination_template.setAccessibleName("Destination organization")
+        self.destination_template.setToolTip("Date folders use each source file's available timestamp. This never changes source files.")
+        self.destination_template.currentIndexChanged.connect(lambda _index: self._invalidate_review())
+        destination_layout.addWidget(QLabel("Organize imported files"))
+        destination_layout.addWidget(self.destination_template)
         self.content.addWidget(destination)
 
         file_types = Card()
@@ -899,7 +1189,12 @@ class ImportPage(BasePage):
             ("other", "Other file types", False),
         ):
             option = QCheckBox(label)
-            option.setChecked(checked)
+            option.setChecked(
+                key in self.app_settings.default_file_categories
+                if self.app_settings.default_file_categories
+                else checked
+            )
+            option.toggled.connect(lambda _checked: self._invalidate_review())
             self.category_checks[key] = option
             type_row.addWidget(option)
         type_row.addStretch()
@@ -909,8 +1204,13 @@ class ImportPage(BasePage):
         for name, values in TRANSFER_PROFILES.items():
             suffix = " — recommended" if name == "Balanced" else ""
             self.profile.addItem(f"{name}{suffix}", name)
+        default_profile_index = self.profile.findData(self.app_settings.default_transfer_profile)
+        self.profile.setCurrentIndex(max(0, default_profile_index))
         self.profile.currentIndexChanged.connect(self._profile_changed)
-        self.profile_description = QLabel(TRANSFER_PROFILES["Balanced"]["description"])
+        self.profile.currentIndexChanged.connect(lambda _index: self._invalidate_review())
+        self.profile_description = QLabel(
+            TRANSFER_PROFILES[self.profile.currentData() or "Balanced"]["description"]
+        )
         self.profile_description.setProperty("muted", True)
         self.profile_description.setWordWrap(True)
         type_layout.addWidget(QLabel("Transfer profile"))
@@ -922,20 +1222,28 @@ class ImportPage(BasePage):
         self.hash_mode.addItem("Use profile default", "")
         self.hash_mode.addItem("Full content", "full")
         self.hash_mode.addItem("Fast large-file sampling", "fast")
+        self.hash_mode.currentIndexChanged.connect(lambda _index: self._invalidate_review())
         self.worker_count = QSpinBox()
         self.worker_count.setRange(0, 16)
         self.worker_count.setSpecialValueText("Profile default")
+        self.worker_count.valueChanged.connect(lambda _value: self._invalidate_review())
         self.retry_count = QSpinBox()
         self.retry_count.setRange(0, 10)
         self.retry_count.setSpecialValueText("Profile default")
+        self.retry_count.valueChanged.connect(lambda _value: self._invalidate_review())
         self.conflict = QComboBox()
         self.conflict.addItem("Rename if a filename exists", "rename")
         self.conflict.addItem("Skip existing filename", "skip")
         self.conflict.addItem("Replace existing filename", "replace")
+        self.conflict.currentIndexChanged.connect(lambda _index: self._invalidate_review())
         self.use_cache = QCheckBox("Use existing library cache")
         self.use_cache.setChecked(True)
         self.update_cache = QCheckBox("Update caches after successful copy")
         self.update_cache.setChecked(True)
+        self.dry_run = QCheckBox("Dry run — review what would copy without writing files")
+        self.dry_run.setChecked(False)
+        self.dry_run_cleanup = QCheckBox("Dry run partial cleanup")
+        self.dry_run_cleanup.setToolTip("List partial files that would be removed without deleting them.")
         self.use_adb_cache = QCheckBox("Use Android hash cache")
         self.use_adb_cache.setChecked(True)
         self.keep_awake = QCheckBox("Keep Android awake during transfer")
@@ -944,10 +1252,12 @@ class ImportPage(BasePage):
         self.reconnect_timeout.setRange(30, 3600)
         self.reconnect_timeout.setValue(300)
         self.reconnect_timeout.setSuffix(" sec reconnect timeout")
+        self.reconnect_timeout.valueChanged.connect(lambda _value: self._invalidate_review())
         self.stall_timeout = QSpinBox()
         self.stall_timeout.setRange(30, 1800)
         self.stall_timeout.setValue(180)
         self.stall_timeout.setSuffix(" sec stall timeout")
+        self.stall_timeout.valueChanged.connect(lambda _value: self._invalidate_review())
         cleanup_partials = QPushButton("Clean partial files in save location")
         cleanup_partials.clicked.connect(self._cleanup_partials)
         for label, widget in (
@@ -958,7 +1268,8 @@ class ImportPage(BasePage):
         ):
             advanced.body_layout.addWidget(QLabel(label))
             advanced.body_layout.addWidget(widget)
-        for widget in (self.use_cache, self.update_cache, self.use_adb_cache, self.keep_awake):
+        for widget in (self.dry_run, self.dry_run_cleanup, self.use_cache, self.update_cache, self.use_adb_cache, self.keep_awake):
+            widget.toggled.connect(lambda _checked: self._invalidate_review())
             advanced.body_layout.addWidget(widget)
         advanced.body_layout.addWidget(self.reconnect_timeout)
         advanced.body_layout.addWidget(self.stall_timeout)
@@ -968,7 +1279,8 @@ class ImportPage(BasePage):
 
         self.content.addWidget(
             InlineMessage(
-                "Imports are copy-only and structure-preserving by default. Source files are not modified.",
+                "Imports are copy-only and structure-preserving by default. Source files are not modified. "
+                "Pause/resume checkpoints are saved between completed files; full live pause controls are planned.",
                 "success",
             )
         )
@@ -985,6 +1297,7 @@ class ImportPage(BasePage):
         self.run_button.setIcon(icon("import", "#FFFFFF"))
         self.run_button.setIconSize(icon_size())
         self.run_button.setEnabled(False)
+        self.run_button.hide()
         self.run_button.clicked.connect(self._run_import)
         action.addWidget(self.review_button)
         action.addWidget(self.run_button)
@@ -1029,15 +1342,67 @@ class ImportPage(BasePage):
         self.controller.recoverable_error.connect(self._on_failed)
         self.controller.failed.connect(self._on_failed)
         self.controller.technical_log.connect(self._on_log)
-        self._source_changed("phone")
+        self._source_changed("folder")
         self.finish()
 
     def _browse(self, selector: PathSelector, title: str) -> None:
+        if selector is self.source_path and self.source_picker.selected_key() == "phone":
+            self._browse_adb_path(selector)
+            return
         selected = QFileDialog.getExistingDirectory(self, title)
         if selected:
             selector.set_path(selected)
 
+    def _choose_favorite_source(self) -> None:
+        location = self.favorite_source.currentData()
+        if location:
+            self.source_path.set_path(str(location))
+
+    def _choose_favorite_library(self) -> None:
+        location = self.favorite_library.currentData()
+        if location:
+            self.library_path.set_path(str(location))
+
+    def update_preferences(self, settings: AppSettings) -> None:
+        self.app_settings = settings
+        for combo in (self.favorite_source, self.favorite_library):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("Use a saved location…", "")
+            for location in settings.favorite_locations:
+                combo.addItem(location, location)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+            combo.setVisible(bool(settings.favorite_locations))
+
+    def _browse_adb_path(self, selector: PathSelector) -> None:
+        from adb_bridge import ADBBridge
+
+        serial = self.device_choice.currentData() or ""
+        if not serial:
+            selector.set_error("Select an authorized Android device before browsing phone folders.")
+            return
+        current = ADBBridge.normalize_remote_path(selector.path() or "/sdcard")
+        folders = ADBBridge.get_directory_structure(current, serial=serial)
+        if not folders:
+            self.banner.set_message(f"No accessible Android subfolders found under {current}. You can type a nested path manually.", "warning")
+            self.banner.show()
+            return
+        labels = [f"{folder['name']} — {folder['path']}" for folder in folders]
+        choice, accepted = QInputDialog.getItem(
+            self,
+            "Choose Android folder",
+            f"Folders under {current}",
+            labels,
+            0,
+            False,
+        )
+        if accepted and choice:
+            selector.set_path(choice.rsplit(" — ", 1)[-1])
+            selector.set_error()
+
     def _source_changed(self, source: str) -> None:
+        self._invalidate_review()
         is_phone = source == "phone"
         self.device_choice.setVisible(is_phone)
         self.use_adb_cache.setVisible(is_phone)
@@ -1047,6 +1412,11 @@ class ImportPage(BasePage):
             self._refresh_devices()
         else:
             self.source_path.entry.setPlaceholderText("Choose a folder or drive")
+
+    def _invalidate_review(self) -> None:
+        self.current_settings = None
+        self.run_button.setEnabled(False)
+        self.run_button.hide()
 
     def _refresh_devices(self) -> None:
         from adb_bridge import ADBBridge
@@ -1087,7 +1457,77 @@ class ImportPage(BasePage):
             adb_serial=self.adb_serial,
             reconnect_timeout=self.reconnect_timeout.value(),
             stall_timeout=self.stall_timeout.value(),
+            destination_template=self.destination_template.currentData(),
+            dry_run=self.dry_run.isChecked(),
         )
+
+    def _resume_setup(self) -> dict:
+        """Capture only the user-visible setup needed for a reviewed journal resume."""
+        return {
+            "source_kind": self.source_picker.selected_key(),
+            "source_root": self.source_path.path(),
+            "existing_library": self.library_path.path(),
+            "save_to": self.output_path.path(),
+            "destination_template": self.destination_template.currentData() or "preserve",
+            "categories": self._selected_categories(),
+            "profile": self.profile.currentData() or "Balanced",
+            "hash_mode": self.hash_mode.currentData() or "",
+            "worker_count": self.worker_count.value(),
+            "retry_count": self.retry_count.value(),
+            "conflict": self.conflict.currentData() or "rename",
+            "use_cache": self.use_cache.isChecked(),
+            "update_cache": self.update_cache.isChecked(),
+            "use_adb_cache": self.use_adb_cache.isChecked(),
+            "keep_awake": self.keep_awake.isChecked(),
+            "reconnect_timeout": self.reconnect_timeout.value(),
+            "stall_timeout": self.stall_timeout.value(),
+            "dry_run": self.dry_run.isChecked(),
+            "adb_serial": self.adb_serial,
+        }
+
+    def apply_resume_setup(self, setup: dict) -> None:
+        """Restore a cancelled import's setup but require a fresh user review."""
+        source_kind = str(setup.get("source_kind", "folder"))
+        if source_kind in self.source_picker.cards:
+            self.source_picker.select(source_kind)
+        self.source_path.set_path(str(setup.get("source_root", "")))
+        self.library_path.set_path(str(setup.get("existing_library", "")))
+        self.output_path.set_path(str(setup.get("save_to", "")))
+        template_index = self.destination_template.findData(str(setup.get("destination_template", "preserve")))
+        if template_index >= 0:
+            self.destination_template.setCurrentIndex(template_index)
+        selected_categories = set(setup.get("categories", []))
+        for key, check in self.category_checks.items():
+            check.setChecked(key in selected_categories)
+        profile_index = self.profile.findData(str(setup.get("profile", "Balanced")))
+        if profile_index >= 0:
+            self.profile.setCurrentIndex(profile_index)
+        for choice, value in ((self.hash_mode, setup.get("hash_mode", "")), (self.conflict, setup.get("conflict", "rename"))):
+            index = choice.findData(value)
+            if index >= 0:
+                choice.setCurrentIndex(index)
+        self.worker_count.setValue(int(setup.get("worker_count", 0) or 0))
+        self.retry_count.setValue(int(setup.get("retry_count", 0) or 0))
+        self.use_cache.setChecked(bool(setup.get("use_cache", True)))
+        self.update_cache.setChecked(bool(setup.get("update_cache", True)))
+        self.use_adb_cache.setChecked(bool(setup.get("use_adb_cache", True)))
+        self.keep_awake.setChecked(bool(setup.get("keep_awake", True)))
+        self.reconnect_timeout.setValue(int(setup.get("reconnect_timeout", 300) or 300))
+        self.stall_timeout.setValue(int(setup.get("stall_timeout", 180) or 180))
+        self.dry_run.setChecked(bool(setup.get("dry_run", False)))
+        serial = str(setup.get("adb_serial", ""))
+        if source_kind == "phone" and serial:
+            index = self.device_choice.findData(serial)
+            if index < 0:
+                self.device_choice.addItem(f"Reconnect previous Android device — {serial}", serial)
+                index = self.device_choice.findData(serial)
+            self.device_choice.setCurrentIndex(index)
+        self._invalidate_review()
+        self.banner.set_message(
+            "Previous import setup restored. Confirm the source and destination, then review before resuming.",
+            "info",
+        )
+        self.banner.show()
 
     def _review(self) -> None:
         valid = True
@@ -1126,6 +1566,7 @@ class ImportPage(BasePage):
                 ("Existing library", review.existing_library),
                 ("Save new files to", review.save_to),
                 ("Copy mode", "Copy-only, structure-preserving"),
+                ("Dry run", "Yes — no files will be written" if self.current_settings.dry_run else "No — copy only new files after comparison"),
                 ("Profile", f"{review.profile}: {review.profile_description}"),
                 ("Advanced", review.advanced_summary),
                 ("Location note", same_text),
@@ -1133,6 +1574,7 @@ class ImportPage(BasePage):
         )
         self.review_card.show()
         self.run_button.setEnabled(True)
+        self.run_button.show()
         self.banner.set_message("Import reviewed. Run it when you are ready.", "success")
         self.banner.show()
 
@@ -1161,8 +1603,18 @@ class ImportPage(BasePage):
             self.banner.set_message("Choose an existing library or save location before cleaning partial files.", "warning")
             self.banner.show()
             return
-        removed = cleanup_partial_files(root)
-        self.banner.set_message(f"Removed {len(removed)} partial transfer file(s).", "success")
+        if not self.dry_run_cleanup.isChecked():
+            response = QMessageBox.question(
+                self,
+                "Clean partial files",
+                "Remove leftover .partial transfer files in the selected save location?\n\n"
+                "This does not remove source files or completed imports.",
+            )
+            if response != QMessageBox.StandardButton.Yes:
+                return
+        removed = cleanup_partial_files(root, dry_run=self.dry_run_cleanup.isChecked())
+        action = "Would remove" if self.dry_run_cleanup.isChecked() else "Removed"
+        self.banner.set_message(f"{action} {len(removed)} partial transfer file(s).", "success")
         self.banner.show()
 
     def _set_stage(self, active_stage: str) -> None:
@@ -1183,7 +1635,7 @@ class ImportPage(BasePage):
         value = int((event.progress or 0) * 100)
         processed = event.processed_items or event.bytes_processed
         total = event.total_items or event.total_bytes
-        metrics = f"{value}%  •  {processed}/{total or '—'}  •  ETA {int(event.eta_seconds) if event.eta_seconds else '—'}"
+        metrics = f"{value}%  •  {processed}/{total or '—'}  •  ETA {format_eta(event.eta_seconds)}"
         self.progress_panel.update_progress(value, event.message, event.current_item or event.message, metrics)
 
     def _on_log(self, line: str) -> None:
@@ -1222,7 +1674,10 @@ class ImportPage(BasePage):
             "import",
             "cancelled",
             title="Cancelled import",
-            summary={"resume": "Completed files remain recorded for resume."},
+            summary={
+                "resume": "Completed files remain recorded for resume.",
+                "resume_setup": self._resume_setup(),
+            },
             resume_available=True,
         )
         self.banner.set_message("Import cancelled safely. Completed files remain recorded for resume.", "warning")
@@ -1236,6 +1691,7 @@ class ImportPage(BasePage):
             "import",
             "failed",
             title="Failed import",
+            summary={"resume_setup": self._resume_setup()},
             failures=[getattr(error, "message", str(error))],
             resume_available=True,
         )
@@ -1243,8 +1699,589 @@ class ImportPage(BasePage):
         self.banner.show()
 
 
+class OrganizerPage(BasePage):
+    """Review-first local file organization with manifest-backed rollback."""
+
+    navigate_requested = Signal(str)
+
+    def __init__(
+        self,
+        service: FileOrganizerService | None = None,
+        operations: OperationRecordService | None = None,
+        settings: AppSettings | None = None,
+        settings_service: SettingsService | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(
+            "Organize Files",
+            "Flatten selected folders or sort local files with a reviewable, reversible plan.",
+            parent,
+        )
+        self.service = service or FileOrganizerService()
+        self.operations = operations or OperationRecordService(self.service.paths)
+        self.app_settings = settings or AppSettings()
+        self.settings_service = settings_service
+        self.scheduler = ScheduledScanService()
+        self.controller = FileOrganizerController(self.service)
+        self.plan = []
+        self.folder_checks: dict[str, QCheckBox] = {}
+        self.plan_checks: dict[str, QCheckBox] = {}
+        self._planning = False
+
+        self.content.addWidget(StepIndicator(["Source", "Folders", "Review", "Organize", "Recovery"]))
+        self.banner = ToastBanner("Organization is reversible for 90 days by default.", "info")
+        self.banner.hide()
+        self.content.addWidget(self.banner)
+
+        setup = Card()
+        layout = QVBoxLayout(setup)
+        layout.setContentsMargins(Spacing.XL, Spacing.XL, Spacing.XL, Spacing.XL)
+        layout.setSpacing(Spacing.MD)
+        layout.addWidget(SectionHeader("1. Choose folders", "Files are moved only after you review a plan."))
+        self.preset_choice = QComboBox()
+        self.preset_choice.addItem("Custom organization", {})
+        for preset in self._presets():
+            self.preset_choice.addItem(preset["name"], preset)
+        self.preset_choice.currentIndexChanged.connect(self._apply_preset)
+        save_preset = QPushButton("Save current as preset")
+        save_preset.clicked.connect(self._save_preset)
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(self.preset_choice, 1)
+        preset_row.addWidget(save_preset)
+        layout.addWidget(QLabel("Organization preset"))
+        layout.addLayout(preset_row)
+        self.schedule_frequency = QComboBox()
+        self.schedule_frequency.addItem("No scheduled preview", "off")
+        self.schedule_frequency.addItem("Daily read-only preview", "daily")
+        self.schedule_frequency.addItem("Weekly read-only preview", "weekly")
+        self.schedule_frequency.setCurrentIndex(
+            max(0, self.schedule_frequency.findData(self.app_settings.organization_schedule_frequency))
+        )
+        schedule_button = QPushButton("Save preview schedule")
+        schedule_button.clicked.connect(self._save_schedule)
+        schedule_row = QHBoxLayout()
+        schedule_row.addWidget(self.schedule_frequency, 1)
+        schedule_row.addWidget(schedule_button)
+        layout.addWidget(QLabel("Automated organizer preview"))
+        layout.addLayout(schedule_row)
+        self.source = PathSelector("Organize from", "Choose a local source folder", "Select subfolders to flatten or sort.")
+        self.destination = PathSelector("Main destination", "Choose a local destination folder", "Existing files are protected by the conflict policy.")
+        self.source.browse_requested.connect(lambda: self._browse(self.source, "Choose source folder"))
+        self.destination.browse_requested.connect(lambda: self._browse(self.destination, "Choose destination folder"))
+        self.source.path_changed.connect(lambda _value: self._invalidate_plan())
+        self.destination.path_changed.connect(lambda _value: self._invalidate_plan())
+        layout.addWidget(self.source)
+        layout.addWidget(self.destination)
+        self.mode = QComboBox()
+        self.mode.addItem("Flatten selected folders — recommended", "flatten")
+        self.mode.addItem("Sort by file type", "type")
+        self.mode.addItem("Sort by file date", "date")
+        self.mode.addItem("Local ML organization", "ml")
+        self.mode.setAccessibleName("Organization mode")
+        self.mode.currentIndexChanged.connect(lambda _index: self._invalidate_plan())
+        layout.addWidget(QLabel("Organization mode"))
+        layout.addWidget(self.mode)
+        self.conflict = QComboBox()
+        self.conflict.addItem("Rename files on conflict — recommended", "rename")
+        self.conflict.addItem("Skip files on conflict", "skip")
+        if self.app_settings.experience_mode == "advanced":
+            self.conflict.addItem("Replace destination file (keeps a rollback backup)", "replace")
+        self.conflict.setAccessibleName("Organizer conflict policy")
+        self.conflict.currentIndexChanged.connect(lambda _index: self._invalidate_plan())
+        layout.addWidget(self.conflict)
+        self.dry_run = QCheckBox("Dry run — preview moves without changing files")
+        self.cleanup_empty = QCheckBox("Remove empty selected folders after organization")
+        self.ml_auto = QCheckBox("Automatically select high-confidence local ML suggestions")
+        self.ml_threshold = QSpinBox()
+        self.ml_threshold.setRange(80, 99)
+        self.ml_threshold.setValue(92)
+        self.ml_threshold.setSuffix("% ML confidence")
+        self.ml_auto.setVisible(False)
+        self.ml_threshold.setVisible(False)
+        self.mode.currentIndexChanged.connect(self._sync_mode_controls)
+        self.ml_threshold.valueChanged.connect(lambda _value: self._invalidate_plan())
+        for widget in (self.dry_run, self.cleanup_empty, self.ml_auto):
+            widget.toggled.connect(lambda _checked: self._invalidate_plan())
+        layout.addWidget(self.dry_run)
+        layout.addWidget(self.cleanup_empty)
+        layout.addWidget(self.ml_auto)
+        layout.addWidget(self.ml_threshold)
+        self.content.addWidget(setup)
+
+        self.folder_card = Card(subtle=True)
+        folder_layout = QVBoxLayout(self.folder_card)
+        folder_layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
+        folder_layout.addWidget(SectionHeader("2. Select subfolders to include", "Unchecked folders remain unchanged."))
+        self.folder_list = QVBoxLayout()
+        folder_layout.addLayout(self.folder_list)
+        self.folder_card.hide()
+        self.content.addWidget(self.folder_card)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        self.review_button = QPushButton("Review organization plan")
+        self.review_button.clicked.connect(self._review)
+        self.run_button = PrimaryButton("Run organization")
+        self.run_button.clicked.connect(self._run)
+        self.run_button.hide()
+        actions.addWidget(self.review_button)
+        actions.addWidget(self.run_button)
+        self.content.addLayout(actions)
+
+        self.progress = ProgressPanel()
+        self.progress.cancel_requested.connect(self.controller.cancel)
+        self.progress.hide()
+        self.content.addWidget(self.progress)
+
+        self.plan_card = Card()
+        plan_layout = QVBoxLayout(self.plan_card)
+        plan_layout.setContentsMargins(Spacing.XL, Spacing.XL, Spacing.XL, Spacing.XL)
+        plan_layout.addWidget(SectionHeader("3. Review planned moves", "Low-confidence ML suggestions remain unchecked unless you choose them."))
+        self.plan_summary = QLabel()
+        self.plan_summary.setWordWrap(True)
+        plan_layout.addWidget(self.plan_summary)
+        self.plan_filter = QLineEdit()
+        self.plan_filter.setPlaceholderText("Filter planned files, folders, categories, or conflicts")
+        self.plan_filter.setAccessibleName("Filter organization plan")
+        self.plan_filter.textChanged.connect(self._filter_plan_rows)
+        plan_layout.addWidget(self.plan_filter)
+        self.plan_table = QTableWidget(0, 7)
+        self.plan_table.setHorizontalHeaderLabels(["Move", "Source", "Destination", "Category", "Confidence", "Reason", "Conflict"])
+        self.plan_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.plan_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.plan_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.plan_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.plan_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.plan_table.verticalHeader().setVisible(False)
+        self.plan_table.setMinimumHeight(320)
+        self.plan_table.currentCellChanged.connect(lambda *_args: self._sync_plan_actions())
+        plan_layout.addWidget(self.plan_table)
+        self.plan_actions = QHBoxLayout()
+        self.select_all_plan = QPushButton("Select all eligible")
+        self.clear_plan_selection = QPushButton("Clear selection")
+        self.relabel_plan = QPushButton("Relabel selected")
+        self.always_rule = QPushButton("Always use label for extension")
+        self.exclude_folder = QPushButton("Never auto-organize this folder")
+        self.export_plan = QPushButton("Export reviewed plan CSV")
+        self.select_all_plan.clicked.connect(lambda: self._set_plan_selection(True))
+        self.clear_plan_selection.clicked.connect(lambda: self._set_plan_selection(False))
+        self.relabel_plan.clicked.connect(self._relabel_selected_plan)
+        self.always_rule.clicked.connect(self._save_extension_rule)
+        self.exclude_folder.clicked.connect(self._exclude_selected_folder)
+        self.export_plan.clicked.connect(self._export_plan_csv)
+        self.plan_actions.addWidget(self.select_all_plan)
+        self.plan_actions.addWidget(self.clear_plan_selection)
+        self.plan_actions.addWidget(self.relabel_plan)
+        self.plan_actions.addWidget(self.always_rule)
+        self.plan_actions.addWidget(self.exclude_folder)
+        self.plan_actions.addWidget(self.export_plan)
+        self.plan_actions.addStretch()
+        plan_layout.addLayout(self.plan_actions)
+        self.plan_card.hide()
+        self.content.addWidget(self.plan_card)
+
+        self.recovery_card = Card(subtle=True)
+        recovery_layout = QHBoxLayout(self.recovery_card)
+        recovery_layout.setContentsMargins(Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD)
+        self.recovery_choice = QComboBox()
+        self.recovery_choice.setAccessibleName("Organization recovery operation")
+        refresh = QPushButton("Refresh recovery")
+        refresh.clicked.connect(self._refresh_recovery)
+        rollback = QPushButton("Rollback selected operation")
+        rollback.clicked.connect(self._rollback)
+        recovery_layout.addWidget(QLabel("Organization recovery"))
+        recovery_layout.addWidget(self.recovery_choice, 1)
+        recovery_layout.addWidget(refresh)
+        recovery_layout.addWidget(rollback)
+        self.content.addWidget(self.recovery_card)
+
+        catalog_card = Card(subtle=True)
+        catalog_layout = QVBoxLayout(catalog_card)
+        catalog_layout.setContentsMargins(Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD)
+        catalog_layout.addWidget(SectionHeader("Local organization catalog", "Search files organized by this app. The index stays on this PC."))
+        self.catalog_search = QLineEdit()
+        self.catalog_search.setPlaceholderText("Search organized filename or category")
+        self.catalog_search.setAccessibleName("Search organization catalog")
+        self.catalog_search.textChanged.connect(self._search_catalog)
+        self.catalog_results = QLabel("Search to find locally cataloged organized files.")
+        self.catalog_results.setWordWrap(True)
+        self.catalog_results.setProperty("muted", True)
+        catalog_layout.addWidget(self.catalog_search)
+        catalog_layout.addWidget(self.catalog_results)
+        self.content.addWidget(catalog_card)
+
+        self.controller.progress.connect(self._on_progress)
+        self.controller.completed.connect(self._on_completed)
+        self.controller.cancelled.connect(self._on_cancelled)
+        self.controller.recoverable_error.connect(self._on_failed)
+        self.controller.failed.connect(self._on_failed)
+        self._refresh_recovery()
+        self.finish()
+
+    def _browse(self, selector: PathSelector, title: str) -> None:
+        selected = QFileDialog.getExistingDirectory(self, title)
+        if selected:
+            selector.set_path(selected)
+
+    def _presets(self) -> list[dict]:
+        built_in = [
+            {"name": "Downloads Cleanup", "mode": "type", "conflict_policy": "rename"},
+            {"name": "Camera Card Import", "mode": "date", "conflict_policy": "rename"},
+            {"name": "Desktop Cleanup", "mode": "type", "conflict_policy": "rename"},
+            {"name": "Project Archive", "mode": "flatten", "conflict_policy": "rename"},
+        ]
+        return [*built_in, *[preset for preset in self.app_settings.organization_presets if isinstance(preset, dict) and preset.get("name")]]
+
+    def _apply_preset(self, _index: int | None = None) -> None:
+        preset = self.preset_choice.currentData() or {}
+        if not preset:
+            return
+        for selector, key in ((self.source, "source_root"), (self.destination, "destination_root")):
+            if preset.get(key):
+                selector.set_path(str(preset[key]))
+        mode = self.mode.findData(preset.get("mode", "flatten"))
+        if mode >= 0:
+            self.mode.setCurrentIndex(mode)
+        conflict = self.conflict.findData(preset.get("conflict_policy", "rename"))
+        if conflict >= 0:
+            self.conflict.setCurrentIndex(conflict)
+        self.cleanup_empty.setChecked(bool(preset.get("cleanup_empty_folders", False)))
+        self.ml_auto.setChecked(bool(preset.get("ml_auto_organize", False)))
+        self.ml_threshold.setValue(int(float(preset.get("ml_confidence_threshold", 0.92)) * 100))
+        self.folder_checks.clear()
+        self.folder_card.hide()
+        self._invalidate_plan()
+
+    def _save_preset(self) -> None:
+        if not self.settings_service:
+            self.banner.set_message("Preset saving is unavailable in this view.", "warning")
+            self.banner.show()
+            return
+        name, accepted = QInputDialog.getText(self, "Save organization preset", "Preset name")
+        if not accepted or not name.strip():
+            return
+        preset = {
+            "name": name.strip(), "source_root": self.source.path(), "destination_root": self.destination.path(),
+            "mode": self.mode.currentData(), "conflict_policy": self.conflict.currentData(),
+            "cleanup_empty_folders": self.cleanup_empty.isChecked(), "ml_auto_organize": self.ml_auto.isChecked(),
+            "ml_confidence_threshold": self.ml_threshold.value() / 100,
+        }
+        self.app_settings.organization_presets = [
+            existing for existing in self.app_settings.organization_presets
+            if isinstance(existing, dict) and existing.get("name") != preset["name"]
+        ] + [preset]
+        self.settings_service.save(self.app_settings)
+        self.preset_choice.addItem(preset["name"], preset)
+        self.preset_choice.setCurrentIndex(self.preset_choice.count() - 1)
+        self.banner.set_message(f"Saved organization preset: {preset['name']}", "success")
+        self.banner.show()
+
+    def _save_schedule(self) -> None:
+        if not self.settings_service:
+            self.banner.set_message("Schedule saving is unavailable in this view.", "warning")
+            self.banner.show()
+            return
+        frequency = self.schedule_frequency.currentData()
+        try:
+            self.scheduler.configure_organizer_preview(
+                self.source.path(), self.destination.path(), self.mode.currentData(), frequency,
+                data_root=str(self.settings_service.paths.root),
+            )
+        except Exception as exc:
+            self.banner.set_message(f"Organizer preview schedule was not changed: {exc}", "warning")
+            self.banner.show()
+            return
+        self.app_settings.organization_schedule_frequency = frequency
+        self.settings_service.save(self.app_settings)
+        label = "disabled" if frequency == "off" else f"saved for {frequency} previews"
+        self.banner.set_message(f"Read-only organizer preview schedule {label}.", "success")
+        self.banner.show()
+
+    def _sync_mode_controls(self) -> None:
+        enabled = self.mode.currentData() == "ml"
+        self.ml_auto.setVisible(enabled)
+        self.ml_threshold.setVisible(enabled)
+
+    def _invalidate_plan(self) -> None:
+        self.plan = []
+        self.plan_card.hide()
+        self.run_button.hide()
+
+    def _settings(self) -> OrganizerSettings:
+        return OrganizerSettings(
+            source_root=self.source.path(), destination_root=self.destination.path(),
+            selected_folders=tuple(path for path, check in self.folder_checks.items() if check.isChecked()),
+            mode=self.mode.currentData(), conflict_policy=self.conflict.currentData(), dry_run=self.dry_run.isChecked(),
+            cleanup_empty_folders=self.cleanup_empty.isChecked(), ml_auto_organize=self.ml_auto.isChecked(),
+            ml_confidence_threshold=self.ml_threshold.value() / 100,
+        )
+
+    def _review(self) -> None:
+        if not self.source.path() or not self.destination.path():
+            if not self.source.path():
+                self.source.set_error("Choose a source folder.")
+            if not self.destination.path():
+                self.destination.set_error("Choose a destination folder.")
+            return
+        self.source.set_error()
+        self.destination.set_error()
+        if not self.folder_checks:
+            self._populate_folders()
+            return
+        self._planning = True
+        self.review_button.setEnabled(False)
+        self.progress.show()
+        self.progress.update_progress(0, "Building organization plan…", "Discovering selected files", "0% • 0 files")
+        if not self.controller.plan(self._settings()):
+            self.review_button.setEnabled(True)
+
+    def _populate_folders(self) -> None:
+        while self.folder_list.count():
+            item = self.folder_list.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.folder_checks.clear()
+        folders = self.service.discover_folders(self.source.path())
+        for folder in folders:
+            check = QCheckBox(folder)
+            check.setChecked(True)
+            check.toggled.connect(self._invalidate_plan)
+            self.folder_checks[folder] = check
+            self.folder_list.addWidget(check)
+        self.folder_card.setVisible(bool(folders))
+        if not folders:
+            self.banner.set_message("No eligible subfolders were found in the source folder.", "warning")
+            self.banner.show()
+            return
+        self.banner.set_message("Choose the subfolders to include, then review the organization plan.", "info")
+        self.banner.show()
+
+    def _run(self) -> None:
+        selected = [path for path, check in self.plan_checks.items() if check.isChecked()]
+        if not selected:
+            self.banner.set_message("Choose at least one planned file to organize.", "warning")
+            self.banner.show()
+            return
+        if not self.dry_run.isChecked():
+            response = QMessageBox.question(self, "Run organization", "Move the selected files into the reviewed destination structure? You can roll this operation back for 90 days.")
+            if response != QMessageBox.StandardButton.Yes:
+                return
+        self._planning = False
+        self.review_button.setEnabled(False)
+        self.run_button.setEnabled(False)
+        self.progress.show()
+        self.progress.update_progress(0, "Organizing reviewed files…", "Preparing reversible manifest", "0% • 0 files")
+        self.controller.organize(self._settings(), selected, self.plan)
+
+    def _on_progress(self, event) -> None:
+        value = int((event.progress or 0) * 100)
+        self.progress.update_progress(value, event.message, event.current_item or event.message, f"{value}% • {event.processed_items}/{event.total_items or '—'}")
+
+    def _on_completed(self, result) -> None:
+        self.progress.hide()
+        self.review_button.setEnabled(True)
+        self.run_button.setEnabled(True)
+        if self._planning:
+            self._planning = False
+            self.plan = list(result.data.get("plan", ()))
+            self._render_plan()
+            return
+        organization = result.data.get("organization")
+        self.operations.record(
+            "organization", "warning" if result.counts.get("errors") else "completed", title="File organization",
+            counts=result.counts, summary={"manifest_path": result.report_path, "mode": self.mode.currentData()},
+            resume_available=bool(result.resume_information.get("rollback_available")), warnings=list(result.warnings),
+        )
+        prefix = "Dry run complete" if self.dry_run.isChecked() else "Organization complete"
+        self.banner.set_message(f"{prefix}: {result.counts.get('moved', 0)} moved, {result.counts.get('skipped', 0)} skipped, {result.counts.get('errors', 0)} issue(s).", "success" if not result.counts.get("errors") else "warning")
+        self.banner.show()
+        self._refresh_recovery()
+
+    def _on_cancelled(self, _result) -> None:
+        self.progress.hide()
+        self.review_button.setEnabled(True)
+        self.run_button.setEnabled(True)
+        self.banner.set_message("Organization cancelled. Completed moves remain available for rollback.", "warning")
+        self.banner.show()
+        self._refresh_recovery()
+
+    def _on_failed(self, error) -> None:
+        self.progress.hide()
+        self.review_button.setEnabled(True)
+        self.run_button.setEnabled(True)
+        self.banner.set_message(getattr(error, "message", str(error)), "danger")
+        self.banner.show()
+
+    def _render_plan(self) -> None:
+        self.plan_table.setRowCount(0)
+        self.plan_checks.clear()
+        for row, item in enumerate(self.plan):
+            self.plan_table.insertRow(row)
+            check = QCheckBox()
+            check.setChecked(item.selected)
+            check.setEnabled(bool(item.destination_path))
+            check.setAccessibleName(f"Organize {Path(item.source_path).name}")
+            self.plan_checks[item.source_path] = check
+            self.plan_table.setCellWidget(row, 0, check)
+            values = [item.source_path, item.destination_path or "Skipped", item.category, f"{item.confidence:.0%}", item.reason, item.collision or "—"]
+            for column, value in enumerate(values, 1):
+                self.plan_table.setItem(row, column, QTableWidgetItem(str(value)))
+        selected_items = [item for item in self.plan if item.selected and item.destination_path]
+        skipped = len(self.plan) - len(selected_items)
+        collisions = sum(1 for item in self.plan if item.collision)
+        total_bytes = sum(item.size for item in selected_items)
+        self.plan_summary.setText(
+            f"{len(self.plan)} file(s) discovered • {len(selected_items)} selected • "
+            f"{format_duplicate_size(total_bytes)} selected • {collisions} collision(s) • {skipped} skipped. "
+            "Review or adjust selections before running."
+        )
+        self._filter_plan_rows(self.plan_filter.text())
+        self.plan_card.show()
+        self._sync_plan_actions()
+        self.run_button.show()
+        self.banner.set_message("Organization plan ready. No files have moved yet.", "success")
+        self.banner.show()
+
+    def _selected_plan_indexes(self) -> list[int]:
+        selected = {index.row() for index in self.plan_table.selectionModel().selectedRows()} if self.plan_table.selectionModel() else set()
+        if not selected and self.plan_table.currentRow() >= 0:
+            selected.add(self.plan_table.currentRow())
+        return sorted(index for index in selected if 0 <= index < len(self.plan))
+
+    def _set_plan_selection(self, selected: bool) -> None:
+        for item in self.plan:
+            check = self.plan_checks.get(item.source_path)
+            if check and check.isEnabled():
+                check.setChecked(selected)
+
+    def _filter_plan_rows(self, query: str) -> None:
+        needle = query.lower().strip()
+        for row, item in enumerate(self.plan):
+            text = " ".join((item.source_path, item.destination_path, item.category, item.reason, item.collision)).lower()
+            self.plan_table.setRowHidden(row, bool(needle and needle not in text))
+
+    def _export_plan_csv(self) -> None:
+        if not self.plan:
+            self.banner.set_message("Review an organization plan before exporting it.", "info")
+            self.banner.show()
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export reviewed organization plan", "organization-plan.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["selected", "source", "destination", "category", "confidence", "reason", "collision", "size_bytes"])
+                for item in self.plan:
+                    writer.writerow([item.selected, item.source_path, item.destination_path, item.category, item.confidence, item.reason, item.collision, item.size])
+        except OSError as exc:
+            self.banner.set_message(f"Could not export the reviewed plan: {exc}", "warning")
+            self.banner.show()
+            return
+        self.banner.set_message("Exported the reviewed organization plan as CSV.", "success")
+        self.banner.show()
+
+    def _sync_plan_actions(self) -> None:
+        ml_mode = self.mode.currentData() == "ml"
+        has_selected_row = bool(self._selected_plan_indexes())
+        for button in (self.relabel_plan, self.always_rule, self.exclude_folder):
+            button.setVisible(ml_mode)
+            button.setEnabled(ml_mode and has_selected_row)
+
+    def _relabel_selected_plan(self) -> None:
+        indexes = self._selected_plan_indexes()
+        if not indexes:
+            return
+        labels = ["Screenshots", "Receipts", "People", "Pets", "Travel", "Food", "Artwork", "Miscellaneous"]
+        category, accepted = QInputDialog.getItem(self, "Relabel planned files", "Use local category", labels, 0, False)
+        if not accepted:
+            return
+        try:
+            for index in indexes:
+                self.plan[index] = self.service.relabel_plan_item(self._settings(), self.plan[index], category)
+        except Exception as exc:
+            self.banner.set_message(f"Could not relabel this plan: {exc}", "warning")
+            self.banner.show()
+            return
+        self._render_plan()
+        self.banner.set_message(f"Applied the {category} label to {len(indexes)} reviewed file(s).", "success")
+        self.banner.show()
+
+    def _save_extension_rule(self) -> None:
+        indexes = self._selected_plan_indexes()
+        if not indexes:
+            return
+        item = self.plan[indexes[0]]
+        extension = Path(item.source_path).suffix.lower()
+        if not extension:
+            self.banner.set_message("Extensionless files cannot use an extension rule.", "info")
+            self.banner.show()
+            return
+        try:
+            self.service.set_ml_extension_rule(extension, item.category)
+        except Exception as exc:
+            self.banner.set_message(f"Could not save this local rule: {exc}", "warning")
+            self.banner.show()
+            return
+        self._invalidate_plan()
+        self.banner.set_message(f"Saved a local {extension} → {item.category} rule. Review a new plan to apply it.", "success")
+        self.banner.show()
+
+    def _exclude_selected_folder(self) -> None:
+        indexes = self._selected_plan_indexes()
+        if not indexes:
+            return
+        folder = str(Path(self.plan[indexes[0]].source_path).parent)
+        try:
+            self.service.exclude_ml_folder(folder)
+        except Exception as exc:
+            self.banner.set_message(f"Could not exclude this folder: {exc}", "warning")
+            self.banner.show()
+            return
+        self._invalidate_plan()
+        self.banner.set_message("This folder will no longer be automatically selected by local ML rules. Review a new plan to apply it.", "success")
+        self.banner.show()
+
+    def _refresh_recovery(self) -> None:
+        self.recovery_choice.clear()
+        for operation in self.service.list_operations():
+            operation_id = operation.get("operation_id", "")
+            moved = len(operation.get("records", []))
+            if operation_id and moved:
+                self.recovery_choice.addItem(f"{operation_id} — {moved} file(s)", operation_id)
+
+    def _rollback(self) -> None:
+        operation_id = self.recovery_choice.currentData()
+        if not operation_id:
+            self.banner.set_message("No reversible organization operation is available.", "info")
+            self.banner.show()
+            return
+        response = QMessageBox.question(self, "Rollback organization", "Move files from the selected organization operation back to their original locations?")
+        if response != QMessageBox.StandardButton.Yes:
+            return
+        result = self.service.rollback(str(operation_id), conflict_policy=self.conflict.currentData())
+        self.operations.record("organization_rollback", "warning" if result.failures else "completed", title="Organization rollback", counts={"restored": len(result.moved), "skipped": len(result.skipped), "errors": len(result.failures)}, summary={"manifest_path": result.manifest_path}, failures=list(result.failures))
+        self.banner.set_message(f"Rollback complete: {len(result.moved)} restored, {len(result.skipped)} skipped, {len(result.failures)} issue(s).", "success" if not result.failures else "warning")
+        self.banner.show()
+        self._refresh_recovery()
+
+    def _search_catalog(self, query: str) -> None:
+        results = self.service.search_catalog(query, limit=8)
+        if not query.strip():
+            self.catalog_results.setText("Search to find locally cataloged organized files.")
+            return
+        if not results:
+            self.catalog_results.setText("No matching locally cataloged organized files.")
+            return
+        self.catalog_results.setText("\n".join(
+            f"{Path(item['destination_path']).name} • {item.get('category', 'Other')} • {item['destination_path']}"
+            for item in results
+        ))
+
+
 class ActivityPage(BasePage):
     navigate_requested = Signal(str)
+    resume_requested = Signal(object)
 
     def __init__(
         self,
@@ -1260,38 +2297,107 @@ class ActivityPage(BasePage):
         self.operations = operations or OperationRecordService()
         self.reports = reports or ReportService()
         self.records: list[dict] = []
-        toolbar = QHBoxLayout()
+
+        self.summary_grid = ResponsiveGrid(
+            [
+                MetricCard("0", "Visible records"),
+                MetricCard("0", "Warnings or failures"),
+                MetricCard("0", "Reports available"),
+            ],
+            min_column_width=260,
+            max_columns=3,
+        )
+        self.content.addWidget(self.summary_grid)
+
+        self.content.addWidget(
+            InlineMessage(
+                "Activity is stored locally. Reports can be opened, exported, or removed without changing imported files.",
+                "success",
+            )
+        )
+
+        toolbar_card = Card(subtle=True)
+        toolbar = QVBoxLayout(toolbar_card)
+        toolbar.setContentsMargins(Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD)
+        toolbar.setSpacing(Spacing.SM)
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(Spacing.MD)
+        action_row = QHBoxLayout()
+        action_row.setSpacing(Spacing.MD)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search activity")
         self.search.setAccessibleName("Search activity")
+        self.search.setMinimumWidth(260)
         self.search.textChanged.connect(self.refresh)
         self.filter_choice = QComboBox()
-        self.filter_choice.addItems(["All operations", "Duplicate scans", "Imports", "Warnings", "Reports"])
+        self.filter_choice.addItems(["All operations", "Duplicate scans", "Imports", "Sorting", "Warnings", "Reports", "Audit history"])
+        self.filter_choice.setMinimumWidth(170)
         self.filter_choice.currentIndexChanged.connect(self.refresh)
+        self.dry_run_reports = QCheckBox("Dry run report actions")
+        self.dry_run_reports.setToolTip("Preview export/remove report actions without writing or deleting files.")
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh)
         open_report = QPushButton("Open report")
         open_report.clicked.connect(self.open_selected_report)
+        open_reports_folder = QPushButton("Open reports folder")
+        open_reports_folder.clicked.connect(self.open_reports_folder)
         export_report = QPushButton("Export report")
         export_report.clicked.connect(self.export_selected_report)
+        export_activity = QPushButton("Export activity CSV")
+        export_activity.setToolTip("Export checked activity rows, or all currently visible rows, without local file paths.")
+        export_activity.clicked.connect(self.export_activity_csv)
+        resume_import = QPushButton("Resume import setup")
+        resume_import.setToolTip("Restore a cancelled import setup for review. The import will not start automatically.")
+        resume_import.clicked.connect(self.resume_selected_import)
         remove_report = QPushButton("Remove report")
         remove_report.clicked.connect(self.remove_selected_report)
-        toolbar.addWidget(self.search, 1)
-        toolbar.addWidget(self.filter_choice)
-        toolbar.addWidget(refresh)
-        toolbar.addWidget(open_report)
-        toolbar.addWidget(export_report)
-        toolbar.addWidget(remove_report)
-        self.content.addLayout(toolbar)
-        self.table = QTableWidget(0, 7)
+        filter_row.addWidget(QLabel("Find"))
+        filter_row.addWidget(self.search, 1)
+        filter_row.addWidget(QLabel("Show"))
+        filter_row.addWidget(self.filter_choice)
+        filter_row.addWidget(self.dry_run_reports)
+        action_row.addStretch()
+        action_row.addWidget(refresh)
+        action_row.addWidget(open_report)
+        action_row.addWidget(open_reports_folder)
+        action_row.addWidget(export_report)
+        action_row.addWidget(export_activity)
+        action_row.addWidget(resume_import)
+        action_row.addWidget(remove_report)
+        toolbar.addLayout(filter_row)
+        toolbar.addLayout(action_row)
+        self.content.addWidget(toolbar_card)
+
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["Type", "Status", "Created", "Title", "Counts", "Report", "Record ID"]
+            ["Select", "Type", "Status", "Created", "Title", "Counts"]
         )
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
+        self.table.setColumnWidth(0, 72)
+        self.table.setMinimumHeight(340)
+        self.table.currentCellChanged.connect(lambda *_args: self._update_details())
         self.content.addWidget(self.table)
+
+        self.detail_card = Card(subtle=True)
+        self.detail_card.setMaximumHeight(190)
+        detail_layout = QVBoxLayout(self.detail_card)
+        detail_layout.setContentsMargins(Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD)
+        detail_layout.setSpacing(Spacing.SM)
+        self.detail_title = QLabel("No activity selected")
+        self.detail_title.setProperty("role", "section")
+        self.detail_text = QLabel("Select an activity row to see report path, warnings, failures, and record details.")
+        self.detail_text.setWordWrap(True)
+        self.detail_text.setProperty("muted", True)
+        detail_layout.addWidget(self.detail_title)
+        detail_layout.addWidget(self.detail_text)
+        self.content.addWidget(self.detail_card)
+
         self.empty = EmptyState(
             "No activity yet",
             "Completed scans and imports will appear here with their reports and outcomes.",
@@ -1310,10 +2416,21 @@ class ActivityPage(BasePage):
         query = self.search.text().lower().strip()
         selected_filter = self.filter_choice.currentText()
         self.records = []
-        for record in self.operations.list_records():
+        source_records = (
+            self.operations.list_audit_events()
+            if selected_filter == "Audit history"
+            else self.operations.list_records()
+        )
+        for record in source_records:
             if selected_filter == "Duplicate scans" and record.get("type") != "duplicate_scan":
                 continue
             if selected_filter == "Imports" and record.get("type") != "import":
+                continue
+            if selected_filter == "Sorting" and not (
+                str(record.get("type", "")).startswith("sorting")
+                or str(record.get("type", "")) == "scheduled_sort"
+                or str(record.get("type", "")).startswith("organization")
+            ):
                 continue
             if selected_filter == "Warnings" and record.get("status") not in {"warning", "failed"}:
                 continue
@@ -1326,22 +2443,44 @@ class ActivityPage(BasePage):
         self.table.setRowCount(0)
         for row, record in enumerate(self.records):
             self.table.insertRow(row)
-            counts = record.get("counts", {})
-            count_text = ", ".join(f"{key}: {value}" for key, value in counts.items()) or "—"
+            check = QCheckBox()
+            check.setAccessibleName(f"Select activity {record.get('title', record.get('id', row))}")
+            check.toggled.connect(lambda checked, target_row=row: self._activity_selection_changed(target_row, checked))
+            self.table.setCellWidget(row, 0, check)
             for column, value in enumerate(
                 [
                     record.get("type", ""),
                     record.get("status", ""),
                     record.get("created_at", "")[:19],
                     record.get("title", ""),
-                    count_text,
-                    record.get("report_path", ""),
-                    record.get("id", ""),
-                ]
+                    self._counts_text(record),
+                ],
+                start=1,
             ):
                 self.table.setItem(row, column, QTableWidgetItem(str(value)))
+        warnings = sum(1 for record in self.records if record.get("status") in {"warning", "failed"} or record.get("warnings") or record.get("failures"))
+        reports = sum(1 for record in self.records if record.get("report_path"))
+        self.summary_grid.widgets[0].layout().itemAt(0).widget().setText(str(len(self.records)))
+        self.summary_grid.widgets[1].layout().itemAt(0).widget().setText(str(warnings))
+        self.summary_grid.widgets[2].layout().itemAt(0).widget().setText(str(reports))
         self.empty.setVisible(not self.records)
         self.table.setVisible(bool(self.records))
+        self.detail_card.setVisible(bool(self.records))
+        if self.records and self.table.currentRow() < 0:
+            self.table.selectRow(0)
+        self._update_details()
+
+    def _activity_selection_changed(self, row: int, checked: bool) -> None:
+        """Keep checked-row actions and the visible detail panel in sync."""
+        if checked and 0 <= row < self.table.rowCount():
+            self.table.selectRow(row)
+        self._update_details()
+
+    def _counts_text(self, record: dict) -> str:
+        counts = record.get("counts", {})
+        if not counts:
+            return "—"
+        return ", ".join(f"{key}: {value}" for key, value in counts.items())
 
     def _selected_record(self) -> dict | None:
         row = self.table.currentRow()
@@ -1349,49 +2488,199 @@ class ActivityPage(BasePage):
             return None
         return self.records[row]
 
-    def open_selected_report(self) -> None:
+    def _checked_records(self) -> list[dict]:
+        checked = []
+        for row, record in enumerate(self.records):
+            check = self.table.cellWidget(row, 0)
+            if isinstance(check, QCheckBox) and check.isChecked():
+                checked.append(record)
+        return checked
+
+    def _primary_action_record(self) -> dict | None:
+        checked = self._checked_records()
+        if checked:
+            return checked[0]
+        return self._selected_record()
+
+    def _update_details(self) -> None:
         record = self._selected_record()
-        if not record or not record.get("report_path"):
-            self.banner.set_message("Select an activity row with a report first.", "warning")
+        if not record:
+            self.detail_title.setText("No activity selected")
+            self.detail_text.setText("Select an activity row to see report path, warnings, failures, and record details.")
+            return
+        self.detail_title.setText(f"{record.get('title', 'Operation')} • {record.get('status', 'unknown')}")
+        details = [
+            f"Type: {record.get('type', '—')}",
+            f"Created: {record.get('created_at', '')[:19] or '—'}",
+            f"Counts: {self._counts_text(record)}",
+            f"Report: {record.get('report_path') or 'No report attached'}",
+            f"Activity file: {self._record_artifact_path(record) or 'Unavailable'}",
+            f"Record ID: {record.get('id', '—')}",
+        ]
+        if record.get("resume_available"):
+            details.append("Resume: available")
+        if record.get("warnings"):
+            details.append("Warnings: " + "; ".join(str(value) for value in record.get("warnings", [])[:3]))
+        if record.get("failures"):
+            details.append("Failures: " + "; ".join(str(value) for value in record.get("failures", [])[:3]))
+        self.detail_text.setText("\n".join(details))
+
+    def _record_artifact_path(self, record: dict) -> str:
+        if record.get("report_path"):
+            return str(record["report_path"])
+        summary = record.get("summary", {})
+        if isinstance(summary, dict) and summary.get("manifest_path"):
+            return str(summary["manifest_path"])
+        if record.get("path"):
+            return str(record["path"])
+        return ""
+
+    def _open_activity_path(self, path: str) -> str:
+        candidate = Path(path)
+        if not candidate.exists():
+            raise FileNotFoundError(candidate)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(candidate)))
+        return str(candidate)
+
+    def open_selected_report(self) -> None:
+        record = self._primary_action_record()
+        if not record:
+            self.banner.set_message("Select or check an activity row first.", "warning")
+            self.banner.show()
+            return
+        artifact_path = self._record_artifact_path(record)
+        if not artifact_path:
+            self.banner.set_message("This activity row does not have a local file to open.", "warning")
             self.banner.show()
             return
         try:
-            payload = self.reports.load_report(record["report_path"])
+            opened = (
+                self.reports.open_report_location(record["report_path"])
+                if record.get("report_path")
+                else self._open_activity_path(artifact_path)
+            )
         except Exception as exc:
-            self.banner.set_message(f"Could not open report: {exc}", "danger")
+            self.banner.set_message(f"Could not open selected activity file: {exc}", "danger")
             self.banner.show()
             return
-        self.banner.set_message(f"Report opened locally with {len(payload)} top-level field(s).", "success")
+        self.banner.set_message(f"Opened selected activity file: {opened}", "success")
+        self.banner.show()
+
+    def open_reports_folder(self) -> None:
+        try:
+            opened = self.reports.open_reports_folder()
+        except Exception as exc:
+            self.banner.set_message(f"Could not open reports folder: {exc}", "danger")
+            self.banner.show()
+            return
+        self.banner.set_message(f"Opened reports folder: {opened}", "success")
         self.banner.show()
 
     def export_selected_report(self) -> None:
-        record = self._selected_record()
+        record = self._primary_action_record()
         if not record or not record.get("report_path"):
-            self.banner.set_message("Select an activity row with a report first.", "warning")
+            self.banner.set_message("Select or check an activity row with a report first.", "warning")
             self.banner.show()
             return
         destination = QFileDialog.getSaveFileName(self, "Export report", Path(record["report_path"]).name, "JSON (*.json)")[0]
         if not destination:
             return
         try:
-            exported = self.reports.export_report(record["report_path"], destination)
-            self.banner.set_message(f"Report exported to {exported}.", "success")
+            exported = self.reports.export_report(
+                record["report_path"],
+                destination,
+                dry_run=self.dry_run_reports.isChecked(),
+            )
+            prefix = "Would export report to" if self.dry_run_reports.isChecked() else "Report exported to"
+            self.banner.set_message(f"{prefix} {exported}.", "success")
         except Exception as exc:
             self.banner.set_message(f"Could not export report: {exc}", "danger")
         self.banner.show()
 
-    def remove_selected_report(self) -> None:
-        record = self._selected_record()
-        if not record or not record.get("report_path"):
-            self.banner.set_message("Select an activity row with a report first.", "warning")
+    def export_activity_csv(self) -> None:
+        records = self._checked_records() or self.records
+        if not records:
+            self.banner.set_message("There is no visible activity to export.", "warning")
             self.banner.show()
             return
+        destination = QFileDialog.getSaveFileName(
+            self,
+            "Export activity CSV",
+            "duplicate-transfer-manager-activity.csv",
+            "CSV (*.csv)",
+        )[0]
+        if not destination:
+            return
         try:
-            self.reports.remove_report(record["report_path"])
-            self.banner.set_message("Report removed from local storage.", "success")
+            exported = self.operations.export_records_csv(
+                records,
+                destination,
+                dry_run=self.dry_run_reports.isChecked(),
+            )
+            prefix = "Would export" if self.dry_run_reports.isChecked() else "Exported"
+            self.banner.set_message(f"{prefix} {len(records)} activity row(s) to {exported}.", "success")
+        except Exception as exc:
+            self.banner.set_message(f"Could not export activity CSV: {exc}", "danger")
+        self.banner.show()
+
+    def resume_selected_import(self) -> None:
+        record = self._primary_action_record()
+        setup = record.get("summary", {}).get("resume_setup") if record else None
+        if not record or record.get("type") != "import" or not record.get("resume_available") or not isinstance(setup, dict):
+            self.banner.set_message("Select a cancelled or failed import with resumable setup first.", "warning")
+            self.banner.show()
+            return
+        self.resume_requested.emit(setup)
+        self.banner.set_message("Import setup restored. Review it before resuming.", "success")
+        self.banner.show()
+
+    def remove_selected_report(self) -> None:
+        records = self._checked_records() or ([self._selected_record()] if self._selected_record() else [])
+        if not records:
+            self.banner.set_message("Select or check an activity row first.", "warning")
+            self.banner.show()
+            return
+        removable = [
+            record
+            for record in records
+            if record.get("report_path") or (record.get("id") and record.get("path"))
+        ]
+        if not removable:
+            self.banner.set_message("The selected activity row(s) do not have removable local records.", "warning")
+            self.banner.show()
+            return
+        if not self.dry_run_reports.isChecked():
+            report_count = sum(1 for record in removable if record.get("report_path"))
+            record_count = len(removable) - report_count
+            response = QMessageBox.question(
+                self,
+                "Remove activity item",
+                (
+                    f"Remove {len(removable)} selected activity item(s) from local app storage?\n\n"
+                    f"Reports: {report_count}. Activity records: {record_count}.\n"
+                    "This does not remove imported, scanned, or quarantined files."
+                ),
+            )
+            if response != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            report_count = 0
+            record_count = 0
+            for record in removable:
+                if record.get("report_path"):
+                    self.reports.remove_report(record["report_path"], dry_run=self.dry_run_reports.isChecked())
+                    report_count += 1
+                elif not self.dry_run_reports.isChecked():
+                    self.operations.remove_record(str(record["id"]))
+                    record_count += 1
+                else:
+                    record_count += 1
+            action = "Would remove" if self.dry_run_reports.isChecked() else "Removed"
+            message = f"{action} {report_count} report(s) and {record_count} activity record(s) from local storage."
+            self.banner.set_message(message, "success")
             self.refresh()
         except Exception as exc:
-            self.banner.set_message(f"Could not remove report: {exc}", "danger")
+            self.banner.set_message(f"Could not remove selected activity item: {exc}", "danger")
         self.banner.show()
 
 
@@ -1412,7 +2701,9 @@ class QuarantinePage(BasePage):
         self.records = []
         self.visible_records = []
         self.summary_grid = ResponsiveGrid(
-            [MetricCard("0", "Files in quarantine"), MetricCard("0 B", "Recoverable space"), MetricCard("—", "Operations")]
+            [MetricCard("0", "Files in quarantine"), MetricCard("0 B", "Recoverable space"), MetricCard("—", "Operations")],
+            min_column_width=260,
+            max_columns=3,
         )
         self.content.addWidget(self.summary_grid)
         self.content.addWidget(
@@ -1421,44 +2712,90 @@ class QuarantinePage(BasePage):
                 "success",
             )
         )
-        tools = QHBoxLayout()
+        toolbar_card = Card(subtle=True)
+        toolbar = QVBoxLayout(toolbar_card)
+        toolbar.setContentsMargins(Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD)
+        toolbar.setSpacing(Spacing.SM)
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(Spacing.MD)
+        action_row = QHBoxLayout()
+        action_row.setSpacing(Spacing.MD)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search quarantine")
         self.search.setAccessibleName("Search quarantine")
+        self.search.setMinimumWidth(260)
         self.search.textChanged.connect(self.refresh)
         self.filter_choice = QComboBox()
         self.filter_choice.addItems(["Active files", "Local files", "Android copies", "Restored files", "All records"])
+        self.filter_choice.setMinimumWidth(150)
         self.filter_choice.currentIndexChanged.connect(self.refresh)
         self.conflict = QComboBox()
         self.conflict.addItem("Rename restored file if a path exists", "rename")
         self.conflict.addItem("Skip if the original path exists", "skip")
         self.conflict.addItem("Replace file at original path", "replace")
         self.conflict.setAccessibleName("Restore conflict policy")
+        self.conflict.setMinimumWidth(260)
+        self.dry_run_restore = QCheckBox("Dry run restore")
+        self.dry_run_restore.setToolTip("Preview restore destinations without moving quarantined files.")
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh)
-        restore_selected = PrimaryButton("Restore selected")
+        open_copy = QPushButton("Open quarantined copy")
+        open_copy.clicked.connect(self.open_selected_copy)
+        open_original = QPushButton("Open original folder")
+        open_original.clicked.connect(self.open_selected_original)
+        restore_selected = PrimaryButton("Restore quarantine")
         restore_selected.clicked.connect(self.restore_selected)
         restore_operation = QPushButton("Restore selected operation")
         restore_operation.clicked.connect(self.restore_selected_operation)
-        tools.addWidget(self.search, 1)
-        tools.addWidget(self.filter_choice)
-        tools.addWidget(self.conflict)
-        tools.addStretch()
-        tools.addWidget(refresh)
-        tools.addWidget(restore_selected)
-        tools.addWidget(restore_operation)
-        self.content.addLayout(tools)
+        filter_row.addWidget(QLabel("Find"))
+        filter_row.addWidget(self.search, 1)
+        filter_row.addWidget(QLabel("Show"))
+        filter_row.addWidget(self.filter_choice)
+        filter_row.addWidget(QLabel("Restore mode"))
+        filter_row.addWidget(self.conflict)
+        filter_row.addWidget(self.dry_run_restore)
+        action_row.addStretch()
+        action_row.addWidget(refresh)
+        action_row.addWidget(open_copy)
+        action_row.addWidget(open_original)
+        action_row.addWidget(restore_selected)
+        action_row.addWidget(restore_operation)
+        toolbar.addLayout(filter_row)
+        toolbar.addLayout(action_row)
+        self.content.addWidget(toolbar_card)
 
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
             ["Restore", "Operation", "Original path", "Quarantined copy", "Size", "Device", "Status"]
         )
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
+        self.table.setColumnWidth(0, 72)
+        self.table.setMinimumHeight(340)
+        self.table.currentCellChanged.connect(lambda *_args: self._update_preview())
         self.content.addWidget(self.table)
+
+        self.preview_card = Card(subtle=True)
+        self.preview_card.setMaximumHeight(180)
+        preview_layout = QHBoxLayout(self.preview_card)
+        preview_layout.setContentsMargins(Spacing.LG, Spacing.MD, Spacing.LG, Spacing.MD)
+        preview_layout.setSpacing(Spacing.LG)
+        self.preview_image = QLabel("No preview selected")
+        self.preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_image.setMinimumSize(160, 96)
+        self.preview_image.setMaximumSize(160, 96)
+        self.preview_image.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.preview_detail = QLabel("Select a quarantined file to preview media when possible.")
+        self.preview_detail.setWordWrap(True)
+        self.preview_detail.setProperty("muted", True)
+        preview_layout.addWidget(self.preview_image)
+        preview_layout.addWidget(self.preview_detail, 1)
+        self.content.addWidget(self.preview_card)
 
         self.empty = EmptyState(
             "Quarantine is empty",
@@ -1498,6 +2835,7 @@ class QuarantinePage(BasePage):
             self.table.insertRow(row)
             check = QCheckBox()
             check.setAccessibleName(f"Restore {record.original_path}")
+            check.toggled.connect(lambda checked, target_row=row: self._quarantine_selection_changed(target_row, checked))
             self.table.setCellWidget(row, 0, check)
             self.table.setItem(row, 1, QTableWidgetItem(record.operation_id))
             self.table.setItem(row, 2, QTableWidgetItem(record.original_path))
@@ -1516,10 +2854,18 @@ class QuarantinePage(BasePage):
         operations = len({record.operation_id for record in active})
         self.empty.setVisible(not active)
         self.table.setVisible(bool(active))
+        self.preview_card.setVisible(bool(active))
         # Rebuild simple summary cards so the page reflects current quarantine state.
         self.summary_grid.widgets[0].layout().itemAt(0).widget().setText(str(len(active)))
         self.summary_grid.widgets[1].layout().itemAt(0).widget().setText(format_duplicate_size(total))
         self.summary_grid.widgets[2].layout().itemAt(0).widget().setText(str(operations) if operations else "—")
+        self._update_preview()
+
+    def _quarantine_selection_changed(self, row: int, checked: bool) -> None:
+        """Checking a restore row makes its preview the active selection."""
+        if checked and 0 <= row < self.table.rowCount():
+            self.table.selectRow(row)
+        self._update_preview()
 
     def _checked_records(self):
         selected = []
@@ -1528,6 +2874,77 @@ class QuarantinePage(BasePage):
             if isinstance(check, QCheckBox) and check.isChecked():
                 selected.append(record)
         return selected
+
+    def _selected_visible_record(self):
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self.visible_records):
+            return None
+        return self.visible_records[row]
+
+    def _update_preview(self) -> None:
+        record = self._selected_visible_record()
+        if not record:
+            self.preview_image.setText("No preview selected")
+            self.preview_image.setPixmap(QPixmap())
+            self.preview_detail.setText("Select a quarantined file to preview media when possible.")
+            return
+        copy_path = Path(record.stored_path)
+        detail = [
+            f"Original: {record.original_path}",
+            f"Quarantined: {record.stored_path}",
+            f"Size: {format_duplicate_size(record.size)}",
+            "Source: Android copy" if record.source_is_adb else "Source: This PC",
+        ]
+        if not copy_path.exists():
+            self.preview_image.setText("Missing file")
+            self.preview_image.setPixmap(QPixmap())
+            detail.append("The quarantined copy is missing or was moved outside the app.")
+        else:
+            pixmap = QPixmap(str(copy_path))
+            if not pixmap.isNull():
+                self.preview_image.setPixmap(
+                    pixmap.scaled(220, 140, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                )
+                self.preview_image.setText("")
+                detail.append("Preview available.")
+            else:
+                self.preview_image.setPixmap(QPixmap())
+                self.preview_image.setText(copy_path.suffix.lower() or "File")
+                detail.append("Preview unavailable for this file type; metadata is shown instead.")
+        self.preview_detail.setText("\n".join(detail))
+
+    def _open_local_path(self, path: Path, *, folder: bool = False) -> bool:
+        target = path.parent if folder else path
+        if not target.exists():
+            self.banner.set_message(f"Path is missing: {target}", "warning")
+            self.banner.show()
+            return False
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        return True
+
+    def open_selected_copy(self) -> None:
+        record = self._selected_visible_record()
+        if not record:
+            self.banner.set_message("Select a quarantined file first.", "warning")
+            self.banner.show()
+            return
+        if self._open_local_path(Path(record.stored_path)):
+            self.banner.set_message("Opened quarantined copy.", "success")
+            self.banner.show()
+
+    def open_selected_original(self) -> None:
+        record = self._selected_visible_record()
+        if not record:
+            self.banner.set_message("Select a quarantined file first.", "warning")
+            self.banner.show()
+            return
+        if record.source_is_adb:
+            self.banner.set_message("Android originals stay on the phone; connect the device to view the original path.", "info")
+            self.banner.show()
+            return
+        if self._open_local_path(Path(record.original_path), folder=True):
+            self.banner.set_message("Opened original folder.", "success")
+            self.banner.show()
 
     def restore_selected(self) -> None:
         selected = self._checked_records()
@@ -1542,6 +2959,7 @@ class QuarantinePage(BasePage):
             result = self.service.restore_record(
                 record,
                 conflict_policy=self.conflict.currentData(),
+                dry_run=self.dry_run_restore.isChecked(),
             )
             restored.extend(result.restored)
             skipped.extend(result.skipped)
@@ -1559,6 +2977,7 @@ class QuarantinePage(BasePage):
         result = self.service.restore_operation(
             operation_id,
             conflict_policy=self.conflict.currentData(),
+            dry_run=self.dry_run_restore.isChecked(),
         )
         self._show_restore_result(len(result.restored), len(result.skipped), len(result.failures))
         self.refresh()
@@ -1574,6 +2993,7 @@ class QuarantinePage(BasePage):
 
 class SettingsPage(BasePage):
     theme_requested = Signal(str)
+    preferences_saved = Signal(object)
 
     def __init__(
         self,
@@ -1590,6 +3010,8 @@ class SettingsPage(BasePage):
         self.settings = settings
         self.service = service
         self.dashboard_service = dashboard_service or DashboardService(service.paths)
+        self.scheduled_scans = ScheduledScanService()
+        self._initial_schedule_frequency = settings.scheduled_scan_frequency
         self.banner = ToastBanner("Settings saved on this PC.", "success")
         self.banner.hide()
         self.content.addWidget(self.banner)
@@ -1650,6 +3072,15 @@ class SettingsPage(BasePage):
         exp_layout.addWidget(self.default_categories)
         exp_layout.addWidget(QLabel("Default transfer profile"))
         exp_layout.addWidget(self.default_profile)
+        self.favorite_locations = QLineEdit(", ".join(settings.favorite_locations))
+        self.favorite_locations.setAccessibleName("Saved local locations")
+        self.favorite_locations.setPlaceholderText(r"D:\Photos, E:\Camera Backup")
+        exp_layout.addWidget(QLabel("Saved local locations"))
+        exp_layout.addWidget(self.favorite_locations)
+        favorite_hint = QLabel("Separate folders with commas. They appear as quick choices for new scans and imports.")
+        favorite_hint.setProperty("muted", True)
+        favorite_hint.setWordWrap(True)
+        exp_layout.addWidget(favorite_hint)
         self.diagnostics = QCheckBox("Share sanitized crash diagnostics")
         self.diagnostics.setChecked(settings.diagnostic_consent)
         self.diagnostics.setToolTip(
@@ -1682,6 +3113,10 @@ class SettingsPage(BasePage):
         self.cache_days.setRange(1, 3650)
         self.cache_days.setValue(settings.cache_retention_days)
         self.cache_days.setSuffix(" days cache retention")
+        self.sorting_retention_days = QSpinBox()
+        self.sorting_retention_days.setRange(1, 3650)
+        self.sorting_retention_days.setValue(settings.sorting_history_retention_days)
+        self.sorting_retention_days.setSuffix(" days sorting history and undo retention")
         clear_cache = QPushButton("Clear hash and thumbnail caches")
         clear_cache.clicked.connect(self._clear_cache)
         self.android_enabled = QCheckBox("Enable Android features")
@@ -1701,6 +3136,7 @@ class SettingsPage(BasePage):
             self.update_channel.addItem(channel.title(), channel)
         self.update_channel.setCurrentIndex(max(0, self.update_channel.findData(settings.update_channel)))
         advanced_layout.addWidget(self.cache_days)
+        advanced_layout.addWidget(self.sorting_retention_days)
         advanced_layout.addWidget(clear_cache)
         advanced_layout.addWidget(self.android_enabled)
         advanced_layout.addWidget(QLabel("Default Android path"))
@@ -1709,6 +3145,23 @@ class SettingsPage(BasePage):
         advanced_layout.addWidget(self.platform_tools)
         advanced_layout.addWidget(QLabel("Update channel"))
         advanced_layout.addWidget(self.update_channel)
+        self.scheduled_frequency = QComboBox()
+        self.scheduled_frequency.addItem("Off", "off")
+        self.scheduled_frequency.addItem("Daily read-only duplicate scan", "daily")
+        self.scheduled_frequency.addItem("Weekly read-only duplicate scan", "weekly")
+        self.scheduled_frequency.setCurrentIndex(
+            max(0, self.scheduled_frequency.findData(settings.scheduled_scan_frequency))
+        )
+        self.scheduled_path = PathSelector(
+            "Scheduled scan folder",
+            "Choose a local folder",
+            "Scheduled scans are read-only: they never quarantine, move, or delete files.",
+        )
+        self.scheduled_path.set_path(settings.scheduled_scan_path)
+        self.scheduled_path.browse_requested.connect(self._browse_scheduled_path)
+        advanced_layout.addWidget(QLabel("Scheduled duplicate scans"))
+        advanced_layout.addWidget(self.scheduled_frequency)
+        advanced_layout.addWidget(self.scheduled_path)
         self.content.addWidget(self.advanced_settings)
 
         save_row = QHBoxLayout()
@@ -1721,6 +3174,8 @@ class SettingsPage(BasePage):
         self.finish()
 
     def _save(self) -> None:
+        previous_schedule_frequency = self.settings.scheduled_scan_frequency
+        previous_schedule_path = self.settings.scheduled_scan_path
         self.settings.appearance = self.theme.currentData()
         self.settings.experience_mode = self.mode.currentData()
         self.settings.default_file_categories = [
@@ -1729,15 +3184,65 @@ class SettingsPage(BasePage):
             if value.strip()
         ]
         self.settings.default_transfer_profile = self.default_profile.currentData()
+        self.settings.favorite_locations = list(
+            dict.fromkeys(
+                value.strip()
+                for value in self.favorite_locations.text().split(",")
+                if value.strip()
+            )
+        )
         self.settings.diagnostic_consent = self.diagnostics.isChecked()
         self.settings.check_updates_automatically = self.updates.isChecked()
         self.settings.cache_retention_days = self.cache_days.value()
+        self.settings.sorting_history_retention_days = self.sorting_retention_days.value()
         self.settings.android_enabled = self.android_enabled.isChecked()
         self.settings.android_default_path = self.android_path.text().strip() or "/sdcard/DCIM"
         self.settings.keep_android_awake = self.keep_awake.isChecked()
         self.settings.update_channel = self.update_channel.currentData()
+        self.settings.scheduled_scan_frequency = self.scheduled_frequency.currentData()
+        self.settings.scheduled_scan_path = self.scheduled_path.path()
+        if (
+            self.settings.scheduled_scan_frequency != "off"
+            or self._initial_schedule_frequency != self.settings.scheduled_scan_frequency
+        ):
+            try:
+                self.scheduled_scans.configure(
+                    self.settings.scheduled_scan_path,
+                    self.settings.scheduled_scan_frequency,
+                    data_root=str(self.service.paths.root),
+                )
+            except Exception as exc:
+                self.settings.scheduled_scan_frequency = previous_schedule_frequency
+                self.settings.scheduled_scan_path = previous_schedule_path
+                self.scheduled_frequency.blockSignals(True)
+                self.scheduled_frequency.setCurrentIndex(
+                    max(0, self.scheduled_frequency.findData(previous_schedule_frequency))
+                )
+                self.scheduled_frequency.blockSignals(False)
+                self.scheduled_path.set_path(previous_schedule_path)
+                self.banner.set_message(f"Scheduled scans were not changed: {exc}", "warning")
+                self.banner.show()
+                return
         self.service.save(self.settings)
+        self._initial_schedule_frequency = self.settings.scheduled_scan_frequency
+        removed = self.dashboard_service.prune_cache(self.settings.cache_retention_days)
+        FileOrganizerService(self.service.paths).prune_manifests(self.settings.organization_retention_days)
+        SortExecutor(self.service.paths).prune_runs(self.settings.sorting_history_retention_days)
+        self.preferences_saved.emit(self.settings)
+        self.banner.set_message(
+            (
+                "Settings saved on this PC."
+                if not removed
+                else f"Settings saved. Cleared {format_duplicate_size(removed)} of expired cache data."
+            ),
+            "success",
+        )
         self.banner.show()
+
+    def _browse_scheduled_path(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "Choose scheduled scan folder")
+        if selected:
+            self.scheduled_path.set_path(selected)
 
     def _clear_cache(self) -> None:
         removed = self.dashboard_service.clear_cache()
@@ -1763,6 +3268,7 @@ class HelpPage(BasePage):
                 MetricCard("02", "Import safely", "Compare against your library and copy only new content."),
                 MetricCard("03", "Connect Android", "Authorize USB debugging and keep the phone unlocked."),
                 MetricCard("04", "Recover files", "Restore quarantined files to their original location."),
+                MetricCard("05", "Sort safely", "Preview rules and local suggestions, approve exact operations, then undo recoverable runs."),
             ],
             min_column_width=280,
             max_columns=2,
@@ -1779,7 +3285,7 @@ class HelpPage(BasePage):
         layout.addWidget(SectionHeader("About this build"))
         layout.addWidget(QLabel(f"Duplicate & Transfer Manager {__version__}"))
         detail = QLabel(
-            "Phase 2 design-system preview • Windows 10 and 11 • Local-first processing"
+            "Phase 7 release-readiness build • Windows 10 and 11 • Local-first processing"
         )
         detail.setProperty("muted", True)
         layout.addWidget(detail)
@@ -1810,6 +3316,7 @@ class FirstRunOnboardingDialog(QDialog):
             ("Privacy", "Files, paths, hashes, and media metadata stay on this PC by default."),
             ("Diagnostics", "Crash diagnostics are off unless you opt in, and reports are sanitized."),
             ("Updates", "Automatic update checks follow your selected channel and never change system ADB."),
+            ("Sort Files", "Deterministic rules override local suggestions. Every live run is reviewed, verified, journaled, and undoable where possible."),
         ]
         for heading, body in topics:
             label = QLabel(f"{heading}: {body}")

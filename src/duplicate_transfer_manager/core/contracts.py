@@ -111,6 +111,14 @@ class AppSettings:
     android_default_path: str = "/sdcard/DCIM"
     android_platform_tools_path: str = ""
     android_platform_tools_version: str = "37.0.0"
+    favorite_locations: list[str] = field(default_factory=list)
+    scheduled_scan_path: str = ""
+    scheduled_scan_frequency: str = "off"
+    organization_retention_days: int = 90
+    organization_presets: list[dict[str, Any]] = field(default_factory=list)
+    organization_schedule_frequency: str = "off"
+    active_sorting_profile_id: str = ""
+    sorting_history_retention_days: int = 90
     onboarding_completed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -120,6 +128,43 @@ class AppSettings:
     def from_dict(cls, values: dict[str, Any]) -> "AppSettings":
         known = cls.__dataclass_fields__
         return cls(**{key: value for key, value in values.items() if key in known})
+
+
+@dataclass(frozen=True)
+class OrganizerSettings:
+    source_root: str
+    destination_root: str
+    selected_folders: tuple[str, ...] = ()
+    mode: str = "flatten"
+    conflict_policy: str = "rename"
+    dry_run: bool = False
+    cleanup_empty_folders: bool = False
+    ml_auto_organize: bool = False
+    ml_confidence_threshold: float = 0.92
+
+
+@dataclass(frozen=True)
+class OrganizationPlanItem:
+    source_path: str
+    destination_path: str
+    size: int
+    modified: float
+    category: str
+    reason: str
+    confidence: float = 1.0
+    selected: bool = True
+    collision: str = ""
+
+
+@dataclass(frozen=True)
+class OrganizationResult:
+    operation_id: str
+    manifest_path: str
+    moved: tuple[str, ...] = ()
+    skipped: tuple[str, ...] = ()
+    failures: tuple[str, ...] = ()
+    cleaned_folders: tuple[str, ...] = ()
+    dry_run: bool = False
 
 
 @dataclass(frozen=True)

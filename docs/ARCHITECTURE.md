@@ -7,7 +7,8 @@ Phase 3 wires the duplicate review workflow to that boundary and adds
 manifest-based quarantine and restore services. Phase 4 replaces the legacy
 sync screen with a guided copy-only import workflow. Phase 5 adds the overview,
 activity, settings, diagnostics, and recovery surfaces that make those
-operations manageable after they run.
+operations manageable after they run. Phases 6 and 7 harden diagnostics,
+update verification, release packaging, signing, and crash handling.
 
 ## Dependency direction
 
@@ -123,6 +124,51 @@ without changing backend behavior by itself.
 Diagnostics include the pinned Android Platform Tools release metadata and
 explicitly report that Duplicate & Transfer Manager does not mutate system-wide
 ADB installations or environment variables.
+
+## Hybrid Sort Files workflow
+
+The Sort Files route is implemented as separate framework-neutral modules for
+profile persistence, discovery/metadata, association evaluation, optional local
+ML, planning, journaled execution, monitoring, and migration. Deterministic
+user associations always win over ML. Same-priority ambiguity, conflicts, and
+medium/low-confidence suggestions enter Review.
+
+`SortController` owns the Qt worker boundary. The live executor processes only
+explicitly approved rows, verifies every output, saves overwrite backups and a
+transaction journal, and supports pause/resume/cancel/retry plus undo where the
+action permits. Legacy organizer presets and manifests are imported
+non-destructively. See
+[SORT_FILES_ARCHITECTURE.md](SORT_FILES_ARCHITECTURE.md) for the complete
+pipeline, contracts, automation behavior, and safety invariants.
+
+## Reliability, Privacy, And Updates
+
+`duplicate_transfer_manager.core.security` owns recursive payload sanitization,
+local correlation identifiers, canonical manifest serialization, and RSA-SHA256
+signature verification. Diagnostics and local crash reports use this sanitizer
+so filenames, local paths, hashes, and device serials are replaced before any
+report can be shown, copied, or prepared for opt-in submission.
+
+`CrashReportService` writes sanitized crash reports under the app log directory.
+The PySide6 bootstrap installs a local exception hook that displays the
+sanitized report and offers a copy action; Sentry remains disabled unless the
+user explicitly opts in and production transport is configured.
+
+`UpdateService` verifies signed update manifests before accepting an update. It
+checks required fields, channel, downgrade protection, minimum supported
+version, RSA-SHA256 manifest signature, downloaded installer size, SHA-256
+checksum, and Windows Authenticode status when running on Windows. Invalid
+signatures, bad checksums, and non-newer versions are rejected.
+
+## Packaging And Signing
+
+Release packaging uses a PyInstaller windowed build collected by
+`packaging/duplicate_transfer_manager.spec`, then a per-user Inno Setup
+installer from `packaging/installer.iss`. The GitHub Actions release workflow
+signs the PyInstaller executable before installer creation, signs the installer,
+verifies Authenticode, generates a signed update manifest, and publishes draft
+release artifacts. Protected secrets provide the Authenticode certificate and
+update-manifest private key; only the public verification key is committed.
 
 ## Threading rules
 

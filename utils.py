@@ -10,6 +10,7 @@ from runtime_paths import get_runtime_paths
 
 DEFAULT_MEDIA_EXTS = [
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".heic", ".webp",
+    ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2",
     ".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".mpeg", ".mpg",
     ".3gp", ".mts", ".m2ts", ".hevc"
 ]

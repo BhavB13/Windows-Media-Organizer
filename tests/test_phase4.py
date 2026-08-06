@@ -34,6 +34,7 @@ class Phase4ImportWorkflowTests(unittest.TestCase):
         self.assertFalse(settings.dry_run)
         self.assertTrue(settings.source_is_adb)
         self.assertEqual(settings.output_root, "")
+        self.assertEqual(settings.destination_template, "preserve")
         self.assertEqual(settings.hash_mode, TRANSFER_PROFILES["Balanced"]["hash_mode"])
 
     def test_reliable_and_fast_presets_map_to_plain_language_profiles(self):
@@ -55,11 +56,32 @@ class Phase4ImportWorkflowTests(unittest.TestCase):
         self.assertEqual(fast.hash_mode, "fast")
         self.assertFalse(fast.source_is_adb)
 
+    def test_date_folder_template_is_preserved_in_import_settings_and_review(self):
+        settings = build_import_settings(
+            source_root="D:/Camera",
+            existing_library="D:/Library",
+            destination_template="date",
+        )
+        review = build_import_review(
+            source_label="Folder",
+            source_root="D:/Camera",
+            existing_library="D:/Library",
+            save_to="",
+            categories=["pictures"],
+            profile="Balanced",
+            settings=settings,
+        )
+
+        self.assertEqual(settings.destination_template, "date")
+        self.assertIn("date folders", review.advanced_summary)
+
     def test_categories_support_media_and_all_files_modes(self):
         only_media, extensions = selected_extensions(["pictures", "audio"])
         self.assertTrue(only_media)
         self.assertIn(".jpg", extensions)
         self.assertIn(".mp3", extensions)
+        self.assertIn(".dng", extensions)
+        self.assertIn(".cr3", extensions)
 
         only_media, extensions = selected_extensions(["other"])
         self.assertFalse(only_media)
@@ -91,6 +113,7 @@ class Phase4ImportWorkflowTests(unittest.TestCase):
         cases = {
             "Discovering source files": "discovery",
             "Building destination cache": "comparison",
+            "Preflight passed: device, destination access, and free space checked.": "preflight",
             "Pulling photo.jpg": "transfer",
             "Post-transfer hash verification failed": "verification",
             "Waiting for destination drive": "reconnect",
@@ -114,6 +137,7 @@ class Phase4ImportWorkflowTests(unittest.TestCase):
 
         def fake_execute(_settings, _cancellation, _cache, _logger, progress):
             progress(0, 0, "Discovering source files")
+            progress(0, 0, "Preflight passed: device, destination access, and free space checked")
             progress(1, 3, "Building destination cache")
             progress(2, 3, "Pulling photo.jpg")
             progress(3, 3, "Post-transfer hash verification complete")
@@ -145,6 +169,7 @@ class Phase4ImportWorkflowTests(unittest.TestCase):
         phases = {event.phase for event in events}
         self.assertIn(OperationPhase.DISCOVERY, phases)
         self.assertIn(OperationPhase.COMPARISON, phases)
+        self.assertIn(OperationPhase.PREFLIGHT, phases)
         self.assertIn(OperationPhase.TRANSFER, phases)
         self.assertIn(OperationPhase.VERIFICATION, phases)
         self.assertIn(OperationPhase.FINALIZATION, phases)
@@ -165,11 +190,50 @@ class Phase4ImportWorkflowTests(unittest.TestCase):
             partial.write_bytes(b"incomplete")
             keep.write_bytes(b"complete")
 
+            preview = cleanup_partial_files(str(root), dry_run=True)
+
+            self.assertEqual(preview, [str(partial)])
+            self.assertTrue(partial.exists())
+
             removed = cleanup_partial_files(str(root))
 
             self.assertEqual(removed, [str(partial)])
             self.assertFalse(partial.exists())
             self.assertTrue(keep.exists())
+
+    def test_transfer_service_explains_preflight_failure_as_recoverable(self):
+        settings = build_import_settings(
+            source_root="source",
+            existing_library="library",
+            source_kind="folder",
+        )
+        raw = {
+            "transferred": 0,
+            "duplicates": 0,
+            "skipped": 0,
+            "errors": 1,
+            "preflight_failed": True,
+            "preflight_errors": ["Insufficient free space"],
+            "preflight_warnings": ["Destination is nearly full"],
+        }
+        with patch(
+            "duplicate_transfer_manager.services.transfer_service.validate_transfer_paths",
+            return_value="",
+        ), patch(
+            "duplicate_transfer_manager.services.transfer_service.execute_smart_transfer",
+            return_value=raw,
+        ):
+            result = TransferService(HashCache("unused.json")).run(
+                settings,
+                CancellationToken(),
+                OperationReporter(),
+            )
+
+        self.assertEqual(result.status, OperationState.FAILED)
+        self.assertEqual(result.failures[0].code, "preflight_failed")
+        self.assertIn("Insufficient free space", result.failures[0].technical_detail)
+        self.assertEqual(result.warnings, ("Destination is nearly full",))
+        self.assertTrue(result.resume_information["can_resume"])
 
 
 if __name__ == "__main__":

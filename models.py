@@ -61,3 +61,4 @@ class TransferSettings:
     journal_path: str = ""
     reconnect_timeout: int = 300
     stall_timeout: int = 180
+    destination_template: str = "preserve"

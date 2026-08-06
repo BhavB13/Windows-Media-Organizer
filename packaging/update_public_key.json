@@ -1,0 +1,7 @@
+{
+  "algorithm": "RSASSA-PKCS1-v1_5-SHA256",
+  "key_id": "dtm-dev-release-key-2026",
+  "n": "ccd8ea06a0c0538e735ba61e2c76d34c5653e369e2273a46922caeb20c07ca6b0844a24a2770cc8d2b04c51fe05d79b136f6a1b819d53ac56f3b1e85ca9b8b026342fe7e0736988ef20cf65970428d01085150bf9d7ecf6f5e821afa009db6be2ca9975c379e1d5b11e9c6e6726c352561b3d2f40bc9c422c352aac07ffea61b",
+  "e": 65537,
+  "rotation_policy": "Replace this development key with a protected production public key before public release."
+}

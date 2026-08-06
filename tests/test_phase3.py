@@ -61,6 +61,22 @@ class Phase3DuplicateWorkflowTests(unittest.TestCase):
         self.assertEqual(payload["warnings"], ["metadata unavailable"])
         self.assertEqual(payload["selected_count"], 1)
 
+    def test_review_can_prefer_highest_resolution_with_size_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            low = root / "low.jpg"
+            high = root / "high.jpg"
+            low.write_bytes(b"same")
+            high.write_bytes(b"same")
+            review = build_duplicate_review(
+                [[FileInfo(str(low), 4, 100), FileInfo(str(high), 8, 200)]],
+                prefer="quality",
+                thumbnail_root=root / "thumbs",
+            )
+
+        kept = next(item for item in review.groups[0].items if item.id == review.groups[0].keep_item_id)
+        self.assertEqual(kept.filename, "high.jpg")
+
     def test_quarantine_local_duplicate_moves_file_and_writes_manifest(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -83,6 +99,32 @@ class Phase3DuplicateWorkflowTests(unittest.TestCase):
             manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
             self.assertEqual(manifest["operation_id"], "op-local")
             self.assertIn("no permanent deletion", manifest["safety"])
+
+    def test_quarantine_dry_run_does_not_move_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            duplicate = root / "duplicate.jpg"
+            keep = root / "keep.jpg"
+            duplicate.write_bytes(b"same")
+            keep.write_bytes(b"same")
+            paths = get_runtime_paths(root / "data")
+            review = build_duplicate_review(
+                [[FileInfo(str(keep), 4, 100), FileInfo(str(duplicate), 4, 200)]],
+                thumbnail_root=root / "thumbs",
+            )
+
+            result = DuplicateQuarantineService(paths).quarantine(
+                review,
+                review.groups[0].selected_item_ids,
+                operation_id="op-dry",
+                dry_run=True,
+            )
+
+            self.assertTrue(result.dry_run)
+            self.assertTrue(duplicate.exists())
+            self.assertFalse(Path(result.records[0].stored_path).exists())
+            manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+            self.assertTrue(manifest["dry_run"])
 
     def test_restore_record_renames_on_conflict_and_updates_manifest(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -132,6 +174,27 @@ class Phase3DuplicateWorkflowTests(unittest.TestCase):
 
             self.assertEqual(restore.restored, ())
             self.assertEqual(restore.skipped, (str(duplicate),))
+
+    def test_restore_dry_run_does_not_move_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            duplicate = root / "duplicate.jpg"
+            keep = root / "keep.jpg"
+            duplicate.write_bytes(b"same")
+            keep.write_bytes(b"same")
+            paths = get_runtime_paths(root / "data")
+            review = build_duplicate_review(
+                [[FileInfo(str(keep), 4, 100), FileInfo(str(duplicate), 4, 200)]],
+                thumbnail_root=root / "thumbs",
+            )
+            service = DuplicateQuarantineService(paths)
+            result = service.quarantine(review, review.groups[0].selected_item_ids, operation_id="op-restore-dry")
+
+            restore = service.restore_record(result.records[0], dry_run=True)
+
+            self.assertTrue(restore.dry_run)
+            self.assertFalse(duplicate.exists())
+            self.assertTrue(Path(result.records[0].stored_path).exists())
 
     def test_android_quarantine_pulls_copy_without_deleting_original(self):
         with tempfile.TemporaryDirectory() as temp_dir:

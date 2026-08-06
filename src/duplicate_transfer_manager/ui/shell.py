@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -12,8 +12,10 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QComboBox,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -39,6 +41,7 @@ from .pages import (
     QuarantinePage,
     SettingsPage,
 )
+from .sort_workspace import SortWorkspace
 from .theme import Spacing, ThemeManager
 from .widgets import add_shortcut, set_accessible
 
@@ -55,11 +58,22 @@ ROUTES = (
     Route("overview", "Overview", "overview", "Alt+1"),
     Route("duplicates", "Find Duplicates", "duplicates", "Alt+2"),
     Route("import", "Import Files", "import", "Alt+3"),
-    Route("activity", "Activity", "activity", "Alt+4"),
-    Route("quarantine", "Quarantine", "quarantine", "Alt+5"),
-    Route("settings", "Settings", "settings", "Alt+6"),
-    Route("help", "Help", "help", "Alt+7"),
+    Route("sort", "Sort Files", "folder", "Alt+4"),
+    Route("activity", "Activity", "activity", "Alt+5"),
+    Route("quarantine", "Quarantine", "quarantine", "Alt+6"),
+    Route("settings", "Settings", "settings", "Alt+7"),
+    Route("help", "Help", "help", "Alt+8"),
 )
+
+
+class _NoWheelSelectionFilter(QObject):
+    """Prevent accidental value changes while scrolling over selection controls."""
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() == QEvent.Type.Wheel:
+            event.ignore()
+            return True
+        return super().eventFilter(watched, event)
 
 
 class Sidebar(QFrame):
@@ -97,7 +111,7 @@ class Sidebar(QFrame):
         self.buttons: dict[str, QPushButton] = {}
         self.shortcuts = []
         for index, route in enumerate(ROUTES):
-            if index == 5:
+            if index == 6:
                 layout.addStretch(1)
             button = QPushButton(route.label)
             button.setCheckable(True)
@@ -252,7 +266,12 @@ class MainWindow(QMainWindow):
                 operation_service=self.operation_records,
                 settings=settings,
             ),
-            "import": ImportPage(hash_cache=hash_cache, operation_service=self.operation_records),
+            "import": ImportPage(
+                hash_cache=hash_cache,
+                operation_service=self.operation_records,
+                settings=settings,
+            ),
+            "sort": SortWorkspace(runtime_paths, settings, settings_service, self.operation_records),
             "activity": ActivityPage(self.operation_records, self.report_service),
             "quarantine": QuarantinePage(DuplicateQuarantineService(runtime_paths)),
             "settings": SettingsPage(settings, settings_service, self.dashboard_service),
@@ -260,12 +279,16 @@ class MainWindow(QMainWindow):
         }
         for page in self.pages.values():
             self.stack.addWidget(page)
+        self.selection_wheel_filter = _NoWheelSelectionFilter(self)
+        self._polish_selection_boxes()
 
         self.sidebar.route_requested.connect(self.navigate)
         self.pages["overview"].navigate_requested.connect(self.navigate)
         self.pages["activity"].navigate_requested.connect(self.navigate)
+        self.pages["activity"].resume_requested.connect(self._resume_import)
         self.pages["quarantine"].navigate_requested.connect(self.navigate)
         self.pages["settings"].theme_requested.connect(self.set_theme)
+        self.pages["settings"].preferences_saved.connect(self._preferences_saved)
         self.theme_manager.theme_changed.connect(self._theme_changed)
         self.navigate("overview")
         self._apply_responsive_state()
@@ -294,6 +317,15 @@ class MainWindow(QMainWindow):
             settings_page.theme.blockSignals(False)
         self.theme_manager.apply(preference)
 
+    def _resume_import(self, setup: dict) -> None:
+        import_page = self.pages["import"]
+        import_page.apply_resume_setup(setup)
+        self.navigate("import")
+
+    def _preferences_saved(self, settings: AppSettings) -> None:
+        self.pages["duplicates"].update_preferences(settings)
+        self.pages["import"].update_preferences(settings)
+
     def _theme_changed(self, _active_theme: str) -> None:
         self.sidebar.update_icon_color(self.theme_manager.colors.text_muted)
 
@@ -303,6 +335,16 @@ class MainWindow(QMainWindow):
 
     def _apply_responsive_state(self) -> None:
         self.sidebar.set_collapsed(self.width() < 1080)
+
+    def _polish_selection_boxes(self) -> None:
+        for combo in self.findChildren(QComboBox):
+            combo.setMaxVisibleItems(12)
+            combo.view().setTextElideMode(Qt.TextElideMode.ElideMiddle)
+            combo.setProperty("wheelChangesDisabled", True)
+            combo.installEventFilter(self.selection_wheel_filter)
+        for spinbox in self.findChildren(QSpinBox):
+            spinbox.setProperty("wheelChangesDisabled", True)
+            spinbox.installEventFilter(self.selection_wheel_filter)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.settings_service.save(self.settings)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -67,6 +68,14 @@ class OperationReporter:
         details: dict[str, Any] | None = None,
     ) -> OperationEvent:
         elapsed = max(time.monotonic() - self._started, 0.000001)
+        current = max(0, int(current or 0))
+        total = max(0, int(total or 0))
+        bytes_processed = max(0, int(bytes_processed or 0))
+        total_bytes = max(0, int(total_bytes or 0))
+        if total and current > total:
+            current = total
+        if total_bytes and bytes_processed > total_bytes:
+            bytes_processed = total_bytes
         byte_progress = total_bytes > 0
         progress_current = bytes_processed if byte_progress else current
         progress_total = total_bytes if byte_progress else total
@@ -76,11 +85,15 @@ class OperationReporter:
             else None
         )
         rate = progress_current / elapsed if progress_current else 0.0
+        if not math.isfinite(rate) or rate < 0:
+            rate = 0.0
         eta = (
             max(0.0, (progress_total - progress_current) / rate)
             if progress_total > 0 and rate > 0
             else None
         )
+        if eta is not None and (not math.isfinite(eta) or eta < 0):
+            eta = None
         with self._lock:
             if phase is not None:
                 self._phase = phase

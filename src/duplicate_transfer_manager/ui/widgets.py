@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import math
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -26,6 +27,23 @@ from PySide6.QtWidgets import (
 
 from .icons import icon, icon_size
 from .theme import Spacing
+
+
+def format_eta(seconds: float | int | None) -> str:
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(value) or value < 0:
+        return "—"
+    value = int(value)
+    if value < 60:
+        return f"{value}s"
+    minutes, sec = divmod(value, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
 
 
 def set_accessible(widget: QWidget, name: str, description: str = "") -> QWidget:
@@ -348,12 +366,12 @@ class MetricCard(Card):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
-        value_label = QLabel(value)
-        value_label.setProperty("role", "title")
-        label_widget = QLabel(label)
-        label_widget.setProperty("role", "section")
-        layout.addWidget(value_label)
-        layout.addWidget(label_widget)
+        self.value_label = QLabel(value)
+        self.value_label.setProperty("role", "title")
+        self.label_widget = QLabel(label)
+        self.label_widget.setProperty("role", "section")
+        layout.addWidget(self.value_label)
+        layout.addWidget(self.label_widget)
         if detail:
             detail_widget = QLabel(detail)
             detail_widget.setProperty("muted", True)
@@ -423,6 +441,7 @@ class StepIndicator(QWidget):
         super().__init__(parent)
         self.steps = list(steps)
         self.buttons: list[QToolButton] = []
+        self.labels: list[QLabel] = []
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(Spacing.SM)
@@ -437,11 +456,26 @@ class StepIndicator(QWidget):
             layout.addWidget(button)
             layout.addWidget(label)
             self.buttons.append(button)
+            self.labels.append(label)
             if index < len(self.steps) - 1:
                 separator = QFrame()
                 separator.setFrameShape(QFrame.Shape.HLine)
                 separator.setMinimumWidth(16)
                 layout.addWidget(separator, 1)
+
+    def set_current(self, index: int) -> None:
+        """Show completed, active, and pending workflow stages."""
+        if not self.buttons:
+            return
+        current = max(0, min(index, len(self.buttons) - 1))
+        for position, (button, label) in enumerate(zip(self.buttons, self.labels)):
+            state = "complete" if position < current else "active" if position == current else "pending"
+            button.setProperty("stepState", state)
+            label.setProperty("muted", position != current)
+            button.style().unpolish(button)
+            button.style().polish(button)
+            label.style().unpolish(label)
+            label.style().polish(label)
 
 
 class DisclosurePanel(QWidget):
@@ -505,6 +539,14 @@ class ResponsiveGrid(QWidget):
         columns = max(1, min(self.max_columns, width // self.min_column_width))
         self._reflow(columns)
         super().resizeEvent(event)
+
+    def minimumSizeHint(self) -> QSize:
+        """Permit the parent to shrink the grid far enough to trigger reflow."""
+        if not self.widgets:
+            return QSize(0, 0)
+        width = max(widget.minimumSizeHint().width() for widget in self.widgets)
+        height = max(widget.minimumSizeHint().height() for widget in self.widgets)
+        return QSize(width, height)
 
     def _reflow(self, columns: int) -> None:
         if columns == self._columns:

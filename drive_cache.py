@@ -49,10 +49,14 @@ class DriveHashCache:
             if loaded.get("version") != CACHE_VERSION:
                 self.data = self._empty_data()
                 return
+            if not isinstance(loaded.get("files", {}), dict) or not isinstance(loaded.get("hash_index", {}), dict):
+                self.data = self._empty_data()
+                return
             self.data = loaded
             self.data.setdefault("roots", {})
             self.data.setdefault("files", {})
             self.data.setdefault("hash_index", {})
+            self._repair_hash_index()
         except (OSError, json.JSONDecodeError):
             self.data = self._empty_data()
 
@@ -96,13 +100,19 @@ class DriveHashCache:
         entry = self.get_file_entry(path)
         if not entry:
             return None
+        if not isinstance(entry, dict):
+            return None
         if entry.get("algo") != algo or entry.get("mode") != mode:
             return None
         if entry.get("size") != size or entry.get("mtime") != mtime:
             return None
         if entry.get("stale"):
             return None
-        return entry.get("hash")
+        digest = entry.get("hash")
+        if not isinstance(digest, str) or not re.fullmatch(r"[a-fA-F0-9]{32,128}", digest):
+            entry["stale"] = True
+            return None
+        return digest
 
     def set_file_hash(self, path, size, mtime, digest, algo, mode, root=None):
         normalized = self.normalize_path(path)
@@ -209,6 +219,21 @@ class DriveHashCache:
         self.data["hash_index"][digest] = [path for path in paths if path != normalized_path]
         if not self.data["hash_index"][digest]:
             del self.data["hash_index"][digest]
+
+    def _repair_hash_index(self):
+        repaired = {}
+        for normalized, entry in list(self.data.get("files", {}).items()):
+            if not isinstance(entry, dict):
+                self.data["files"].pop(normalized, None)
+                continue
+            digest = entry.get("hash")
+            if not isinstance(digest, str) or not re.fullmatch(r"[a-fA-F0-9]{32,128}", digest):
+                entry["stale"] = True
+                continue
+            repaired.setdefault(digest, [])
+            if normalized not in repaired[digest]:
+                repaired[digest].append(normalized)
+        self.data["hash_index"] = repaired
 
 
 def default_cache_path(root):

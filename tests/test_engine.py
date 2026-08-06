@@ -1,5 +1,6 @@
 import os
 import hashlib
+import json
 import tempfile
 import threading
 import unittest
@@ -45,7 +46,7 @@ class EngineTests(unittest.TestCase):
                 "/storage/emulated/0/DCIM/Camera/photo.jpg",
                 4,
                 123.0,
-                "digest",
+                "a" * 64,
                 "sha256",
                 "full",
                 root="/sdcard/DCIM",
@@ -53,7 +54,7 @@ class EngineTests(unittest.TestCase):
 
             self.assertEqual(
                 cache.get_valid_hash("/sdcard/DCIM/Camera/photo.jpg", "sha256", "full", 4, 123.0),
-                "digest",
+                "a" * 64,
             )
             self.assertEqual(cache.active_file_count_under_root("/sdcard/DCIM", "sha256", "full"), 1)
 
@@ -61,6 +62,36 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(ADBBridge.normalize_remote_path("/sd/DCIM"), "/sdcard/DCIM")
         self.assertEqual(ADBBridge.normalize_remote_path("/sd/pictures"), "/sdcard/Pictures")
         self.assertEqual(ADBBridge.normalize_remote_path("storage/self/primary/downloads"), "/sdcard/Download")
+        self.assertEqual(ADBBridge.normalize_remote_path("/storage/emulated/0/DCIM/Camera"), "/sdcard/DCIM/Camera")
+
+    def test_drive_cache_repairs_broken_hash_index_and_ignores_bad_digests(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = os.path.join(temp_dir, "cache.json")
+            file_path = os.path.join(temp_dir, "photo.jpg")
+            with open(file_path, "wb") as handle:
+                handle.write(b"same")
+            with open(cache_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "version": 1,
+                    "roots": {},
+                    "files": {
+                        os.path.normcase(os.path.abspath(file_path)): {
+                            "path": file_path,
+                            "size": 4,
+                            "mtime": 10,
+                            "hash": "not-a-real-hash",
+                            "algo": "sha256",
+                            "mode": "full",
+                        }
+                    },
+                    "hash_index": {"bad": ["missing"]},
+                }))
+
+            cache = DriveHashCache(cache_path)
+            cache.load()
+
+            self.assertIsNone(cache.get_valid_hash(file_path, "sha256", "full", 4, 10))
+            self.assertEqual(cache.hashes(), set())
 
     def test_adb_walk_root_uses_canonical_storage_without_changing_display_path(self):
         walk_root = _canonical_adb_walk_root("/sdcard/DCIM")
@@ -90,6 +121,25 @@ class EngineTests(unittest.TestCase):
             )
 
             self.assertTrue(target.endswith("photo (1).jpg"))
+
+    def test_build_target_path_can_organize_by_source_date(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_root = os.path.join(temp_dir, "source")
+            dest_root = os.path.join(temp_dir, "dest")
+            os.makedirs(source_root)
+            source = os.path.join(source_root, "photo.jpg")
+            timestamp = 1767225600  # 2026-01-01 UTC
+
+            target = build_target_path(
+                source,
+                source_root,
+                dest_root,
+                preserve_structure=True,
+                destination_template="date",
+                source_timestamp=timestamp,
+            )
+
+            self.assertEqual(target, os.path.join(dest_root, "2026", "01", "photo.jpg"))
 
     def test_build_relative_path_handles_adb_style_paths(self):
         relative = build_relative_path(
@@ -544,6 +594,53 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(output_root, "B", "unique.jpg")))
             self.assertFalse(os.path.exists(os.path.join(output_root, "duplicate.jpg")))
             self.assertTrue(any("Transferred Breakdown by Source Folder:" in msg for msg in result_logger.messages))
+
+    def test_smart_transfer_handles_spaces_unicode_and_special_characters(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_root = os.path.join(temp_dir, "source folder")
+            compare_root = os.path.join(temp_dir, "compare folder")
+            output_root = os.path.join(temp_dir, "output folder")
+            nested = os.path.join(source_root, "Trip 2026", "café & family")
+            os.makedirs(nested)
+            os.makedirs(compare_root)
+            os.makedirs(output_root)
+
+            source_file = os.path.join(nested, "photo (final) #1.jpg")
+            with open(source_file, "wb") as handle:
+                handle.write(b"unique-special")
+
+            settings = TransferSettings(
+                source_root=source_root,
+                dest_root=compare_root,
+                output_root=output_root,
+                criteria="hash",
+                hash_algo="sha256",
+                hash_mode="full",
+                only_media=True,
+                extensions=[".jpg"],
+                min_size_kb=0,
+                exclude_dirs=[],
+                skip_hidden_system=False,
+                dry_run=False,
+                preserve_structure=True,
+                max_hash_workers=1,
+                transfer_mode="copy",
+                duplicate_policy="skip",
+                use_dest_cache=False,
+            )
+
+            result = execute_smart_transfer(
+                settings,
+                threading.Event(),
+                HashCache(os.path.join(temp_dir, "hash_cache.json")),
+                DummyLogger(),
+            )
+
+            expected = os.path.join(output_root, "Trip 2026", "café & family", "photo (final) #1.jpg")
+            self.assertEqual(result["transferred"], 1)
+            self.assertTrue(os.path.exists(expected))
+            with open(expected, "rb") as handle:
+                self.assertEqual(handle.read(), b"unique-special")
 
     def test_adb_transfer_compare_folder_scans_local_nested_subfolders(self):
         with tempfile.TemporaryDirectory() as temp_dir:

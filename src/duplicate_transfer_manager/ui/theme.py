@@ -91,6 +91,8 @@ class Radius:
 
 
 def _system_is_dark(application: QApplication) -> bool:
+    if application.platformName().lower() in {"offscreen", "minimal"}:
+        return False
     hints = application.styleHints()
     if hasattr(hints, "colorScheme"):
         return hints.colorScheme() == Qt.ColorScheme.Dark
@@ -120,7 +122,7 @@ def build_stylesheet(colors: ThemeColors) -> str:
         border-radius: {Radius.MD}px;
     }}
     QLabel[role="display"] {{
-        font-size: 25pt;
+        font-size: 22pt;
         font-weight: 700;
     }}
     QLabel[role="title"] {{
@@ -213,16 +215,25 @@ def build_stylesheet(colors: ThemeColors) -> str:
     QToolButton[sourceCard="true"]:focus {{
         border: 2px solid {colors.focus};
     }}
-    QLineEdit, QComboBox, QSpinBox {{
+    QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
         min-height: 36px;
         padding: 0 10px;
         background: {colors.surface};
         border: 1px solid {colors.border_strong};
         border-radius: {Radius.SM}px;
         selection-background-color: {colors.accent};
+        selection-color: white;
+    }}
+    QComboBox QAbstractItemView {{
+        color: {colors.text};
+        background: {colors.surface};
+        border: 1px solid {colors.border_strong};
+        selection-background-color: {colors.accent_soft};
+        selection-color: {colors.text};
+        outline: 0;
     }}
     QLineEdit:hover, QComboBox:hover {{ border-color: {colors.text_muted}; }}
-    QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
+    QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
         border: 2px solid {colors.focus};
     }}
     QLineEdit[invalid="true"] {{
@@ -246,6 +257,38 @@ def build_stylesheet(colors: ThemeColors) -> str:
     QProgressBar::chunk {{
         border-radius: 3px;
         background: {colors.accent};
+    }}
+    QTableWidget {{
+        color: {colors.text};
+        background: {colors.surface};
+        gridline-color: {colors.border};
+        border: 1px solid {colors.border};
+        border-radius: {Radius.MD}px;
+        selection-background-color: {colors.accent_soft};
+        selection-color: {colors.text};
+    }}
+    QTableWidget::item {{
+        padding: 6px;
+        border-bottom: 1px solid {colors.border};
+    }}
+    QTableWidget::item:selected {{
+        color: {colors.text};
+        background: {colors.accent_soft};
+    }}
+    QHeaderView::section {{
+        color: {colors.text_muted};
+        background: {colors.surface_alt};
+        border: none;
+        border-right: 1px solid {colors.border};
+        border-bottom: 1px solid {colors.border};
+        padding: 6px;
+        font-weight: 650;
+    }}
+    QTableCornerButton::section {{
+        background: {colors.surface_alt};
+        border: none;
+        border-right: 1px solid {colors.border};
+        border-bottom: 1px solid {colors.border};
     }}
     QScrollArea {{ border: none; background: transparent; }}
     QScrollArea > QWidget > QWidget {{ background: transparent; }}
@@ -339,6 +382,7 @@ class ThemeManager(QObject):
         self.preference = preference if preference in {"system", "light", "dark"} else "system"
         self.active_theme = "light"
         self.colors = LIGHT
+        self._style_initialized = False
         hints = self.application.styleHints()
         if hasattr(hints, "colorSchemeChanged"):
             hints.colorSchemeChanged.connect(self._system_scheme_changed)
@@ -357,7 +401,9 @@ class ThemeManager(QObject):
             else "light"
         )
         self.colors = DARK if self.active_theme == "dark" else LIGHT
-        self.application.setStyle("Fusion")
+        if not self._style_initialized:
+            self.application.setStyle("Fusion")
+            self._style_initialized = True
         self.application.setStyleSheet(build_stylesheet(self.colors))
         palette = self.application.palette()
         palette.setColor(QPalette.ColorRole.Window, QColor(self.colors.canvas))

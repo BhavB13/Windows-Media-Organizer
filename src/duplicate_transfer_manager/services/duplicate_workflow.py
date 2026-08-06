@@ -83,6 +83,7 @@ class QuarantineResult:
     manifest_path: str
     records: tuple[QuarantineRecord, ...] = ()
     failures: tuple[str, ...] = ()
+    dry_run: bool = False
 
     @property
     def quarantined_count(self) -> int:
@@ -94,6 +95,7 @@ class RestoreResult:
     restored: tuple[str, ...] = ()
     skipped: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
+    dry_run: bool = False
 
 
 def _utc_stamp() -> str:
@@ -163,6 +165,18 @@ def _thumbnail(path: str, target: Path, is_adb: bool) -> tuple[str, str]:
         return "", "Thumbnail unavailable."
 
 
+def _quality_key(item: DuplicateItem) -> tuple[int, int, float, str]:
+    """Prefer usable pixel detail, then file size when metadata is unavailable."""
+    pixels = 0
+    if "×" in item.dimensions:
+        try:
+            width, height = (int(value.strip()) for value in item.dimensions.split("×", 1))
+            pixels = max(0, width) * max(0, height)
+        except ValueError:
+            pass
+    return pixels, max(0, item.size), item.modified, item.path.lower()
+
+
 def build_duplicate_review(
     raw_groups: Iterable[Iterable[FileInfo]],
     *,
@@ -208,7 +222,12 @@ def build_duplicate_review(
                 )
             )
         ordered = sorted(items, key=lambda item: (item.modified, item.path.lower()))
-        keep = ordered[-1] if prefer == "newest" else ordered[0]
+        if prefer == "newest":
+            keep = ordered[-1]
+        elif prefer == "quality":
+            keep = max(items, key=_quality_key)
+        else:
+            keep = ordered[0]
         selected = tuple(item.id for item in items if item.id != keep.id)
         groups.append(
             DuplicateGroup(
@@ -239,6 +258,7 @@ class DuplicateQuarantineService:
         *,
         operation_id: str | None = None,
         adb_serial: str = "",
+        dry_run: bool = False,
     ) -> QuarantineResult:
         selected = set(selected_ids)
         operation = operation_id or f"duplicate_{_utc_stamp()}"
@@ -257,7 +277,10 @@ class DuplicateQuarantineService:
                     target_name = f"{target_name}{suffix}"
                 stored_path = operation_root / target_name
                 try:
-                    if item.is_adb:
+                    if dry_run:
+                        if not item.is_adb and not Path(item.path).exists():
+                            raise FileNotFoundError(item.path)
+                    elif item.is_adb:
                         ADBBridge.pull(item.path, str(stored_path), serial=adb_serial or None)
                     else:
                         if not Path(item.path).exists():
@@ -278,12 +301,13 @@ class DuplicateQuarantineService:
                 except Exception as exc:  # noqa: BLE001 - item-level recoverable failure
                     failures.append(f"{item.path}: {exc}")
 
-        manifest_path = self._write_manifest(operation, records, failures)
+        manifest_path = self._write_manifest(operation, records, failures, dry_run=dry_run)
         return QuarantineResult(
             operation_id=operation,
             manifest_path=str(manifest_path),
             records=tuple(records),
             failures=tuple(failures),
+            dry_run=dry_run,
         )
 
     def restore_record(
@@ -291,20 +315,24 @@ class DuplicateQuarantineService:
         record: QuarantineRecord,
         *,
         conflict_policy: str = "rename",
+        dry_run: bool = False,
     ) -> RestoreResult:
         if record.source_is_adb:
             return RestoreResult(
                 skipped=(
                     f"{record.original_path}: Android originals are not deleted; the quarantined copy can be exported manually.",
-                )
+                ),
+                dry_run=dry_run,
             )
         source = Path(record.stored_path)
         target = Path(record.original_path)
         if not source.exists():
-            return RestoreResult(failures=(f"{source}: quarantined file is missing.",))
+            return RestoreResult(failures=(f"{source}: quarantined file is missing.",), dry_run=dry_run)
         resolved = self._resolve_restore_path(target, conflict_policy)
         if not resolved:
-            return RestoreResult(skipped=(str(target),))
+            return RestoreResult(skipped=(str(target),), dry_run=dry_run)
+        if dry_run:
+            return RestoreResult(restored=(str(resolved),), dry_run=True)
         try:
             resolved.parent.mkdir(parents=True, exist_ok=True)
             if conflict_policy == "replace" and resolved.exists():
@@ -313,15 +341,16 @@ class DuplicateQuarantineService:
                 resolved.unlink()
             shutil.move(str(source), str(resolved))
             self._mark_restored(record, str(resolved))
-            return RestoreResult(restored=(str(resolved),))
+            return RestoreResult(restored=(str(resolved),), dry_run=dry_run)
         except OSError as exc:
-            return RestoreResult(failures=(f"{target}: {exc}",))
+            return RestoreResult(failures=(f"{target}: {exc}",), dry_run=dry_run)
 
     def restore_operation(
         self,
         operation_id: str,
         *,
         conflict_policy: str = "rename",
+        dry_run: bool = False,
     ) -> RestoreResult:
         records = [
             record
@@ -332,11 +361,20 @@ class DuplicateQuarantineService:
         skipped: list[str] = []
         failures: list[str] = []
         for record in records:
-            result = self.restore_record(record, conflict_policy=conflict_policy)
+            result = self.restore_record(record, conflict_policy=conflict_policy, dry_run=dry_run)
             restored.extend(result.restored)
             skipped.extend(result.skipped)
             failures.extend(result.failures)
-        return RestoreResult(tuple(restored), tuple(skipped), tuple(failures))
+        return RestoreResult(tuple(restored), tuple(skipped), tuple(failures), dry_run=dry_run)
+
+    @staticmethod
+    def record_paths(record: QuarantineRecord) -> dict[str, str]:
+        return {
+            "original": record.original_path,
+            "quarantined": record.stored_path,
+            "quarantined_exists": str(Path(record.stored_path).exists()),
+            "original_exists": str(Path(record.original_path).exists()) if not record.source_is_adb else "android",
+        }
 
     def list_records(self) -> list[QuarantineRecord]:
         records: list[QuarantineRecord] = []
@@ -355,6 +393,8 @@ class DuplicateQuarantineService:
         operation_id: str,
         records: list[QuarantineRecord],
         failures: list[str],
+        *,
+        dry_run: bool = False,
     ) -> Path:
         operation_root = self.paths.quarantine / operation_id
         manifest = operation_root / "manifest.json"
@@ -362,6 +402,7 @@ class DuplicateQuarantineService:
             "version": 1,
             "operation_id": operation_id,
             "created_at": _iso_now(),
+            "dry_run": dry_run,
             "records": [record.to_dict() for record in records],
             "failures": failures,
             "safety": "Files are moved into app quarantine or copied from Android; no permanent deletion is performed.",

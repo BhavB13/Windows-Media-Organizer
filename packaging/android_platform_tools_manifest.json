@@ -3,6 +3,7 @@
   "version": "37.0.0",
   "platform": "windows",
   "source_url": "https://developer.android.com/tools/releases/platform-tools",
+  "download_url": "https://dl.google.com/android/repository/platform-tools-latest-windows.zip",
   "license": "Android Software Development Kit License Agreement",
   "bundled_path": "platform-tools/adb.exe",
   "system_path_policy": "Never modify system-wide ADB installations or environment variables."

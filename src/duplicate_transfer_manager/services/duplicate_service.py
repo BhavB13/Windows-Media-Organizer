@@ -111,7 +111,7 @@ class DuplicateScanService:
                 duration_seconds=time.monotonic() - started,
             )
 
-        if hasattr(self.hash_cache, "save"):
+        if hasattr(self.hash_cache, "save") and not getattr(settings, "dry_run", False):
             self.hash_cache.save()
 
         duplicate_count = sum(max(0, len(group) - 1) for group in duplicates)

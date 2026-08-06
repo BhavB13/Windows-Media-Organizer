@@ -1,0 +1,13 @@
+{
+  "version": "0.8.0",
+  "channel": "stable",
+  "installer_url": "https://github.com/BhavB13/Windows-Media-Organizer/releases/download/v0.8.0/DuplicateTransferManagerSetup-0.8.0.exe",
+  "size": 0,
+  "sha256": "replace-with-installer-sha256",
+  "release_notes_url": "https://github.com/BhavB13/Windows-Media-Organizer/releases/tag/v0.8.0",
+  "minimum_supported_version": "0.6.0",
+  "signature_algorithm": "RSASSA-PKCS1-v1_5-SHA256",
+  "signature": "replace-with-base64-signature",
+  "authenticode_thumbprint": "replace-with-code-signing-certificate-thumbprint",
+  "publisher": "BhavB13"
+}

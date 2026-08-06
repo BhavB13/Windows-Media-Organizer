@@ -200,7 +200,7 @@ def pull_with_retries(
     raise last_error
 
 
-def cleanup_partial_files(root):
+def cleanup_partial_files(root, dry_run=False):
     removed = []
     for current_root, _, files in os.walk(root):
         for filename in files:
@@ -208,7 +208,8 @@ def cleanup_partial_files(root):
                 continue
             path = os.path.join(current_root, filename)
             try:
-                os.remove(path)
+                if not dry_run:
+                    os.remove(path)
                 removed.append(path)
             except OSError:
                 pass

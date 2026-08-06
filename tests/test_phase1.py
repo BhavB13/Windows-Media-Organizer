@@ -104,6 +104,17 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(events[-1].total_bytes, 4096)
         self.assertEqual(events[-1].processed_items, 0)
 
+    def test_reporter_sanitizes_broken_eta_inputs(self):
+        events = []
+        reporter = OperationReporter(events.append)
+
+        reporter.progress_callback(200, 100, "Processed too many")
+        self.assertEqual(events[-1].progress, 1.0)
+        self.assertEqual(events[-1].eta_seconds, 0.0)
+
+        reporter.emit("No negative progress", current=-5, total=100)
+        self.assertGreaterEqual(events[-1].processed_items, 0)
+
     def test_error_mapping_preserves_safe_and_technical_messages(self):
         error = map_exception(PermissionError("secret technical detail"))
         self.assertEqual(error.code, ErrorCode.PERMISSION_DENIED)

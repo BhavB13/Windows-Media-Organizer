@@ -186,6 +186,12 @@ quarantine grouping/filtering.
 
 ## Phase 6 — Reliability, Accessibility, and Security Hardening
 
+**Status: Complete — July 8, 2026.** Added privacy redaction, local sanitized
+crash reports, Sentry opt-in boundaries, additional reliability tests, and
+recoverable failure coverage. Verified with Phase 6 tests covering sanitization,
+diagnostics privacy, crash report creation, quarantine preflight failures,
+operation records, and migration safety.
+
 - Add unit tests for controllers, settings, migration, quarantine, updater verification, and error mapping.
 - Add PySide6 UI tests for navigation, form validation, state transitions, simple/advanced mode, themes, and cancellation.
 - Add integration tests using temporary directories and mocked ADB devices.
@@ -200,6 +206,12 @@ quarantine grouping/filtering.
 - Gate release on clean tests, successful upgrade testing, and manual Windows 10/11 smoke tests.
 
 ## Phase 7 — Packaging, Signing, Diagnostics, and Updates
+
+**Status: Complete — July 8, 2026.** Added PyInstaller, Inno Setup, release
+manifest, RSA-SHA256 update verification, Authenticode verification hooks,
+GitHub Actions release workflow, and release build scripts. Verified with Phase
+7 tests covering signed manifest verification, checksum validation, downgrade
+refusal, invalid-signature refusal, and required packaging assets.
 
 - Build the application with PyInstaller in windowed mode.
 - Include Qt assets, application icons, bundled ADB tools, licenses, version metadata, and required runtime libraries.
