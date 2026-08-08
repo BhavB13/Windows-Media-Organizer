@@ -190,6 +190,19 @@ confirmation. Android duplicates are copied into quarantine so phone originals
 remain untouched. Always review results before processing important libraries
 and keep an independent backup.
 
+## Documentation
+
+- [User guide](docs/USER_GUIDE.md) — importing from a phone, reviewing
+  duplicates, restoring from quarantine, sorting, and troubleshooting
+- [Changelog](CHANGELOG.md) — what changed and why
+- [Privacy](PRIVACY.md) — what stays on your PC, and what sanitization does
+- [Security policy](SECURITY.md) — reporting a vulnerability, how updates are
+  verified, and current release gates
+- [Contributing](CONTRIBUTING.md) — setup, tests, and the architecture rules
+- [Third-party licenses](THIRD_PARTY_LICENSES.md) — what is redistributed
+- [Architecture](docs/ARCHITECTURE.md) — engine/UI separation and threading
+
 ## License
 
-Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](LICENSE). Redistributed components are listed
+in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
