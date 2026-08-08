@@ -86,6 +86,18 @@ class DuplicateScanService:
                 duration_seconds=time.monotonic() - started,
             )
 
+        incomplete_warning = ()
+        if discovery.incomplete:
+            # Reviewing duplicates from a partial listing looks like a clean
+            # result while copies elsewhere in the tree were never compared.
+            # The individual errors are already carried as warnings; this says
+            # plainly what they add up to.
+            incomplete_warning = (
+                f"This scan was incomplete: {len(discovery.errors)} problem(s) were reported, "
+                "so some files in this folder may not have been compared.",
+            )
+            reporter.log(f"WARNING: {incomplete_warning[0]}")
+
         reporter.set_state(
             OperationState.COMPARING,
             phase=OperationPhase.HASHING,

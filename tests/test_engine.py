@@ -64,6 +64,112 @@ class EngineTests(unittest.TestCase):
             os.utime(target, (recorded + 60, recorded + 60))
             self.assertFalse(journal.is_complete("source", 8))
 
+    def _run_adb_scan(self, stdout, returncode=0, stderr="", settings=None):
+        """Drive scan_adb_tree against a replayed device listing."""
+        import io
+        import discovery as discovery_module
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdout = io.StringIO(stdout)
+                self.stderr = io.StringIO(stderr)
+                self.returncode = returncode
+
+            def wait(self, timeout=None):
+                return returncode
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        class DefaultSettings:
+            exclude_dirs = []
+            extensions = []
+            only_media = False
+            min_size_kb = 0
+            skip_hidden_system = True
+            adb_serial = "SERIAL"
+            use_adb = True
+
+        with mock.patch.object(discovery_module.subprocess, "Popen", return_value=FakeProcess()), mock.patch(
+            "adb_bridge.ADBBridge.probe_device", return_value=(True, "")
+        ), mock.patch("adb_bridge.ADBBridge.remote_path_status", return_value="dir"):
+            return discovery_module.scan_adb_tree(
+                "/sdcard/DCIM", settings or DefaultSettings(), threading.Event()
+            )
+
+    def test_adb_scan_walks_every_nested_subfolder(self):
+        # The whole point of the recursive walk: a file several levels down,
+        # in a folder whose name contains a space, must be found.
+        listing = "\n".join(
+            [
+                "D|/sdcard/DCIM",
+                "D|/sdcard/DCIM/Camera",
+                "D|/sdcard/DCIM/Camera/2024/07",
+                "D|/sdcard/DCIM/Camera/nested deep/level3/level4",
+                "F|10|1700000000|/sdcard/DCIM/top.jpg",
+                "F|11|1700000001|/sdcard/DCIM/Camera/2024/07/IMG_0001.JPG",
+                "F|12|1700000002|/sdcard/DCIM/Camera/nested deep/level3/level4/deep.mp4",
+                # A literal pipe in a file name must survive parsing.
+                "F|13|1700000003|/sdcard/DCIM/Camera/pipe|name.jpg",
+            ]
+        ) + "\n"
+        result = self._run_adb_scan(listing)
+
+        self.assertEqual(len(result.files), 4)
+        self.assertFalse(result.incomplete)
+        self.assertIn("/sdcard/DCIM/Camera/nested deep/level3/level4/deep.mp4", [f.path for f in result.files])
+        self.assertIn("/sdcard/DCIM/Camera/pipe|name.jpg", [f.path for f in result.files])
+
+    def test_adb_scan_reports_a_truncated_listing_as_incomplete(self):
+        # A phone unplugged mid-scan must not look like a folder that simply
+        # held fewer files, or the import silently leaves the rest behind.
+        result = self._run_adb_scan(
+            "F|10|1700000000|/sdcard/DCIM/a.jpg\n",
+            returncode=1,
+            stderr="adb: error: device 'R58M12ABCDE' not found\n",
+        )
+
+        self.assertEqual(len(result.files), 1)
+        self.assertTrue(result.incomplete)
+        self.assertTrue(any("not found" in error for error in result.errors))
+
+    def test_adb_scan_accounts_for_files_it_could_not_stat(self):
+        # find listed the file but stat failed. Previously it vanished with no
+        # error, no count, and no log line.
+        result = self._run_adb_scan(
+            "F|10|1700000000|/sdcard/DCIM/ok.jpg\nE|/sdcard/DCIM/locked.jpg\n"
+        )
+
+        self.assertEqual(len(result.files), 1)
+        self.assertTrue(result.incomplete)
+        self.assertEqual(result.unreadable, ("/sdcard/DCIM/locked.jpg",))
+
+    def test_adb_scan_preserves_trailing_whitespace_in_names(self):
+        # A trailing space is legal on Android. Trimming it produced a path
+        # that does not exist on the device.
+        result = self._run_adb_scan("F|10|1700000000|/sdcard/DCIM/photo.jpg \n")
+
+        self.assertEqual(result.files[0].path, "/sdcard/DCIM/photo.jpg ")
+
+    def test_remote_walk_follows_symlinks_for_every_root_spelling(self):
+        import discovery as discovery_module
+
+        class ExcludeSettings:
+            exclude_dirs = ["android"]
+
+        # A symlinked subfolder is neither -type d nor -type f, so without -L
+        # its entire subtree is invisible. /sdcard/DCIM and its canonical
+        # equivalent must not disagree about which files exist.
+        for root in ("/sdcard/DCIM", "/storage/emulated/0/DCIM"):
+            script = discovery_module._build_remote_walk_script(root, ExcludeSettings(), follow_links=False)
+            self.assertIn("find -L ", script)
+            # Exclusions are lowercased, so device matching must ignore case.
+            self.assertIn("-iname", script)
+            self.assertNotIn("-name '", script.replace("-iname '", ""))
+
     def test_remote_hash_many_groups_paths_into_few_adb_calls(self):
         paths = [f"/sdcard/DCIM/photo {index}'s.jpg" for index in range(300)]
         digests = {path: hashlib.sha256(path.encode()).hexdigest() for path in paths}
@@ -405,11 +511,34 @@ class EngineTests(unittest.TestCase):
             )
             self.assertEqual(cache.active_file_count_under_root("/sdcard/DCIM", "sha256", "full"), 1)
 
-    def test_adb_path_shorthand_normalizes_to_sdcard_common_dirs(self):
+    def test_adb_path_shorthand_resolves_equivalent_mount_points_only(self):
+        # Interchangeable spellings of primary storage collapse to one form.
         self.assertEqual(ADBBridge.normalize_remote_path("/sd/DCIM"), "/sdcard/DCIM")
-        self.assertEqual(ADBBridge.normalize_remote_path("/sd/pictures"), "/sdcard/Pictures")
-        self.assertEqual(ADBBridge.normalize_remote_path("storage/self/primary/downloads"), "/sdcard/Download")
+        self.assertEqual(ADBBridge.normalize_remote_path("storage/self/primary/downloads"), "/sdcard/downloads")
         self.assertEqual(ADBBridge.normalize_remote_path("/storage/emulated/0/DCIM/Camera"), "/sdcard/DCIM/Camera")
+        self.assertEqual(ADBBridge.normalize_remote_path("/sdcard/DCIM/"), "/sdcard/DCIM")
+        self.assertEqual(ADBBridge.normalize_remote_path(r"\sdcard\DCIM"), "/sdcard/DCIM")
+
+    def test_adb_path_normalization_never_renames_a_real_folder(self):
+        # A phone can hold both /sdcard/Videos and /sdcard/Movies. Rewriting one
+        # to the other scanned a folder the user did not choose and left their
+        # actual videos unimported, so folder names must survive untouched.
+        for path in (
+            "/sdcard/Videos",
+            "/sdcard/Videos/clip.mp4",
+            "/sdcard/Downloads",
+            "/sdcard/Audio/song.mp3",
+            "/sdcard/Picture/a.jpg",
+            "/sdcard/pictures",
+        ):
+            self.assertEqual(ADBBridge.normalize_remote_path(path), path)
+
+        # Two distinct device files must never collapse onto one path, or
+        # hashing one would stand in for the other.
+        self.assertNotEqual(
+            ADBBridge.normalize_remote_path("/sdcard/Videos/clip.mp4"),
+            ADBBridge.normalize_remote_path("/sdcard/Movies/clip.mp4"),
+        )
 
     def test_drive_cache_repairs_broken_hash_index_and_ignores_bad_digests(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -720,8 +849,10 @@ class EngineTests(unittest.TestCase):
 
         script = _build_remote_find_script("/sdcard/My Photos", settings, "f")
         self.assertIn("find -L '/sdcard/My Photos'", script)
-        self.assertIn("-name 'Android'", script)
-        self.assertIn("-name 'System Volume Information'", script)
+        # Case-insensitive: normalize_excludes lowercases these names, so a
+        # case-sensitive -name would never match the real folder on the device.
+        self.assertIn("-iname 'Android'", script)
+        self.assertIn("-iname 'System Volume Information'", script)
 
     def test_remote_walk_script_streams_folders_and_files(self):
         settings = Settings(
@@ -741,11 +872,14 @@ class EngineTests(unittest.TestCase):
         )
 
         script = _build_remote_walk_script("/storage/emulated/0/DCIM", settings, follow_links=False)
-        self.assertIn("find '/storage/emulated/0/DCIM'", script)
-        self.assertNotIn("find -L", script)
-        self.assertIn("-name 'Android'", script)
+        # -L regardless of how the root was spelled: a symlinked subfolder is
+        # neither -type d nor -type f, so without it the whole subtree is lost.
+        self.assertIn("find -L '/storage/emulated/0/DCIM'", script)
+        self.assertIn("-iname 'Android'", script)
         self.assertIn("printf 'D|%s\\n'", script)
         self.assertIn("stat -c 'F|%s|%Y|%n'", script)
+        # A file find listed but stat could not read is reported, not dropped.
+        self.assertIn("printf 'E|%s\\n'", script)
 
     def test_execute_smart_transfer_counts_skipped_duplicates_in_dry_run(self):
         with tempfile.TemporaryDirectory() as temp_dir:

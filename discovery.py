@@ -35,6 +35,12 @@ class DiscoveryResult:
     files_found: int
     errors: list
     cancelled: bool
+    # True when the listing is known not to cover everything under the root:
+    # the device walk exited non-zero, reported errors, or could not read some
+    # entries. Callers must not treat an incomplete listing as the full set of
+    # files, or an import will silently leave files behind.
+    incomplete: bool = False
+    unreadable: tuple = ()
 
 
 def _normalize_settings(settings):
@@ -138,25 +144,49 @@ def _build_remote_find_script(root, settings, find_type, follow_links=True):
     excluded = [name for name in getattr(settings, "exclude_dirs", []) if name]
     prune = ""
     if excluded:
-        name_expr = " -o ".join(f"-name {_shell_quote(name)}" for name in excluded)
+        # -iname, not -name: normalize_excludes lowercases the list, so a real
+        # folder such as "Android" would never match a case-sensitive test and
+        # the exclusion would silently do nothing on the device while Python's
+        # own case-insensitive check excluded it locally.
+        name_expr = " -o ".join(f"-iname {_shell_quote(name)}" for name in excluded)
         prune = f"\\( -type d \\( {name_expr} \\) -prune \\) -o "
     link_flag = "-L " if follow_links else ""
     return f"find {link_flag}{quoted_root} {prune}-type {find_type} -print"
 
 
 def _build_remote_walk_script(root, settings, follow_links=True):
+    """Build the device-side recursive walk.
+
+    ``find -L`` is used unconditionally. Symlinks are followed regardless of
+    which spelling of the root the user typed, because a symlinked subfolder is
+    neither ``-type d`` nor ``-type f`` and would otherwise be skipped along
+    with everything beneath it. Resolving the root through
+    ``_canonical_adb_walk_root`` is about producing a stable display path and
+    says nothing about symlinks deeper in the tree; previously the two were
+    conflated, so ``/sdcard/DCIM`` and ``/storage/emulated/0/DCIM`` — the same
+    folder — could return different files.
+
+    A file that ``find`` lists but ``stat`` cannot read emits an ``E|`` line
+    instead of vanishing, so the caller can report it rather than silently
+    dropping it from the import.
+    """
+
     quoted_root = _shell_quote(root)
     excluded = [name for name in getattr(settings, "exclude_dirs", []) if name]
     prune = ""
     if excluded:
-        name_expr = " -o ".join(f"-name {_shell_quote(name)}" for name in excluded)
+        # -iname, not -name: normalize_excludes lowercases the list, so a real
+        # folder such as "Android" would never match a case-sensitive test and
+        # the exclusion would silently do nothing on the device while Python's
+        # own case-insensitive check excluded it locally.
+        name_expr = " -o ".join(f"-iname {_shell_quote(name)}" for name in excluded)
         prune = f"\\( -type d \\( {name_expr} \\) -prune \\) -o "
-    link_flag = "-L " if follow_links else ""
     return (
-        f"find {link_flag}{quoted_root} {prune}\\( -type d -o -type f \\) -print | "
+        f"find -L {quoted_root} {prune}\\( -type d -o -type f \\) -print | "
         "while IFS= read -r path; do "
         "if [ -d \"$path\" ]; then printf 'D|%s\\n' \"$path\"; "
-        "elif [ -f \"$path\" ]; then stat -c 'F|%s|%Y|%n' \"$path\" 2>/dev/null; fi; "
+        "elif [ -f \"$path\" ]; then stat -c 'F|%s|%Y|%n' \"$path\" 2>/dev/null "
+        "|| printf 'E|%s\\n' \"$path\"; fi; "
         "done"
     )
 
@@ -243,7 +273,14 @@ def scan_local_tree(root, settings, stop_event, progress_callback=None, logger=N
     progress.files_found = files_found
     progress.message = "Discovery finished" if not progress.cancelled else "Discovery cancelled"
     _emit_progress(progress_callback, progress, last_emit, force=True)
-    return DiscoveryResult(files, folders_scanned, files_found, errors, progress.cancelled)
+    return DiscoveryResult(
+        files,
+        folders_scanned,
+        files_found,
+        errors,
+        progress.cancelled,
+        incomplete=bool(errors) and not progress.cancelled,
+    )
 
 
 def _stream_lines(process):
@@ -260,7 +297,10 @@ def _enqueue_stdout_lines(process, output_queue):
         for raw_line in iter(process.stdout.readline, ""):
             if not raw_line:
                 break
-            line = raw_line.strip()
+            # Strip only the line terminator. A full strip() also removed
+            # trailing spaces, which are legal in Android file names and left
+            # a path that does not exist on the device.
+            line = raw_line.rstrip("\n").rstrip("\r")
             if line:
                 output_queue.put(line)
     finally:
@@ -321,6 +361,7 @@ def scan_adb_tree(root, settings, stop_event, progress_callback=None, logger=Non
     root = ADBBridge.normalize_remote_path(root)
     files = []
     errors = []
+    unreadable = []
     progress = ScanProgress(
         phase="discovering",
         source=root,
@@ -352,7 +393,7 @@ def scan_adb_tree(root, settings, stop_event, progress_callback=None, logger=Non
         progress.message = error_msg
         progress.phase = "complete"
         _emit_progress(progress_callback, progress, last_emit, force=True)
-        return DiscoveryResult(files, 0, 0, errors, False)
+        return DiscoveryResult(files, 0, 0, errors, False, incomplete=True)
 
     path_status = ADBBridge.remote_path_status(root, serial=getattr(settings, "adb_serial", ""))
     if path_status != "dir":
@@ -365,7 +406,7 @@ def scan_adb_tree(root, settings, stop_event, progress_callback=None, logger=Non
         progress.message = error_msg
         progress.phase = "complete"
         _emit_progress(progress_callback, progress, last_emit, force=True)
-        return DiscoveryResult(files, 0, 0, errors, False)
+        return DiscoveryResult(files, 0, 0, errors, False, incomplete=True)
 
     walk_root = _canonical_adb_walk_root(root)
     follow_links = walk_root == root
@@ -397,7 +438,7 @@ def scan_adb_tree(root, settings, stop_event, progress_callback=None, logger=Non
         progress.message = error_msg
         progress.phase = "complete"
         _emit_progress(progress_callback, progress, last_emit, force=True)
-        return DiscoveryResult(files, progress.folders_scanned, progress.files_found, errors, False)
+        return DiscoveryResult(files, progress.folders_scanned, progress.files_found, errors, False, incomplete=True)
     stderr_thread = threading.Thread(
         target=_drain_stderr,
         args=(process, errors, progress_callback, progress, logger),
@@ -440,6 +481,21 @@ def scan_adb_tree(root, settings, stop_event, progress_callback=None, logger=Non
                 progress.message = "Scanning folder"
                 last_emit = _emit_progress(progress_callback, progress, last_emit)
                 continue
+            if raw_line.startswith("E|"):
+                # The device listed this file but could not stat it. Record it
+                # rather than letting it disappear from the import silently.
+                path = _display_adb_path(raw_line[2:], walk_root, root)
+                if _is_excluded_remote(path, settings):
+                    continue
+                unreadable.append(path)
+                error_msg = f"Could not read file details: {path}"
+                errors.append(error_msg)
+                progress.errors = len(errors)
+                progress.message = error_msg
+                if logger:
+                    logger.log(f"WARNING: {error_msg}")
+                last_emit = _emit_progress(progress_callback, progress, last_emit)
+                continue
             if not raw_line.startswith("F|"):
                 continue
             try:
@@ -476,10 +532,35 @@ def scan_adb_tree(root, settings, stop_event, progress_callback=None, logger=Non
         stderr_thread.join(timeout=2)
 
     progress.cancelled = stop_event.is_set()
+    # A non-zero exit means find or the shell gave up part way through, so the
+    # listing covers only part of the tree. Treating that as the complete set
+    # of files is how an import silently leaves files on the phone.
+    exit_code = process.returncode
+    incomplete = not progress.cancelled and (bool(errors) or (exit_code not in (0, None)))
+    if incomplete:
+        if exit_code not in (0, None):
+            error_msg = f"Device file listing ended early (exit code {exit_code}); results may be incomplete."
+            errors.append(error_msg)
+            progress.errors = len(errors)
+            if logger:
+                logger.log(f"ERROR: {error_msg}")
+        elif logger:
+            logger.log(
+                f"WARNING: {len(errors)} problem(s) during the device scan; "
+                "some files under this folder may not be listed."
+            )
     progress.phase = "complete" if not progress.cancelled else "cancelled"
     progress.message = "Discovery finished" if not progress.cancelled else "Discovery cancelled"
     _emit_progress(progress_callback, progress, last_emit, force=True)
-    return DiscoveryResult(files, progress.folders_scanned, len(files), errors, progress.cancelled)
+    return DiscoveryResult(
+        files,
+        progress.folders_scanned,
+        len(files),
+        errors,
+        progress.cancelled,
+        incomplete=incomplete,
+        unreadable=tuple(unreadable),
+    )
 
 
 def discover_files(root, settings, stop_event, progress_callback=None, logger=None):

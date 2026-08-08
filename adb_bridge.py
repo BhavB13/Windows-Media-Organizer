@@ -17,6 +17,9 @@ ADB_PULL_PROGRESS_INTERVAL = 0.5
 # Maximum length of the batched hash command line. Android's ARG_MAX is well
 # above this, so the limit is deliberately conservative rather than tuned.
 ADB_HASH_BATCH_COMMAND_LIMIT = 24000
+# A single file hash reads the whole file on the phone, so this is generous;
+# it exists to bound a wedged USB stack, not to bound normal work.
+ADB_HASH_TIMEOUT = 600
 
 
 class ADBOperationError(RuntimeError):
@@ -25,9 +28,21 @@ class ADBOperationError(RuntimeError):
         self.path = path
         self.detail = detail.strip() or "ADB command failed."
         lowered = self.detail.lower()
+        # adb names the serial in its disconnect message, as in
+        # "adb: error: device 'R58M12ABCDE' not found", so a literal
+        # "device not found" test never matched a real unplug and the caller
+        # skipped its reconnect wait.
         self.device_unavailable = any(
             marker in lowered
-            for marker in ("unauthorized", "offline", "no devices", "device not found", "device disconnected")
+            for marker in (
+                "unauthorized",
+                "offline",
+                "no devices",
+                "not found",
+                "device disconnected",
+                "closed",
+                "protocol fault",
+            )
         )
         super().__init__(f"{operation} failed for {path}: {self.detail}")
 
@@ -59,6 +74,21 @@ class ADBBridge:
 
     @staticmethod
     def normalize_remote_path(remote_path):
+        """Resolve equivalent spellings of a device path to one canonical form.
+
+        Only genuinely interchangeable mount points are rewritten: /sd,
+        /storage/self/primary, and /storage/emulated/0 all name the same
+        primary storage as /sdcard.
+
+        This deliberately does not "correct" folder names. An earlier version
+        mapped the first component through a synonym table, so a phone with a
+        real /sdcard/Videos folder was scanned as /sdcard/Movies and the user's
+        actual videos were never seen. The same rewrite was applied per file
+        during hashing, which could hash a different file than the one
+        discovered. A folder that does not exist is already reported clearly by
+        remote_path_status, so guessing is both unnecessary and unsafe.
+        """
+
         path = (remote_path or "").strip().replace("\\", "/")
         if not path:
             return path
@@ -79,21 +109,6 @@ class ADBBridge:
         elif path.startswith("/storage/emulated/0/"):
             path = f"/sdcard/{path[len('/storage/emulated/0/'):]}"
 
-        parts = path.split("/")
-        if len(parts) > 2 and parts[1] == "sdcard":
-            common_dirs = {
-                "dcim": "DCIM",
-                "pictures": "Pictures",
-                "picture": "Pictures",
-                "download": "Download",
-                "downloads": "Download",
-                "movies": "Movies",
-                "videos": "Movies",
-                "music": "Music",
-                "audio": "Music",
-            }
-            parts[2] = common_dirs.get(parts[2].lower(), parts[2])
-            path = "/".join(parts)
         return path.rstrip("/") or "/"
 
     @staticmethod
@@ -314,14 +329,20 @@ class ADBBridge:
             f"{'sha256sum' if algo=='sha256' else 'md5sum'} {quoted_path}",
             serial=serial,
         )
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=CREATE_NO_WINDOW,
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+                # Without a timeout a wedged USB stack blocks this worker
+                # forever, which freezes the scan and makes Cancel do nothing.
+                timeout=ADB_HASH_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ADBOperationError("Hash", path, f"The device did not respond within {ADB_HASH_TIMEOUT}s.") from exc
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
             raise ADBOperationError("Hash", path, detail)
@@ -356,14 +377,22 @@ class ADBBridge:
             if not entries:
                 return
             script = tool + " " + " ".join(quoted for _, _, quoted in entries)
-            completed = subprocess.run(
-                ADBBridge._adb_command("exec-out", "sh", "-c", script, serial=serial),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=CREATE_NO_WINDOW,
-            )
+            try:
+                completed = subprocess.run(
+                    ADBBridge._adb_command("exec-out", "sh", "-c", script, serial=serial),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=CREATE_NO_WINDOW,
+                    # A batch hashes many files, so it is allowed proportionally
+                    # longer than a single hash before being treated as wedged.
+                    timeout=ADB_HASH_TIMEOUT * 4,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ADBOperationError(
+                    "Hash", entries[0][1], f"The device did not respond within {ADB_HASH_TIMEOUT * 4}s."
+                ) from exc
             by_normalized = {normalized: original for original, normalized, _ in entries}
             matched = 0
             # Parse stdout even on a non-zero exit: the hash tools report a

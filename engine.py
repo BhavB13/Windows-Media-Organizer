@@ -338,9 +338,24 @@ def validate_scan_paths(settings):
         return "Isolate folder does not exist."
     return ""
 
-def iter_files(root, settings, stop_event, progress_callback=None, logger=None):
+def iter_files(root, settings, stop_event, progress_callback=None, logger=None, on_result=None):
+    """Yield discovered files, handing the full result to ``on_result`` first.
+
+    The discovery result carries errors and an ``incomplete`` flag. Dropping
+    those on the floor is how a partially listed phone becomes an import that
+    reports success while leaving files behind, so callers are given the chance
+    to record them.
+    """
+
     settings = normalize_settings(settings)
     discovery = discover_files(root, settings, stop_event, progress_callback=progress_callback, logger=logger)
+    if on_result is not None:
+        on_result(discovery)
+    elif discovery.incomplete and logger:
+        logger.log(
+            f"WARNING: The listing of {root} was incomplete; "
+            f"{len(discovery.errors)} problem(s) were reported and some files may be missing."
+        )
     yield from discovery.files
 
 def _transfer_discovery_progress(label, start_time, progress_callback):
@@ -525,8 +540,25 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
     if progress_callback: progress_callback(0, 0, "Discovering source files... 0 found")
     
     source_files = []
+    source_discovery = {}
     source_progress = _transfer_discovery_progress("Source scan", start_time, progress_callback)
-    for count, f in enumerate(iter_files(settings.source_root, source_scan_settings, stop_event, source_progress, logger), 1):
+    for count, f in enumerate(
+        iter_files(
+            settings.source_root,
+            source_scan_settings,
+            stop_event,
+            source_progress,
+            logger,
+            on_result=lambda result: source_discovery.update(
+                {
+                    "incomplete": result.incomplete,
+                    "errors": list(result.errors),
+                    "unreadable": list(result.unreadable),
+                }
+            ),
+        ),
+        1,
+    ):
         source_files.append(f)
         if count % 25 == 0 and progress_callback:
             elapsed = int(time.time() - start_time)
@@ -534,6 +566,18 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
 
     if progress_callback:
         progress_callback(0, 0, f"Scanning Source: {len(source_files)} files found")
+
+    if source_discovery.get("incomplete"):
+        # Say so loudly. An import that copies everything it saw is still an
+        # incomplete import if the source listing itself was truncated, and the
+        # user has no other way to discover that.
+        logger.log(
+            f"WARNING: The source listing was incomplete. {len(source_discovery.get('errors', []))} "
+            "problem(s) were reported, so some files may not have been offered for import. "
+            "Re-run the import after resolving them."
+        )
+        for unreadable_path in source_discovery.get("unreadable", [])[:20]:
+            logger.log(f"WARNING: Source file could not be read: {unreadable_path}")
 
     preflight_errors, preflight_warnings = preflight_transfer(
         output_root,
@@ -1075,6 +1119,11 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         "bytes_transferred": bytes_transferred,
         "adb_device_failed": adb_device_failed,
         "dry_run": settings.dry_run,
+        # Carried into the report so a completed import that was working from a
+        # truncated source listing is not mistaken for a complete one.
+        "source_listing_incomplete": bool(source_discovery.get("incomplete")),
+        "source_listing_errors": len(source_discovery.get("errors", [])),
+        "source_unreadable_files": len(source_discovery.get("unreadable", [])),
     }
     if not settings.dry_run:
         try:
