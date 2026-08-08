@@ -32,8 +32,11 @@ Use this checklist on Windows after installing the project dependencies.
   remain in place while the dry-run manifest records what would happen.
 - In **Quarantine**, enable **Dry run restore** and confirm restore destinations
   are reported without moving quarantined files.
-- In **Import Files**, enable **Dry run partial cleanup** and confirm `.partial`
-  files are listed but remain on disk.
+- In **Import Files**, enable **Dry run partial cleanup** and confirm the listed
+  files remain on disk. Cleanup only ever targets files the app can prove it
+  owns — its own staging directory or paths recorded in a transfer journal — so
+  place an unrelated file named `download.partial` under the save location
+  first and confirm it is neither listed nor removed by a live cleanup.
 - In **Activity**, enable **Dry run report actions** and confirm export/remove
   report actions preview the target without writing or deleting report files.
 
@@ -127,7 +130,8 @@ Use this checklist on Windows after installing the project dependencies.
 ### Processing safety and recovery
 
 - [ ] During a large copy, test pause/resume, per-file skip, cancellation, and
-      retry. Confirm partial files are removed and completed files remain valid.
+      retry. Confirm the app's own partial files are removed, that unrelated
+      files ending in `.partial` are untouched, and completed files remain valid.
 - [ ] Test a cross-volume Move and confirm the destination hash is verified
       before the source is removed.
 - [ ] Replace an existing destination, then undo the run. Confirm both the

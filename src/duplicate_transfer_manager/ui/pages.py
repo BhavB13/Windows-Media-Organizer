@@ -50,6 +50,7 @@ from ..services import (
     DuplicateReview,
     DashboardService,
     FileOrganizerService,
+    IOSTransferService,
     OperationRecordService,
     ReportService,
     ScheduledScanService,
@@ -475,8 +476,15 @@ class DuplicatesPage(BasePage):
         advanced.body_layout.addWidget(self.hash_choice)
         advanced.body_layout.addWidget(QLabel("Hash mode"))
         self.hash_mode = QComboBox()
-        self.hash_mode.addItem("Full content — safest", "full")
-        self.hash_mode.addItem("Fast — large-file sampling", "fast")
+        self.hash_mode.addItem("Full content — recommended", "full")
+        self.hash_mode.addItem("Fast — sample first, then confirm", "fast")
+        self.hash_mode.setToolTip(
+            "Fast samples large files to shortlist candidates, then still reads every "
+            "shortlisted file in full before anything is quarantined. Photos and videos "
+            "that share a size are usually genuine copies, so the sample rarely rules "
+            "any out and Fast ends up reading them twice. Prefer Full content unless a "
+            "library has many same-size files with different contents."
+        )
         self.hash_mode.currentIndexChanged.connect(lambda _index: self._invalidate_review())
         advanced.body_layout.addWidget(self.hash_mode)
         self.threads = QSpinBox()
@@ -1127,7 +1135,11 @@ class ImportPage(BasePage):
         self.favorite_source.currentIndexChanged.connect(self._choose_favorite_source)
         self.favorite_source.setVisible(bool(self.app_settings.favorite_locations))
         source_layout.addWidget(self.favorite_source)
-        source_layout.addWidget(InlineMessage("iOS transfer support coming soon.", "info"))
+        # Sourced from the service rather than hardcoded so enabling iOS later
+        # is a service change, not a hunt for strings scattered through the UI.
+        ios_status = IOSTransferService().status()
+        if not ios_status.get("supported"):
+            source_layout.addWidget(InlineMessage(str(ios_status.get("message", "")), "info"))
         self.content.addWidget(source)
 
         destination = Card()
@@ -1232,6 +1244,11 @@ class ImportPage(BasePage):
         self.hash_mode.addItem("Use profile default", "")
         self.hash_mode.addItem("Full content", "full")
         self.hash_mode.addItem("Fast large-file sampling", "fast")
+        self.hash_mode.setToolTip(
+            "Fast samples the start and end of large files instead of reading them "
+            "whole. It helps least on photos and videos, where files of the same size "
+            "are usually genuine copies."
+        )
         self.hash_mode.currentIndexChanged.connect(lambda _index: self._invalidate_review())
         self.worker_count = QSpinBox()
         self.worker_count.setRange(0, 16)

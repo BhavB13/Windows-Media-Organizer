@@ -10,6 +10,10 @@ on:
         description: Update channel
         required: true
         default: stable
+      minimum_supported_version:
+        description: Oldest installed version allowed to take this update
+        required: true
+        default: "0.6.0"
 
 permissions:
   contents: write
@@ -112,7 +116,7 @@ jobs:
             size = $size
             sha256 = $hash
             release_notes_url = "https://github.com/BhavB13/Windows-Media-Organizer/releases/tag/v${{ inputs.version }}"
-            minimum_supported_version = "0.6.0"
+            minimum_supported_version = "${{ inputs.minimum_supported_version }}"
             signature_algorithm = "RSASSA-PKCS1-v1_5-SHA256"
             signature = ""
             authenticode_thumbprint = $env:WINDOWS_SIGNING_CERT_THUMBPRINT

@@ -53,9 +53,14 @@ is tracked in [OVERHAUL_PLAN.md](OVERHAUL_PLAN.md).
 - Verify signed update manifests, installer size, SHA-256 checksums, downgrade
   protection, and Windows Authenticode signatures before update launch.
 - Preserve source directory structure.
-- Resume interrupted transfers with journals.
+- Resume interrupted transfers with journals. Resume trusts a file whose size
+  and recorded timestamp still match and re-reads anything that changed; an
+  advanced option re-verifies every resumed file by content.
 - Use reusable local and Android hash caches.
-- Verify transfers, clean partial files, and produce JSON reports.
+- Verify transfers, produce JSON reports, and clean up leftover partial files.
+  Cleanup removes only files the app can prove it owns — its own staging
+  directory or paths recorded in a transfer journal — so unrelated files that
+  happen to end in `.partial` are never deleted.
 - Run copy-only dry runs before making changes.
 
 ## Requirements
