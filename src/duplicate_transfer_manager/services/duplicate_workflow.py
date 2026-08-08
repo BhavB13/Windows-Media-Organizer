@@ -116,6 +116,30 @@ def _safe_token(value: str) -> str:
     return f"{cleaned}_{digest}"
 
 
+def _stored_name(item: "DuplicateItem") -> str:
+    """Name a quarantined copy uniquely per source file, not per file name.
+
+    The digest is taken from the full original path. Two photos called
+    IMG_0001.jpg in different folders are entirely ordinary on a phone, and
+    keying only on the file name gave them the same quarantine path, so the
+    second move overwrote the first after that first original had already been
+    moved out of its folder. The manifest then held two records pointing at one
+    stored file, so a restore would put the wrong contents back.
+
+    The readable prefix still comes from the file name so quarantine stays
+    browsable.
+    """
+
+    digest = hashlib.sha256(str(item.path).encode("utf-8", errors="replace")).hexdigest()[:12]
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in item.filename)
+    cleaned = cleaned.strip("._")[:48] or "file"
+    name = f"{cleaned}_{digest}"
+    suffix = Path(item.filename).suffix
+    if suffix and not name.endswith(suffix):
+        name = f"{name}{suffix}"
+    return name
+
+
 def _format_bytes(value: int) -> str:
     amount = float(max(0, value))
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -292,14 +316,24 @@ class DuplicateQuarantineService:
 
         planned: list[tuple[DuplicateItem, str, dict]] = []
         manifest_records: list[dict] = []
+        claimed_names: set[str] = set()
         for group in review.groups:
             for item in group.items:
                 if item.id not in selected:
                     continue
-                target_name = _safe_token(item.filename)
-                suffix = Path(item.filename).suffix
-                if suffix and not target_name.endswith(suffix):
-                    target_name = f"{target_name}{suffix}"
+                target_name = _stored_name(item)
+                if target_name in claimed_names:
+                    # Belt and braces: the name is already keyed on the full
+                    # source path, so this only fires on a digest collision.
+                    # Overwriting here would destroy an original that has
+                    # already been moved out of its folder.
+                    stem = Path(target_name).stem
+                    suffix = Path(target_name).suffix
+                    index = 2
+                    while f"{stem}-{index}{suffix}" in claimed_names:
+                        index += 1
+                    target_name = f"{stem}-{index}{suffix}"
+                claimed_names.add(target_name)
                 stored_path = operation_root / target_name
                 record = QuarantineRecord(
                     original_path=item.path,

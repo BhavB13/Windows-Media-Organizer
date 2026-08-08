@@ -198,6 +198,47 @@ class Phase3DuplicateWorkflowTests(unittest.TestCase):
             self.assertEqual(manifest["operation_id"], "op-local")
             self.assertIn("no permanent deletion", manifest["safety"])
 
+    def test_quarantine_keeps_same_named_files_from_different_folders_apart(self):
+        # Two photos called IMG_0001.jpg in different folders are ordinary on a
+        # phone. Naming the quarantined copy after the file name alone made the
+        # second overwrite the first, destroying an original that had already
+        # been moved out of its folder.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            camera = root / "DCIM" / "Camera"
+            whatsapp = root / "Pictures" / "WhatsApp"
+            camera.mkdir(parents=True)
+            whatsapp.mkdir(parents=True)
+
+            # Two distinct duplicate pairs that happen to share a file name.
+            camera_keep = camera / "keep_a.jpg"
+            camera_dup = camera / "IMG_0001.jpg"
+            whatsapp_keep = whatsapp / "keep_b.jpg"
+            whatsapp_dup = whatsapp / "IMG_0001.jpg"
+            camera_keep.write_bytes(b"content-A")
+            camera_dup.write_bytes(b"content-A")
+            whatsapp_keep.write_bytes(b"content-B")
+            whatsapp_dup.write_bytes(b"content-B")
+
+            paths = get_runtime_paths(root / "data")
+            review = build_duplicate_review(
+                [
+                    [FileInfo(str(camera_keep), 9, 100), FileInfo(str(camera_dup), 9, 200)],
+                    [FileInfo(str(whatsapp_keep), 9, 100), FileInfo(str(whatsapp_dup), 9, 200)],
+                ],
+                thumbnail_root=root / "thumbs",
+            )
+            selected = [value for group in review.groups for value in group.selected_item_ids]
+            result = DuplicateQuarantineService(paths).quarantine(review, selected, operation_id="op-collide")
+
+            self.assertEqual(result.quarantined_count, 2)
+            stored = [Path(record.stored_path) for record in result.records]
+            self.assertEqual(len({str(path) for path in stored}), 2, "quarantined copies shared a path")
+            for path in stored:
+                self.assertTrue(path.exists())
+            # Both distinct contents survived; neither overwrote the other.
+            self.assertEqual({path.read_bytes() for path in stored}, {b"content-A", b"content-B"})
+
     def test_quarantine_dry_run_does_not_move_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
