@@ -14,6 +14,9 @@ ADB_PULL_POLL_INTERVAL = 0.05
 # the completion check so that shortening the poll does not stat the file or
 # repaint the UI twenty times a second.
 ADB_PULL_PROGRESS_INTERVAL = 0.5
+# Maximum length of the batched hash command line. Android's ARG_MAX is well
+# above this, so the limit is deliberately conservative rather than tuned.
+ADB_HASH_BATCH_COMMAND_LIMIT = 24000
 
 
 class ADBOperationError(RuntimeError):
@@ -326,6 +329,81 @@ class ADBBridge:
         if not output:
             raise ADBOperationError("Hash", path, "The device returned no hash output.")
         return output[0]
+
+    @staticmethod
+    def remote_hash_many(paths, algo, serial=None, stop_event=None):
+        """Hash many device files using a few shell invocations, not one per file.
+
+        Each ``adb exec-out`` costs a client spawn before the device does any
+        work, so hashing a phone library one file at a time is dominated by
+        process startup. Paths are batched into a single ``sha256sum``/
+        ``md5sum`` invocation per chunk, sized well under the device's argument
+        limit.
+
+        Returns ``{original_path: digest}``. Anything the device could not hash
+        is simply absent from the result, so callers fall back per file rather
+        than treating a gap as a failure. A device-level failure still raises
+        ``ADBOperationError`` so disconnects are not mistaken for missing files.
+        """
+
+        tool = "sha256sum" if algo == "sha256" else "md5sum"
+        digest_length = 64 if algo == "sha256" else 32
+        results = {}
+        batch = []
+        batch_length = 0
+
+        def run_batch(entries):
+            if not entries:
+                return
+            script = tool + " " + " ".join(quoted for _, _, quoted in entries)
+            completed = subprocess.run(
+                ADBBridge._adb_command("exec-out", "sh", "-c", script, serial=serial),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+            )
+            by_normalized = {normalized: original for original, normalized, _ in entries}
+            matched = 0
+            # Parse stdout even on a non-zero exit: the hash tools report a
+            # missing file and carry on, so a partial result is still useful.
+            for line in completed.stdout.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) != 2:
+                    continue
+                digest, reported_path = parts[0].strip(), parts[1].strip()
+                if len(digest) != digest_length:
+                    continue
+                try:
+                    int(digest, 16)
+                except ValueError:
+                    continue
+                original = by_normalized.get(reported_path)
+                if original is None:
+                    continue
+                results[original] = digest
+                matched += 1
+            if matched == 0 and completed.returncode != 0:
+                detail = completed.stderr.strip() or completed.stdout.strip()
+                raise ADBOperationError("Hash", entries[0][1], detail)
+
+        for original in paths:
+            if stop_event is not None and stop_event.is_set():
+                break
+            normalized = ADBBridge.normalize_remote_path(original)
+            # Output is line oriented and space separated, so a path carrying a
+            # newline could not be mapped back to its request reliably.
+            if not normalized or "\n" in normalized or "\r" in normalized:
+                continue
+            quoted = ADBBridge._shell_quote(normalized)
+            if batch and batch_length + len(quoted) + 1 > ADB_HASH_BATCH_COMMAND_LIMIT:
+                run_batch(batch)
+                batch, batch_length = [], 0
+            batch.append((original, normalized, quoted))
+            batch_length += len(quoted) + 1
+        run_batch(batch)
+        return results
 
     @staticmethod
     def pull(

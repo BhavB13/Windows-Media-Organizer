@@ -64,6 +64,82 @@ class EngineTests(unittest.TestCase):
             os.utime(target, (recorded + 60, recorded + 60))
             self.assertFalse(journal.is_complete("source", 8))
 
+    def test_remote_hash_many_groups_paths_into_few_adb_calls(self):
+        paths = [f"/sdcard/DCIM/photo {index}'s.jpg" for index in range(300)]
+        digests = {path: hashlib.sha256(path.encode()).hexdigest() for path in paths}
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            script = cmd[-1]
+            calls.append(script)
+            # The device only reports the paths this invocation asked for.
+            lines = [
+                f"{digest}  {path}"
+                for path, digest in digests.items()
+                if ADBBridge._shell_quote(path) in script
+            ]
+            return mock.Mock(returncode=0, stdout="\n".join(lines), stderr="")
+
+        with mock.patch.object(adb_bridge.subprocess, "run", side_effect=fake_run):
+            result = ADBBridge.remote_hash_many(paths, "sha256", serial="serial")
+
+        self.assertEqual(result, digests)
+        # One adb spawn per file is what this replaces; a few hundred paths
+        # must collapse into a handful of invocations.
+        self.assertLess(len(calls), 10)
+        self.assertTrue(all(call.startswith("sha256sum ") for call in calls))
+
+    def test_remote_hash_many_reports_partial_results_and_rejects_bad_lines(self):
+        paths = ["/sdcard/a.jpg", "/sdcard/missing.jpg", "/sdcard/c.jpg"]
+        good = hashlib.sha256(b"a").hexdigest()
+        stdout = "\n".join(
+            [
+                f"{good}  /sdcard/a.jpg",
+                "not-a-digest  /sdcard/c.jpg",
+                f"{good}  /sdcard/never-requested.jpg",
+            ]
+        )
+        # The hash tools skip a missing file, report it on stderr, and exit
+        # non-zero while still hashing everything else.
+        with mock.patch.object(
+            adb_bridge.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=1, stdout=stdout, stderr="sha256sum: /sdcard/missing.jpg: No such file"),
+        ):
+            result = ADBBridge.remote_hash_many(paths, "sha256", serial="serial")
+
+        self.assertEqual(result, {"/sdcard/a.jpg": good})
+
+    def test_remote_hash_many_raises_when_the_device_is_unavailable(self):
+        with mock.patch.object(
+            adb_bridge.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=1, stdout="", stderr="error: device unauthorized"),
+        ):
+            with self.assertRaises(adb_bridge.ADBOperationError) as caught:
+                ADBBridge.remote_hash_many(["/sdcard/a.jpg"], "sha256", serial="serial")
+        self.assertTrue(caught.exception.device_unavailable)
+
+    def test_grouped_device_hashing_falls_back_when_unavailable(self):
+        infos = [FileInfo("/sdcard/a.jpg", 10, 1.0, is_adb=True)]
+        settings = mock.Mock(hash_algo="sha256", adb_serial="serial")
+        with mock.patch.object(
+            adb_bridge.ADBBridge,
+            "remote_hash_many",
+            side_effect=adb_bridge.ADBOperationError("Hash", "/sdcard/a.jpg", "device offline"),
+        ):
+            self.assertEqual(
+                engine_module.batch_adb_hashes(infos, settings, threading.Event(), DummyLogger()),
+                {},
+            )
+
+    def test_grouped_device_hashing_skips_local_only_scans(self):
+        infos = [FileInfo("C:/photos/a.jpg", 10, 1.0, is_adb=False)]
+        settings = mock.Mock(hash_algo="sha256", adb_serial="")
+        with mock.patch.object(adb_bridge.ADBBridge, "remote_hash_many") as never:
+            self.assertEqual(engine_module.batch_adb_hashes(infos, settings, threading.Event()), {})
+        never.assert_not_called()
+
     def test_pull_notices_a_fast_transfer_without_waiting_for_the_progress_tick(self):
         # A phone photo finishes far inside one progress interval. The old
         # loop slept a full interval before noticing, which set the floor on

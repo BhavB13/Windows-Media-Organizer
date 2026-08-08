@@ -32,6 +32,37 @@ class HashCancelled(RuntimeError):
 def _hash_cancelled(stop_event):
     return bool(stop_event and stop_event.is_set())
 
+
+def batch_adb_hashes(items, settings, stop_event, logger=None):
+    """Hash device files in grouped commands before per-file work starts.
+
+    Hashing a phone one file at a time spends most of its wall clock spawning
+    an adb client rather than reading files. Anything not returned here simply
+    falls back to the per-file path, so a device that cannot run the batched
+    command behaves exactly as before.
+    """
+
+    adb_paths = [info.path for info in items if getattr(info, "is_adb", False)]
+    if not adb_paths:
+        return {}
+    try:
+        digests = ADBBridge.remote_hash_many(
+            adb_paths,
+            settings.hash_algo,
+            serial=getattr(settings, "adb_serial", ""),
+            stop_event=stop_event,
+        )
+    except ADBOperationError as exc:
+        if logger:
+            logger.log(f"WARNING: Grouped device hashing unavailable ({exc}). Falling back to per-file hashing.")
+        return {}
+    if logger and digests:
+        logger.log(
+            f"Grouped device hashing: {len(digests)} of {len(adb_paths)} device file(s) "
+            "hashed without a per-file adb call."
+        )
+    return digests
+
 def compute_hash(path, settings, stop_event, hash_cache=None, is_adb=False, logger=None):
     if _hash_cancelled(stop_event):
         raise HashCancelled(path)
@@ -389,10 +420,19 @@ def group_duplicates(infos, settings, stop_event, hash_cache, logger, progress_c
         if progress_callback: progress_callback(1, 1, "No duplicates found.")
         return []
 
+    batched = batch_adb_hashes(items_to_hash, settings, stop_event, logger)
+    for info in items_to_hash:
+        digest = batched.get(info.path)
+        if digest:
+            hash_groups.setdefault(digest, []).append(info)
+    processed = len(batched)
+    if processed and progress_callback:
+        progress_callback(processed, total_to_hash, "Hashing potential duplicates...")
+
     with ThreadPoolExecutor(max_workers=settings.max_hash_workers) as pool:
-        futures = {pool.submit(compute_hash, info.path, settings, stop_event, hash_cache, info.is_adb, logger): info 
-                   for info in items_to_hash}
-        
+        futures = {pool.submit(compute_hash, info.path, settings, stop_event, hash_cache, info.is_adb, logger): info
+                   for info in items_to_hash if info.path not in batched}
+
         for future in as_completed(futures):
             if stop_event.is_set(): break
             processed += 1
@@ -419,6 +459,11 @@ def group_duplicates(infos, settings, stop_event, hash_cache, logger, progress_c
     total_candidates = len(candidates_to_hash)
     if progress_callback:
         progress_callback(0, total_candidates, "Confirming duplicate candidates with full-content SHA-256...")
+    confirmed_batch = batch_adb_hashes(candidates_to_hash, full_settings, stop_event, logger)
+    for info in candidates_to_hash:
+        digest = confirmed_batch.get(info.path)
+        if digest:
+            full_groups.setdefault(digest, []).append(info)
     with ThreadPoolExecutor(max_workers=settings.max_hash_workers) as pool:
         futures = {
             pool.submit(
@@ -431,8 +476,9 @@ def group_duplicates(infos, settings, stop_event, hash_cache, logger, progress_c
                 logger,
             ): info
             for info in candidates_to_hash
+            if info.path not in confirmed_batch
         }
-        confirmed = 0
+        confirmed = len(confirmed_batch)
         for future in as_completed(futures):
             if stop_event.is_set():
                 break
@@ -638,6 +684,31 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         journal = TransferJournal(journal_path)
         logger.log(f"Resume journal: {journal_path}")
     verify_resumed_files = bool(getattr(settings, "verify_resumed_files", False))
+    batched_source_hashes = {}
+    uses_staged_import = (
+        getattr(settings, "source_is_adb", False)
+        and getattr(settings, "transfer_profile", "Balanced") in ("Balanced", "Fast")
+        and not settings.dry_run
+    )
+    if getattr(settings, "source_is_adb", False) and not uses_staged_import:
+        # Staged imports hash the local copy after pulling, so batching would
+        # add an entire extra device-side read. Only the profiles that hash on
+        # the phone benefit from grouping those calls.
+        pending_device_hashes = [
+            source_info
+            for source_info in source_files
+            if not (
+                adb_cache
+                and adb_cache.get_valid_hash(
+                    source_info.path,
+                    hash_settings.hash_algo,
+                    hash_settings.hash_mode,
+                    source_info.size,
+                    source_info.created,
+                )
+            )
+        ]
+        batched_source_hashes = batch_adb_hashes(pending_device_hashes, hash_settings, stop_event, logger)
     previous_stay_awake = None
     if getattr(settings, "source_is_adb", False) and getattr(settings, "keep_device_awake", True):
         previous_stay_awake = ADBBridge.enable_usb_stay_awake(getattr(settings, "adb_serial", ""))
@@ -672,6 +743,8 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                 f.size,
                 f.created,
             )
+        if not h and f.is_adb:
+            h = batched_source_hashes.get(f.path)
         if not h:
             try:
                 single_read_import = (
