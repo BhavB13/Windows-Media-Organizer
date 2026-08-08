@@ -308,6 +308,65 @@ class Phase5OverviewActivitySettingsTests(unittest.TestCase):
         self.assertEqual(len({record.operation_id for record in loaded}), 2)
         self.assertTrue(any(record.source_is_adb for record in loaded))
 
+    def test_dashboard_can_skip_the_storage_walk_for_first_paint(self):
+        from duplicate_transfer_manager.services import DashboardService
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = get_runtime_paths(temp_dir)
+            nested = paths.cache / "drive" / "deep"
+            nested.mkdir(parents=True, exist_ok=True)
+            (nested / "entry.json").write_text("x" * 512, encoding="utf-8")
+            service = DashboardService(paths)
+
+            deferred = service.summary(include_storage=False)
+            self.assertFalse(deferred["storage"]["measured"])
+            self.assertEqual(deferred["storage"]["cache_bytes"], 0)
+            # Counts already held in memory stay available for first paint.
+            self.assertEqual(deferred["storage"]["quarantine_bytes"], 0)
+
+            measured = service.summary()
+            self.assertTrue(measured["storage"]["measured"])
+            self.assertGreaterEqual(measured["storage"]["cache_bytes"], 512)
+
+    def test_directory_size_counts_nested_files(self):
+        from duplicate_transfer_manager.services.support_services import _directory_size
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "tree"
+            (root / "a" / "b").mkdir(parents=True)
+            (root / "top.bin").write_bytes(b"x" * 100)
+            (root / "a" / "mid.bin").write_bytes(b"x" * 200)
+            (root / "a" / "b" / "leaf.bin").write_bytes(b"x" * 300)
+
+            self.assertEqual(_directory_size(root), 600)
+            self.assertEqual(_directory_size(root / "does-not-exist"), 0)
+
+    def test_android_connection_help_names_the_real_causes(self):
+        from duplicate_transfer_manager.services import DeviceService
+
+        # A ready device needs no guidance, even alongside a bad one.
+        self.assertEqual(DeviceService.connection_help([{"status": "device"}]), "")
+        self.assertEqual(
+            DeviceService.connection_help([{"status": "unauthorized"}, {"status": "device"}]), ""
+        )
+
+        # "No device" is most often a power-only cable or the wrong USB mode,
+        # neither of which adb's own output mentions.
+        missing = DeviceService.connection_help([])
+        self.assertIn("USB debugging", missing)
+        self.assertIn("charging only", missing)
+        self.assertIn("cable", missing)
+
+        unauthorized = DeviceService.connection_help([{"status": "unauthorized"}])
+        self.assertIn("Unlock the screen", unauthorized)
+        self.assertIn("Revoke USB debugging authorizations", unauthorized)
+
+        # A locked phone commonly reports offline, so say so.
+        self.assertIn("locked phone", DeviceService.connection_help([{"status": "offline"}]))
+
+        # An unrecognised state still produces something actionable.
+        self.assertIn("weird", DeviceService.connection_help([{"status": "weird"}]))
+
 
 if __name__ == "__main__":
     unittest.main()

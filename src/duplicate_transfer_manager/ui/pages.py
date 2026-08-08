@@ -44,6 +44,7 @@ from ..core import AppSettings
 from ..runtime_paths import get_runtime_paths
 from ..sorting import SortExecutor
 from ..services import (
+    DeviceService,
     DiagnosticsService,
     DuplicateQuarantineService,
     DuplicateReview,
@@ -290,10 +291,15 @@ class OverviewPage(BasePage):
             max_columns=3,
         )
         self.content.addWidget(self.summary_sections)
-        self.refresh()
+        # Overview is the landing route, so the window must not wait on a walk
+        # of the cache tree that grows with every scan. Render immediately with
+        # the counts already in memory, then measure storage once the shell is
+        # on screen.
+        self.refresh(include_storage=False)
+        QTimer.singleShot(0, self.refresh)
 
-    def refresh(self) -> None:
-        summary = self.dashboard_service.summary()
+    def refresh(self, *, include_storage: bool = True) -> None:
+        summary = self.dashboard_service.summary(include_storage=include_storage)
         recent = summary["recent_operations"]
         interrupted = summary["interrupted_transfers"]
         devices = summary.get("connected_devices", [])
@@ -322,10 +328,11 @@ class OverviewPage(BasePage):
             or [("No interrupted transfers", "Nothing currently needs recovery.")]
         )
         storage = summary["storage"]
+        measuring = not storage.get("measured", True)
         self.storage.set_items(
             [
-                ("Cache", format_duplicate_size(storage["cache_bytes"])),
-                ("Reports", format_duplicate_size(storage["reports_bytes"])),
+                ("Cache", "Measuring…" if measuring else format_duplicate_size(storage["cache_bytes"])),
+                ("Reports", "Measuring…" if measuring else format_duplicate_size(storage["reports_bytes"])),
                 ("Quarantine", format_duplicate_size(storage["quarantine_bytes"])),
                 ("Connected devices", ", ".join(str(device.get("serial", device)) for device in devices[:3]) or "None"),
             ]
@@ -666,6 +673,10 @@ class DuplicatesPage(BasePage):
             self.device_choice.addItem(label, device.get("serial", ""))
         if not devices:
             self.device_choice.addItem("No authorized Android device found", "")
+        help_text = DeviceService.connection_help(devices)
+        self.path.helper.setText(
+            help_text or "Authorize USB debugging, then choose or type an Android folder."
+        )
 
     def _selected_categories(self) -> tuple[bool, list[str]]:
         extensions: list[str] = []
@@ -1435,6 +1446,12 @@ class ImportPage(BasePage):
             self.device_choice.addItem(label, device.get("serial", ""))
         if not devices:
             self.device_choice.addItem("No authorized Android device found", "")
+        help_text = DeviceService.connection_help(devices)
+        if help_text:
+            self.banner.set_message(help_text, "warning")
+            self.banner.show()
+        elif self.banner.isVisible():
+            self.banner.hide()
 
     def _profile_changed(self) -> None:
         profile = self.profile.currentData() or "Balanced"
