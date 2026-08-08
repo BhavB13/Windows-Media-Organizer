@@ -114,7 +114,11 @@ def _drain_stderr(process, errors, progress_callback, progress, logger=None):
 
 
 def _adb_shell_command(serial, script):
-    cmd = ["adb"]
+    # Resolved through adb_bridge so discovery uses the same binary as every
+    # other adb call, including the copy shipped beside the executable.
+    from adb_bridge import resolve_adb_executable
+
+    cmd = [resolve_adb_executable()]
     if serial:
         cmd.extend(["-s", serial])
     cmd.extend(["exec-out", "sh", "-c", script])

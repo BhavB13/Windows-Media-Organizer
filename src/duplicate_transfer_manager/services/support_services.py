@@ -21,7 +21,7 @@ from urllib.request import urlopen
 
 from packaging.version import InvalidVersion, Version
 
-from adb_bridge import ADBBridge
+from adb_bridge import ADBBridge, resolve_adb_executable
 
 from ..core import (
     AppSettings,
@@ -357,17 +357,20 @@ class DiagnosticsService:
         self.paths = paths or get_runtime_paths()
 
     def collect(self, include_devices: bool = True, *, sanitized: bool = True) -> dict[str, Any]:
-        bundled_adb = self.paths.root / "platform-tools" / ("adb.exe" if os.name == "nt" else "adb")
+        # Report the binary adb calls actually use. This previously looked under
+        # the runtime data directory, while packaging puts platform-tools beside
+        # the executable, so a correct install still reported "Not bundled".
+        resolved_adb = Path(resolve_adb_executable())
+        bundled_adb = resolved_adb
         manifest = _resource_path("packaging/android_platform_tools_manifest.json")
         manifest_payload: dict[str, Any] = {}
         try:
             manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             pass
-        bundled_version = "Not bundled"
         pinned_version = str(manifest_payload.get("version", "Unknown"))
-        if bundled_adb.exists():
-            bundled_version = pinned_version
+        is_bundled = resolved_adb.parent.name == "platform-tools" and resolved_adb.is_file()
+        bundled_version = pinned_version if is_bundled else "Not bundled"
         payload = {
             "application_version": __version__,
             "python_version": platform.python_version(),
@@ -380,7 +383,8 @@ class DiagnosticsService:
             },
             "android_platform_tools": {
                 "bundled_adb": str(bundled_adb),
-                "bundled": bundled_adb.exists(),
+                "bundled": is_bundled,
+                "resolved_adb": str(resolved_adb),
                 "version": bundled_version,
                 "pinned_version": pinned_version,
                 "license": manifest_payload.get("license", ""),

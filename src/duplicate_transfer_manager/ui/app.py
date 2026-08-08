@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from ..runtime_paths import initialize_runtime_data
 from ..services import CrashReportService, DashboardService, FileOrganizerService, SettingsService
 from ..version import __version__
+from adb_bridge import set_adb_executable
 from utils import HashCache
 from .shell import MainWindow
 from ..sorting import SortExecutor, SortingMigrationService
@@ -38,6 +39,11 @@ def create_application(
     paths, _migration = initialize_runtime_data(source_root, root=data_root)
     settings_service = SettingsService(paths)
     settings = settings_service.load()
+    # Honour a configured adb location. The setting was persisted but never
+    # read, so a user who pointed the app at their own platform-tools was
+    # silently ignored.
+    if settings.android_platform_tools_path:
+        set_adb_executable(settings.android_platform_tools_path)
     DashboardService(paths).prune_cache(settings.cache_retention_days)
     FileOrganizerService(paths).prune_manifests(settings.organization_retention_days)
     SortingMigrationService(paths).migrate_legacy_runs()

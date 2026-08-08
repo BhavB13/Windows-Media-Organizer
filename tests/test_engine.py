@@ -529,6 +529,65 @@ class EngineTests(unittest.TestCase):
             )
             self.assertEqual(cache.active_file_count_under_root("/sdcard/DCIM", "sha256", "full"), 1)
 
+    def test_directory_listing_shows_symlinked_folders_and_reports_failures(self):
+        listing = b"Camera/\nScreenshots/\nlinked_album/\nnote.txt\n"
+        with mock.patch.object(
+            adb_bridge.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=listing, stderr=b"")
+        ) as run:
+            folders = ADBBridge.get_directory_structure("/sdcard/DCIM", serial="X")
+
+        # -L dereferences symlinks, so a symlinked album is listed as a folder
+        # instead of being invisible in the browser.
+        self.assertIn("ls -pL", run.call_args[0][0][-1])
+        self.assertEqual([f["name"] for f in folders], ["Camera", "linked_album", "Screenshots"])
+        self.assertEqual(folders[0]["path"], "/sdcard/DCIM/Camera")
+
+        # A device failure must not look like an empty folder.
+        with mock.patch.object(
+            adb_bridge.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=1, stdout=b"", stderr=b"error: device offline"),
+        ):
+            with self.assertRaises(adb_bridge.ADBOperationError) as caught:
+                ADBBridge.get_directory_structure("/sdcard/DCIM", serial="X")
+        self.assertTrue(caught.exception.device_unavailable)
+
+    def test_bundled_adb_is_preferred_over_whatever_is_on_path(self):
+        # Packaging ships platform-tools beside the executable, but every call
+        # site used the bare name "adb" and so depended on the user having the
+        # Android SDK on PATH. An ordinary Windows PC does not, so a packaged
+        # install found no phone and blamed the cable.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app_dir = os.path.join(temp_dir, "app")
+            tools = os.path.join(app_dir, "platform-tools")
+            os.makedirs(tools)
+            name = "adb.exe" if os.name == "nt" else "adb"
+            bundled = os.path.join(tools, name)
+            with open(bundled, "wb") as handle:
+                handle.write(b"")
+
+            adb_bridge.set_adb_executable("")
+            try:
+                with mock.patch.object(adb_bridge.sys, "executable", os.path.join(app_dir, "app.exe")), mock.patch.object(
+                    adb_bridge.shutil, "which", return_value="C:/somewhere/else/adb.exe"
+                ):
+                    adb_bridge.resolve_adb_executable.cache_clear()
+                    self.assertEqual(adb_bridge.resolve_adb_executable(), bundled)
+                    self.assertEqual(ADBBridge._adb_command("devices")[0], bundled)
+            finally:
+                adb_bridge.set_adb_executable("")
+
+    def test_configured_adb_path_overrides_discovery(self):
+        adb_bridge.set_adb_executable("D:/tools/adb.exe")
+        try:
+            self.assertEqual(adb_bridge.resolve_adb_executable(), "D:/tools/adb.exe")
+            self.assertEqual(
+                ADBBridge._adb_command("shell", "ls", serial="ABC"),
+                ["D:/tools/adb.exe", "-s", "ABC", "shell", "ls"],
+            )
+        finally:
+            adb_bridge.set_adb_executable("")
+
     def test_adb_path_shorthand_resolves_equivalent_mount_points_only(self):
         # Interchangeable spellings of primary storage collapse to one form.
         self.assertEqual(ADBBridge.normalize_remote_path("/sd/DCIM"), "/sdcard/DCIM")

@@ -1,7 +1,11 @@
 import subprocess
 import os
+import shutil
+import sys
 import threading
 import time
+from functools import lru_cache
+
 from models import FileInfo
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == 'nt' else 0
@@ -21,6 +25,54 @@ ADB_HASH_BATCH_COMMAND_LIMIT = 24000
 # A single file hash reads the whole file on the phone, so this is generous;
 # it exists to bound a wedged USB stack, not to bound normal work.
 ADB_HASH_TIMEOUT = 600
+
+
+_ADB_EXECUTABLE_OVERRIDE = ""
+
+
+def set_adb_executable(path):
+    """Point every adb call at a specific binary, or clear the override."""
+    global _ADB_EXECUTABLE_OVERRIDE
+    _ADB_EXECUTABLE_OVERRIDE = str(path or "")
+    resolve_adb_executable.cache_clear()
+
+
+@lru_cache(maxsize=1)
+def _discover_adb_executable():
+    candidates = []
+    # A frozen build unpacks beside the executable, which is where packaging
+    # puts platform-tools.
+    frozen_root = getattr(sys, "_MEIPASS", "")
+    if frozen_root:
+        candidates.append(os.path.join(frozen_root, "platform-tools"))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "platform-tools"))
+    # Development checkout.
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "platform-tools"))
+    name = "adb.exe" if os.name == "nt" else "adb"
+    for directory in candidates:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return shutil.which("adb") or "adb"
+
+
+def resolve_adb_executable():
+    """Return the adb binary to invoke, preferring the copy shipped with the app.
+
+    Packaging copies platform-tools next to the executable, but every call site
+    used the bare name "adb" and so silently depended on the user having the
+    Android SDK on PATH. An ordinary Windows PC does not, so a packaged install
+    shipped adb.exe and then found no phone, which the UI reported as a cable or
+    USB-debugging problem. Resolution happens in one place so the bundled copy
+    is actually used and diagnostics can report what was chosen.
+    """
+
+    if _ADB_EXECUTABLE_OVERRIDE:
+        return _ADB_EXECUTABLE_OVERRIDE
+    return _discover_adb_executable()
+
+
+resolve_adb_executable.cache_clear = _discover_adb_executable.cache_clear
 
 
 class ADBOperationError(RuntimeError):
@@ -63,7 +115,7 @@ class ADBBridge:
 
     @staticmethod
     def _adb_command(*args, serial=None):
-        cmd = ["adb"]
+        cmd = [resolve_adb_executable()]
         if serial:
             cmd.extend(["-s", serial])
         cmd.extend(args)
@@ -294,19 +346,43 @@ class ADBBridge:
 
     @staticmethod
     def get_directory_structure(remote_path, serial=None):
+        """List immediate subfolders, raising rather than hiding a failure.
+
+        ``-L`` dereferences symlinks so a symlinked subfolder is marked as a
+        directory; without it such folders were invisible in the browser and a
+        user could not reach the files beneath them.
+
+        A device error used to be swallowed and returned as an empty list, so
+        the caller could not tell "this folder has no subfolders" from "adb
+        failed", and told the user the folder was empty either way.
+        """
+
         remote_path = ADBBridge.normalize_remote_path(remote_path)
         quoted_path = ADBBridge._shell_quote(remote_path)
-        cmd = ADBBridge._adb_command("shell", f"ls -p {quoted_path}", serial=serial)
+        cmd = ADBBridge._adb_command("shell", f"ls -pL {quoted_path}", serial=serial)
         try:
-            output = subprocess.check_output(
+            completed = subprocess.run(
                 cmd,
+                capture_output=True,
                 creationflags=CREATE_NO_WINDOW,
                 timeout=ADB_PROBE_TIMEOUT,
-            ).decode(errors="replace").splitlines()
-            dirs = [{"name": i.strip('/'), "path": f"{remote_path.rstrip('/')}/{i.strip('/')}"} for i in output if i.endswith('/')]
-            return sorted(dirs, key=lambda x: x['name'].lower())
-        except Exception:
-            return []
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ADBOperationError(
+                "List", remote_path, f"The device did not respond within {ADB_PROBE_TIMEOUT}s."
+            ) from exc
+        except OSError as exc:
+            raise ADBOperationError("List", remote_path, str(exc)) from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or b"").decode(errors="replace").strip()
+            raise ADBOperationError("List", remote_path, detail or "The folder could not be listed.")
+        output = completed.stdout.decode(errors="replace").splitlines()
+        dirs = [
+            {"name": line.strip("/"), "path": f"{remote_path.rstrip('/')}/{line.strip('/')}"}
+            for line in output
+            if line.endswith("/")
+        ]
+        return sorted(dirs, key=lambda value: value["name"].lower())
 
     @staticmethod
     def list_files_recursive(remote_path, settings, stop_event, serial=None):

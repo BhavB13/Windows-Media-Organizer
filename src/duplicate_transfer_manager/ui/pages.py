@@ -637,9 +637,16 @@ class DuplicatesPage(BasePage):
             self.path.set_error("Select an authorized Android device before browsing phone folders.")
             return
         current = ADBBridge.normalize_remote_path(selector.path() or "/sdcard")
-        folders = ADBBridge.get_directory_structure(current, serial=serial)
+        try:
+            folders = ADBBridge.get_directory_structure(current, serial=serial)
+        except Exception as exc:
+            # A device error is not an empty folder. Saying so sends the user
+            # looking for missing files instead of a stalled connection.
+            self.banner.set_message(f"Could not list folders under {current}: {exc}", "error")
+            self.banner.show()
+            return
         if not folders:
-            self.banner.set_message(f"No accessible Android subfolders found under {current}. You can type a nested path manually.", "warning")
+            self.banner.set_message(f"No subfolders under {current}. You can type a nested path manually.", "warning")
             self.banner.show()
             return
         labels = [f"{folder['name']} — {folder['path']}" for folder in folders]
@@ -1418,9 +1425,16 @@ class ImportPage(BasePage):
             selector.set_error("Select an authorized Android device before browsing phone folders.")
             return
         current = ADBBridge.normalize_remote_path(selector.path() or "/sdcard")
-        folders = ADBBridge.get_directory_structure(current, serial=serial)
+        try:
+            folders = ADBBridge.get_directory_structure(current, serial=serial)
+        except Exception as exc:
+            # A device error is not an empty folder. Saying so sends the user
+            # looking for missing files instead of a stalled connection.
+            self.banner.set_message(f"Could not list folders under {current}: {exc}", "error")
+            self.banner.show()
+            return
         if not folders:
-            self.banner.set_message(f"No accessible Android subfolders found under {current}. You can type a nested path manually.", "warning")
+            self.banner.set_message(f"No subfolders under {current}. You can type a nested path manually.", "warning")
             self.banner.show()
             return
         labels = [f"{folder['name']} — {folder['path']}" for folder in folders]
