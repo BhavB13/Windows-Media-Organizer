@@ -254,8 +254,14 @@ class EngineTests(unittest.TestCase):
 
         class FakeProcess:
             def __init__(self, polls_until_exit):
+                import io
+
                 self.remaining = polls_until_exit
                 self.returncode = None
+                # adb writes progress here; the pull drains both pipes while
+                # the transfer runs so a large file cannot block on a full one.
+                self.stdout = io.StringIO("[ 50%] /sdcard/photo.jpg\n")
+                self.stderr = io.StringIO("")
 
             def poll(self):
                 if self.remaining > 0:
@@ -264,8 +270,12 @@ class EngineTests(unittest.TestCase):
                 self.returncode = 0
                 return 0
 
-            def communicate(self):
-                return "", ""
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def kill(self):
+                pass
 
         sleeps = []
         process = FakeProcess(polls_until_exit=2)
@@ -290,8 +300,12 @@ class EngineTests(unittest.TestCase):
 
         class FakeProcess:
             def __init__(self):
+                import io
+
                 self.calls = 0
                 self.returncode = None
+                self.stdout = io.StringIO("")
+                self.stderr = io.StringIO("")
 
             def poll(self):
                 self.calls += 1
@@ -301,8 +315,12 @@ class EngineTests(unittest.TestCase):
                 self.returncode = 0
                 return 0
 
-            def communicate(self):
-                return "", ""
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def kill(self):
+                pass
 
         with tempfile.TemporaryDirectory() as temp_dir:
             destination = os.path.join(temp_dir, "clip.mp4")

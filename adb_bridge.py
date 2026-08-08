@@ -1,5 +1,6 @@
 import subprocess
 import os
+import threading
 import time
 from models import FileInfo
 
@@ -457,6 +458,29 @@ class ADBBridge:
             errors="replace",
             creationflags=CREATE_NO_WINDOW,
         )
+        # adb writes transfer progress while it runs. Nothing read these pipes
+        # until the process exited, so a large file could fill the OS pipe
+        # buffer, block adb, stop the destination growing, and trip the stall
+        # detector - which then killed and retried a transfer that was working.
+        # Draining in background threads keeps adb moving.
+        collected = {"stdout": [], "stderr": []}
+
+        def drain(stream, key):
+            try:
+                for chunk in iter(stream.readline, ""):
+                    if not chunk:
+                        break
+                    collected[key].append(chunk)
+            except (OSError, ValueError):
+                pass
+
+        drains = [
+            threading.Thread(target=drain, args=(process.stdout, "stdout"), daemon=True),
+            threading.Thread(target=drain, args=(process.stderr, "stderr"), daemon=True),
+        ]
+        for thread in drains:
+            thread.start()
+
         last_size = -1
         last_progress = time.monotonic()
         last_report = None
@@ -486,8 +510,15 @@ class ADBBridge:
                 if progress_callback:
                     progress_callback(current_size)
             time.sleep(ADB_PULL_POLL_INTERVAL)
-        stdout, stderr = process.communicate()
+        for thread in drains:
+            thread.join(timeout=5)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
         returncode = process.returncode
+        stdout = "".join(collected["stdout"])
+        stderr = "".join(collected["stderr"])
         detail = stderr.strip() or stdout.strip()
         if returncode != 0 and disable_compression and (
             "unknown option" in detail.lower() or "usage:" in detail.lower()
