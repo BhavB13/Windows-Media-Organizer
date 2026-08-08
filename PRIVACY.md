@@ -48,13 +48,15 @@ into the original path.
 You can review a crash report in full before deciding whether to send it. The
 local crash dialog shows the sanitized report and offers a copy action.
 
-### Known limitation
+Sanitization covers rooted paths (`C:\Users\...`, UNC paths, and paths beginning
+with a separator) and also bare file names appearing in free-form error text, so
+`Could not read IMG_1234.jpg` becomes
+`Could not read <redacted:filename:f-caf88bc25fd8>`.
 
-Sanitization currently recognises rooted paths — `C:\Users\...`, UNC paths, and
-paths beginning with a separator. A bare file name appearing inside free-form
-error text may not be redacted. This is tracked as a defect and production
-diagnostics should stay disabled until it is fixed. If you have opted in and are
-concerned, turn diagnostics off in Settings.
+Redaction is deliberately conservative in one direction and careful in the
+other: an ordinary uppercase word such as `PERMISSION` is left readable, because
+over-redacting error text makes reports useless without making them safer, while
+anything shaped like a device serial, hash, path, or file name is replaced.
 
 ## Where your data is stored
 

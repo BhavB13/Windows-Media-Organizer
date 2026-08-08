@@ -58,6 +58,16 @@ where a user could have lost a file.
 - Version comparison dropped non-numeric components, making `0.9.0rc1` compare
   equal to `0.9`.
 
+### Fixed — privacy
+
+- Crash-report sanitization missed bare file names in free-form error text, so
+  `Could not read IMG_1234.jpg` passed through unredacted despite the stated
+  guarantee that file names never leave the machine. File names are now replaced
+  with local correlation identifiers.
+- The same sanitizer over-redacted ordinary uppercase words such as
+  `PERMISSION`, which made reports harder to read without making them safer.
+  Device-serial matching now requires a digit.
+
 ### Added
 
 - An off-by-default advanced import option, "Re-read every resumed file to

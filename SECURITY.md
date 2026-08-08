@@ -49,16 +49,17 @@ signing key and the Authenticode certificate live in protected CI secrets.
 
 ## Current security status
 
-This project has not yet had a public release. Two items are release gates and
-are documented here rather than hidden:
+This project has not yet had a public release. One item is a release gate and is
+documented here rather than hidden:
 
 1. **The committed update key is a 1024-bit development key**
    (`packaging/update_public_key.json`, `key_id: dtm-dev-release-key-2026`).
    RSA-1024 is below current standards for a software-update trust root. It must
    be replaced with a production key before any public release.
-2. **Crash-report sanitization does not yet redact bare file names** in
-   free-form error text. Production diagnostics should remain disabled until
-   that is fixed. See [PRIVACY.md](PRIVACY.md).
+
+Separately, no released build has yet been verified end to end: the packaged
+installer, its signature, and the update flow have not been exercised on a clean
+Windows machine.
 
 ## Supported versions
 
