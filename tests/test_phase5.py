@@ -341,6 +341,33 @@ class Phase5OverviewActivitySettingsTests(unittest.TestCase):
             self.assertEqual(_directory_size(root), 600)
             self.assertEqual(_directory_size(root / "does-not-exist"), 0)
 
+    def test_packaged_scheduled_tasks_do_not_launch_the_application(self):
+        # A packaged build has no console scripts, and PyInstaller's bootloader
+        # ignores "-m module", so the previous fallback made every scheduled
+        # trigger open the GUI instead of running the task.
+        import duplicate_transfer_manager.scheduled_tasks as scheduled_tasks
+        from duplicate_transfer_manager.scheduled_tasks import RUN_TASK_FLAG, build_task_command
+        from duplicate_transfer_manager.sorting.scheduler import SortScheduleService
+        from duplicate_transfer_manager.sorting.models import MonitoredFolder, SortingProfile
+
+        with patch.object(scheduled_tasks, "is_frozen", return_value=True):
+            for kind in ("scan", "sort", "organizer"):
+                command = build_task_command(kind, ["--source", "D:/Pictures"])
+                self.assertEqual(command[1], RUN_TASK_FLAG)
+                self.assertEqual(command[2], kind)
+                self.assertNotIn("-m", command)
+
+            profile = SortingProfile("Bulk")
+            monitor = MonitoredFolder(path="D:/Watch")
+            rendered = SortScheduleService().command(profile, monitor)
+            self.assertIn(RUN_TASK_FLAG, rendered)
+
+            rendered_scan = ScheduledScanService().command("D:/Pictures")
+            self.assertIn(RUN_TASK_FLAG, rendered_scan)
+
+        # An unknown kind is refused rather than silently opening a window.
+        self.assertEqual(scheduled_tasks.run_scheduled_task("nonsense", []), 2)
+
     def test_android_connection_help_names_the_real_causes(self):
         from duplicate_transfer_manager.services import DeviceService
 

@@ -22,6 +22,7 @@ from urllib.request import urlopen
 from packaging.version import InvalidVersion, Version
 
 from adb_bridge import ADBBridge, resolve_adb_executable
+from ..scheduled_tasks import build_task_command
 
 from ..core import (
     AppSettings,
@@ -120,12 +121,10 @@ class ScheduledScanService:
     organizer_task_name = "DuplicateTransferManager-OrganizationPreview"
 
     def command(self, source: str, *, data_root: str = "") -> str:
-        executable = shutil.which("dtm-scheduled-scan")
-        parts = [executable] if executable else [sys.executable, "-m", "duplicate_transfer_manager.scheduled_scan"]
-        parts.extend(["--source", source])
+        arguments = ["--source", source]
         if data_root:
-            parts.extend(["--data-root", data_root])
-        return subprocess.list2cmdline(parts)
+            arguments.extend(["--data-root", data_root])
+        return subprocess.list2cmdline(build_task_command("scan", arguments))
 
     def configure(self, source: str, frequency: str, *, data_root: str = "") -> None:
         normalized = frequency.lower().strip()
@@ -173,13 +172,11 @@ class ScheduledScanService:
             raise ServiceError(ErrorCode.VALIDATION, "Choose available source and destination folders for organizer previews.")
         if mode not in {"flatten", "type", "date", "ml"}:
             raise ServiceError(ErrorCode.VALIDATION, "Choose a supported organization mode.")
-        executable = shutil.which("dtm-scheduled-organizer")
-        parts = [executable] if executable else [sys.executable, "-m", "duplicate_transfer_manager.scheduled_organizer"]
-        parts.extend(["--source", str(Path(source).expanduser()), "--destination", str(Path(destination).expanduser()), "--mode", mode])
+        arguments = ["--source", str(Path(source).expanduser()), "--destination", str(Path(destination).expanduser()), "--mode", mode]
         if data_root:
-            parts.extend(["--data-root", data_root])
+            arguments.extend(["--data-root", data_root])
         completed = subprocess.run(
-            ["schtasks", "/Create", "/F", "/TN", self.organizer_task_name, "/SC", normalized.upper(), "/TR", subprocess.list2cmdline(parts)],
+            ["schtasks", "/Create", "/F", "/TN", self.organizer_task_name, "/SC", normalized.upper(), "/TR", subprocess.list2cmdline(build_task_command("organizer", arguments))],
             capture_output=True, text=True, check=False,
         )
         if completed.returncode != 0:

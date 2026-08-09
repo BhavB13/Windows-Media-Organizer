@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from ..core import ErrorCode, ServiceError
+from ..scheduled_tasks import build_task_command
 from .models import MonitoredFolder, SortingProfile
 
 
@@ -19,12 +20,10 @@ class SortScheduleService:
         return f"{self.task_prefix}{safe}"[:220]
 
     def command(self, profile: SortingProfile, monitor: MonitoredFolder, *, data_root: str = "") -> str:
-        executable = shutil.which("dtm-scheduled-sort")
-        parts = [executable] if executable else [sys.executable, "-m", "duplicate_transfer_manager.scheduled_sort"]
-        parts.extend(["--profile-id", profile.id, "--monitor-id", monitor.id])
+        arguments = ["--profile-id", profile.id, "--monitor-id", monitor.id]
         if data_root:
-            parts.extend(["--data-root", data_root])
-        return subprocess.list2cmdline(parts)
+            arguments.extend(["--data-root", data_root])
+        return subprocess.list2cmdline(build_task_command("sort", arguments))
 
     def configure(self, profile: SortingProfile, monitor: MonitoredFolder, *, data_root: str = "") -> None:
         if os.name != "nt":
