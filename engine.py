@@ -393,6 +393,28 @@ def build_transfer_hash_settings(settings):
         hash_settings.hash_mode = "full"
     return hash_settings
 
+
+def confirm_duplicate_by_content(source_path, dest_path, settings, stop_event, hash_cache=None, logger=None):
+    """Prove two files are identical before treating the source as a duplicate.
+
+    A sampled digest covers only the size plus the first and last megabyte, so
+    two different large files can share one. Skipping an import on that basis
+    silently leaves a file behind, which is the one outcome an import must
+    never produce. Duplicate grouping already confirms its candidates the same
+    way; this is the transfer path's equivalent.
+    """
+
+    if not dest_path or not os.path.exists(dest_path):
+        return False
+    full_settings = copy(settings)
+    full_settings.hash_algo = "sha256"
+    full_settings.hash_mode = "full"
+    source_digest = compute_hash(source_path, full_settings, stop_event, hash_cache, False, logger)
+    if not source_digest:
+        return False
+    dest_digest = compute_hash(dest_path, full_settings, stop_event, hash_cache, False, logger)
+    return bool(dest_digest) and source_digest == dest_digest
+
 def get_drive_cache_path(root, settings):
     return getattr(settings, "drive_cache_path", "").strip() or default_cache_path(root)
 
@@ -638,6 +660,10 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         progress_callback(0, 0, f"Scanning Compare: {len(dest_files)} files found")
     
     dest_hashes = set()
+    # One representative destination per digest. A sampled "fast" digest is
+    # only a shortlist, so skipping a source as an existing duplicate has to be
+    # confirmed against a real file rather than against the digest alone.
+    dest_hash_paths = {}
     total_dest = len(dest_files)
     cache_count_matches = False
     if drive_cache:
@@ -650,11 +676,15 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         logger.log(f"Drive cache compare count: {cached_count} cached file(s), {total_dest} file(s) currently present.")
 
     if drive_cache and cache_count_matches:
-        dest_hashes = drive_cache.hashes_under_root(
+        cached_entries = drive_cache.entries_under_root(
             compare_root,
             algo=compare_scan_settings.hash_algo,
             mode=compare_scan_settings.hash_mode,
         )
+        dest_hashes = {entry["hash"] for entry in cached_entries if entry.get("hash")}
+        for entry in cached_entries:
+            if entry.get("hash") and entry.get("path"):
+                dest_hash_paths.setdefault(entry["hash"], entry["path"])
         logger.log(f"Drive cache count matches compare folder. Using {len(dest_hashes)} cached hash(es); destination hashing skipped.")
         if progress_callback:
             progress_callback(1, 1, f"Using drive cache: {total_dest} compare files")
@@ -695,7 +725,9 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                     compare_scan_settings.hash_mode,
                     root=compare_root,
                 )
-            if h: dest_hashes.add(h)
+            if h:
+                dest_hashes.add(h)
+                dest_hash_paths.setdefault(h, f.path)
             if progress_callback: progress_callback(i + 1, total_dest, f"Building destination cache... {i + 1}/{total_dest}")
         if drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
             drive_cache.mark_missing_under_root(compare_root, [f.path for f in dest_files])
@@ -877,7 +909,18 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                 journal.fail(f.path, "Comparison hash could not be read")
             continue
         
-        if h in dest_hashes:
+        is_duplicate = h in dest_hashes
+        if is_duplicate and hash_settings.hash_mode == "fast" and not f.is_adb:
+            # A sampled match is a shortlist entry, not proof. Confirm against
+            # the real destination file before skipping the import.
+            if not confirm_duplicate_by_content(
+                f.path, dest_hash_paths.get(h, ""), hash_settings, stop_event, hash_cache, logger
+            ):
+                is_duplicate = False
+                logger.log(
+                    f"Sampled hash matched but full contents differ; importing anyway: {f.path}"
+                )
+        if is_duplicate:
             if staged_path:
                 try:
                     os.remove(staged_path)
@@ -1031,6 +1074,9 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                         logger.log(f"WARNING: Failed to update drive cache for copied file: {target_path} ({exc})")
             if h:
                 dest_hashes.add(h)
+                # Newly copied files join the comparison set, so a later source
+                # matching one of them can be confirmed against a real path too.
+                dest_hash_paths.setdefault(h, target_path)
             transferred += 1
             bytes_transferred += f.size
             source_folder = os.path.dirname(f.path)

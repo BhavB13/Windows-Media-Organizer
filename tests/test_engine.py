@@ -529,6 +529,110 @@ class EngineTests(unittest.TestCase):
             )
             self.assertEqual(cache.active_file_count_under_root("/sdcard/DCIM", "sha256", "full"), 1)
 
+    def test_unreadable_attributes_do_not_mark_a_file_hidden(self):
+        # GetFileAttributesW returns the sentinel 0xFFFFFFFF on any failure,
+        # and without an explicit restype that arrived as -1, whose bitwise AND
+        # with HIDDEN|SYSTEM is truthy. Every long, locked, or permission-denied
+        # path was therefore classified as hidden and dropped from local scans
+        # with no error recorded, so the scan still called itself complete.
+        from pathlib import Path
+        from utils import is_hidden_or_system
+
+        self.assertFalse(is_hidden_or_system(r"C:/definitely/does/not/exist/anywhere.jpg"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            deep = Path(temp_dir)
+            for index in range(30):
+                deep = deep / f"a_very_long_folder_name_{index:02d}_padding_padding"
+            self.assertGreater(len(str(deep)), 260)
+            self.assertFalse(is_hidden_or_system(str(deep)))
+
+            if os.name == "nt":
+                import ctypes
+
+                visible = Path(temp_dir) / "visible.txt"
+                visible.write_text("x", encoding="utf-8")
+                self.assertFalse(is_hidden_or_system(str(visible)))
+                # A genuinely hidden file must still be detected.
+                ctypes.windll.kernel32.SetFileAttributesW(str(visible), 0x2)
+                try:
+                    self.assertTrue(is_hidden_or_system(str(visible)))
+                finally:
+                    ctypes.windll.kernel32.SetFileAttributesW(str(visible), 0x80)
+
+    def test_fast_import_does_not_skip_a_file_that_only_matches_a_sampled_hash(self):
+        # Fast hashing covers size + first and last 1 MiB. Two different large
+        # files can share that digest, and skipping the import on that basis
+        # leaves a file behind while reporting a clean run.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source_root = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source_root, library, output):
+                os.makedirs(path)
+
+            head = b"H" * (1024 * 1024)
+            tail = b"T" * (1024 * 1024)
+            middle = 1024 * 1024
+            existing = os.path.join(library, "existing.bin")
+            incoming = os.path.join(source_root, "incoming.bin")
+            with open(existing, "wb") as handle:
+                handle.write(head + (b"A" * middle) + tail)
+            with open(incoming, "wb") as handle:
+                handle.write(head + (b"B" * middle) + tail)
+
+            settings = TransferSettings(
+                source_root=source_root, dest_root=library, output_root=output,
+                criteria="hash", hash_algo="sha256", hash_mode="fast", only_media=False,
+                extensions=[], min_size_kb=0, exclude_dirs=[], skip_hidden_system=False,
+                dry_run=False, preserve_structure=True, max_hash_workers=1,
+                transfer_mode="copy", duplicate_policy="skip", use_dest_cache=False,
+                source_is_adb=False, update_drive_cache=False, use_adb_cache=False,
+            )
+
+            # Same size, same first and last megabyte: the sampled digests match.
+            fast = engine_module.compute_hash(existing, settings, threading.Event())
+            self.assertEqual(fast, engine_module.compute_hash(incoming, settings, threading.Event()))
+
+            result = engine_module.execute_smart_transfer(
+                settings, threading.Event(), HashCache(os.path.join(root, "cache.json")), DummyLogger()
+            )
+
+            self.assertEqual(result["transferred"], 1, "a unique file must not be skipped as a duplicate")
+            self.assertEqual(result["duplicates"], 0)
+            self.assertTrue(os.path.exists(os.path.join(output, "incoming.bin")))
+
+    def test_fast_import_still_skips_a_genuine_duplicate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source_root = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source_root, library, output):
+                os.makedirs(path)
+
+            payload = (b"H" * (1024 * 1024)) + (b"A" * (1024 * 1024)) + (b"T" * (1024 * 1024))
+            with open(os.path.join(library, "existing.bin"), "wb") as handle:
+                handle.write(payload)
+            with open(os.path.join(source_root, "copy.bin"), "wb") as handle:
+                handle.write(payload)
+
+            settings = TransferSettings(
+                source_root=source_root, dest_root=library, output_root=output,
+                criteria="hash", hash_algo="sha256", hash_mode="fast", only_media=False,
+                extensions=[], min_size_kb=0, exclude_dirs=[], skip_hidden_system=False,
+                dry_run=False, preserve_structure=True, max_hash_workers=1,
+                transfer_mode="copy", duplicate_policy="skip", use_dest_cache=False,
+                source_is_adb=False, update_drive_cache=False, use_adb_cache=False,
+            )
+            result = engine_module.execute_smart_transfer(
+                settings, threading.Event(), HashCache(os.path.join(root, "cache.json")), DummyLogger()
+            )
+
+            self.assertEqual(result["transferred"], 0)
+            self.assertEqual(result["duplicates"], 1)
+
     def test_directory_listing_shows_symlinked_folders_and_reports_failures(self):
         listing = b"Camera/\nScreenshots/\nlinked_album/\nnote.txt\n"
         with mock.patch.object(

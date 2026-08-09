@@ -115,12 +115,36 @@ def get_local_storage_info(path):
         return usage.used, usage.total, (usage.used / usage.total)
     except: return 0, 1, 0
 
+_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+_FILE_ATTRIBUTE_HIDDEN = 0x2
+_FILE_ATTRIBUTE_SYSTEM = 0x4
+
+if os.name == 'nt':
+    # Without an explicit restype the failure sentinel arrives as -1, and
+    # -1 & (HIDDEN | SYSTEM) is truthy, so every unreadable path was reported
+    # as hidden. Scans then dropped it with no error recorded, which is how a
+    # long path or a permission failure made files disappear from an import
+    # while the scan still called itself complete.
+    ctypes.windll.kernel32.GetFileAttributesW.restype = ctypes.c_uint32
+    ctypes.windll.kernel32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+
+
 def is_hidden_or_system(path):
+    """Report whether a path is hidden or system.
+
+    Fails open: if the attributes cannot be read, the answer is False so the
+    file stays in the scan. An unreadable file that is included surfaces later
+    as a recorded error, whereas one excluded here vanishes silently.
+    """
+
     if os.name == 'nt':
         try:
-            attrs = ctypes.windll.kernel32.GetFileAttributesW(path)
-            return bool(attrs & (0x2 | 0x4))
-        except: return False
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        except (OSError, ValueError, ctypes.ArgumentError):
+            return False
+        if attrs == _INVALID_FILE_ATTRIBUTES:
+            return False
+        return bool(attrs & (_FILE_ATTRIBUTE_HIDDEN | _FILE_ATTRIBUTE_SYSTEM))
     return os.path.basename(path).startswith('.')
 
 def normalize_extensions(extensions):
