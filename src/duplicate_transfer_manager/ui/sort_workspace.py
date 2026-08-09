@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt, Signal, QTimer, QUrl
+from PySide6.QtCore import QPoint, Qt, Signal, QThreadPool, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -35,7 +35,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..controllers import SortController
-from ..core import AppSettings
+from ..controllers.base import OperationWorker
+from ..core import AppSettings, CancellationToken, OperationResult, OperationState
 from ..runtime_paths import RuntimePaths, get_runtime_paths
 from ..services import OperationRecordService, SettingsService
 from ..sorting import (
@@ -457,6 +458,7 @@ class SortWorkspace(QScrollArea):
         self._refresh_profiles()
         self._refresh_history()
         self._show_section(self.SOURCE_STAGE)
+        self._monitor_poll_running = False
         self.change_timer = QTimer(self)
         self.change_timer.setInterval(30_000)
         self.change_timer.timeout.connect(self._poll_change_monitors)
@@ -1461,21 +1463,58 @@ class SortWorkspace(QScrollArea):
             self._show_error(exc)
 
     def _poll_change_monitors(self) -> None:
+        """Check monitored folders for changes without blocking the window.
+
+        Each poll walks every monitored folder recursively, resolves and stats
+        every file, extracts metadata for changed ones, and rewrites a snapshot.
+        That ran on the Qt main thread every thirty seconds for as long as this
+        page was open, so a monitored photo library froze the interface on a
+        timer.
+        """
+
+        if self._monitor_poll_running:
+            return
         profile = self._active_profile()
         if not profile:
             return
-        added: list[str] = []
-        for monitor in profile.monitored_folders:
-            if not monitor.enabled or monitor.scan_mode != "filesystem_change":
-                continue
-            try:
-                added.extend(item.path for item in self.monitor.poll(monitor))
-            except Exception:
-                continue
-        if added:
-            self._add_sources(added)
-            self.banner.set_message(f"Queued {len(added)} new or changed monitored file(s) for review.", "info")
-            self.banner.show()
+        monitors = [
+            monitor for monitor in profile.monitored_folders
+            if monitor.enabled and monitor.scan_mode == "filesystem_change"
+        ]
+        if not monitors:
+            return
+        if self.controller.busy:
+            # Do not compete with a live sort for the same folders.
+            return
+
+        service = self.monitor
+
+        def poll_all(_cancellation, _reporter):
+            found: list[str] = []
+            for monitor in monitors:
+                try:
+                    found.extend(item.path for item in service.poll(monitor))
+                except Exception:
+                    continue
+            return OperationResult(status=OperationState.COMPLETED, data={"monitor_paths": found})
+
+        self._monitor_poll_running = True
+        worker = OperationWorker(poll_all, CancellationToken())
+        worker.signals.result.connect(self._on_monitor_poll_result)
+        worker.signals.error.connect(lambda _error: None)
+        worker.signals.finished.connect(self._on_monitor_poll_finished)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_monitor_poll_finished(self) -> None:
+        self._monitor_poll_running = False
+
+    def _on_monitor_poll_result(self, result) -> None:
+        added = list((result.data or {}).get("monitor_paths", []))
+        if not added:
+            return
+        self._add_sources(added)
+        self.banner.set_message(f"Queued {len(added)} new or changed monitored file(s) for review.", "info")
+        self.banner.show()
 
     def _render_monitors(self, profile: SortingProfile) -> None:
         self.monitor_table.setRowCount(len(profile.monitored_folders))
