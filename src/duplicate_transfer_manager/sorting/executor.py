@@ -123,12 +123,16 @@ class SortExecutor:
         completed = skipped = failed = verified = bytes_processed = 0
         failures: list[str] = []
         started = time.monotonic()
+        planned_total = sum(value.metadata.size for value in selected)
+        planned_remaining = planned_total
         for index, item in enumerate(selected, 1):
             source = str(Path(item.metadata.path).resolve())
             try:
                 if control.checkpoint(source):
                     skipped += 1
-                    records.append(self._record(item, "skipped", warning="Skipped during processing."))
+                    entry = self._record(item, "skipped", warning="Skipped during processing.")
+                    records.append(entry)
+                    self._append_record(journal_path, entry)
                     continue
             except OperationCancelled:
                 journal["status"] = "cancelled"
@@ -138,10 +142,10 @@ class SortExecutor:
             reporter.progress_callback(index - 1, len(selected), f"Sorting {Path(source).name}", phase=OperationPhase.TRANSFER)
             if plan.dry_run or item.action == SortAction.IGNORE:
                 status = "previewed" if plan.dry_run else "ignored"
-                records.append(self._record(item, status))
+                entry = self._record(item, status)
+                records.append(entry)
+                self._append_record(journal_path, entry)
                 skipped += int(item.action == SortAction.IGNORE)
-                journal["updated_at"] = _now()
-                self._write_journal(journal_path, journal)
                 continue
             error = ""
             record: dict = {}
@@ -174,15 +178,17 @@ class SortExecutor:
                     completed += 1
                     bytes_processed += item.metadata.size
                     verified += int(record.get("verified", False))
-            journal["updated_at"] = _now()
-            self._write_journal(journal_path, journal)
+            self._append_record(journal_path, records[-1])
             elapsed = max(0.001, time.monotonic() - started)
             rate = bytes_processed / elapsed
-            remaining = sum(value.metadata.size for value in selected[index:])
+            # Both totals used to be re-summed over the whole plan on every
+            # item, which is O(n^2) arithmetic on top of the O(n^2) writes.
+            planned_remaining -= item.metadata.size
+            remaining = max(0, planned_remaining)
             reporter.emit(
                 f"Sorted {index} of {len(selected)} files", phase=OperationPhase.VERIFICATION,
                 current=index, total=len(selected), bytes_processed=bytes_processed,
-                total_bytes=sum(value.metadata.size for value in selected),
+                total_bytes=planned_total,
                 details={"rate": rate, "eta_seconds": remaining / rate if rate else None},
             )
         status = "completed_with_errors" if failed else "completed"
@@ -302,9 +308,13 @@ class SortExecutor:
             raise ServiceError(ErrorCode.VALIDATION, "Choose a valid sorting run.")
         path = self.paths.sorting / "runs" / run_id / "journal.json"
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            journal = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ServiceError(ErrorCode.NOT_FOUND, "The sorting run journal is unavailable.", technical_detail=str(exc)) from exc
+        # A run killed part way has a consolidated journal from before the
+        # first item. The append log holds what actually happened, so undo and
+        # resume see the real history rather than an empty record list.
+        return self._merge_appended_records(path, journal)
 
     def export_run(self, run_id: str, destination: str | os.PathLike[str]) -> Path:
         journal = self.load_run(run_id)
@@ -552,6 +562,61 @@ class SortExecutor:
             warnings=tuple(values.get("warnings", [])), requires_review=bool(values.get("requires_review", True)),
             approved=bool(values.get("approved", False)), selected=bool(values.get("selected", True)),
         )
+
+    @staticmethod
+    def _records_path(journal_path: Path) -> Path:
+        return journal_path.with_name("records.jsonl")
+
+    @classmethod
+    def _append_record(cls, journal_path: Path, record: dict) -> None:
+        """Append one record instead of rewriting the whole journal.
+
+        The journal was serialized in full after every item, including
+        planned_items, which holds a full metadata blob per selected file and
+        never shrinks. That made the run cost O(n^2) bytes: a 20,000 file sort
+        measured at roughly 360 GB written for a 24 MB final journal. Appending
+        one line per item is O(1) and is still a durable crash record, which
+        matters more than the consolidated file during the run.
+        """
+
+        try:
+            path = cls._records_path(journal_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record) + "\n")
+        except OSError:
+            # The consolidated journal written at the end remains the fallback.
+            pass
+
+    @classmethod
+    def _merge_appended_records(cls, journal_path: Path, journal: dict) -> dict:
+        """Fill in records from the append log when the run did not finish.
+
+        A run killed part way leaves a journal whose records list is whatever
+        was last consolidated. The append log is the authoritative per-item
+        history, so recovery reads it back.
+        """
+
+        path = cls._records_path(journal_path)
+        if not path.exists():
+            return journal
+        appended: list[dict] = []
+        try:
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        appended.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        # A torn final line from a hard kill; earlier ones stand.
+                        continue
+        except OSError:
+            return journal
+        if len(appended) > len(journal.get("records", [])):
+            journal["records"] = appended
+        return journal
 
     @staticmethod
     def _write_journal(path: Path, payload: dict) -> None:

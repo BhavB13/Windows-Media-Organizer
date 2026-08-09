@@ -432,6 +432,70 @@ class SortExecutorTests(unittest.TestCase):
         )
         return paths, source, destination / "file.txt", plan
 
+    def _bulk_plan(self, root: Path, count: int):
+        source_dir = root / "source"
+        destination = root / "destination"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        destination.mkdir(parents=True, exist_ok=True)
+        metadata = []
+        for index in range(count):
+            item = source_dir / f"photo_{index:04d}.jpg"
+            item.write_bytes(b"x" * 128)
+            metadata.append(MetadataExtractor().extract(item))
+        association = Association("Everything", (), SortAction.MOVE, str(destination))
+        profile = SortingProfile("Bulk", (association,), ml_enabled=False)
+        paths = get_runtime_paths(root / "data")
+        plan = SortPlanner(paths).build(profile, metadata, sources=[str(source_dir)], dry_run=False)
+        return paths, plan
+
+    def test_journal_is_not_rewritten_once_per_item(self):
+        # The whole journal, including a metadata blob for every planned item,
+        # used to be re-serialized after each file. That is O(n^2) bytes: a
+        # 600 file run wrote 347 MB and took 38 s, and a 20,000 file library
+        # would have written hundreds of gigabytes.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            count = 40
+            paths, plan = self._bulk_plan(Path(temp_dir), count)
+            executor = SortExecutor(paths)
+            approved = [item.metadata.path for item in plan.items]
+
+            serialized = {"bytes": 0, "calls": 0}
+            original = SortExecutor._write_journal
+
+            def counting(path, payload):
+                serialized["bytes"] += len(json.dumps(payload))
+                serialized["calls"] += 1
+                return original(path, payload)
+
+            with patch.object(SortExecutor, "_write_journal", staticmethod(counting)):
+                result = executor.execute(plan, approved_sources=approved, confirmed=True)
+
+            self.assertEqual(result.completed, count)
+            # Full writes happen at run start and run end, not per item.
+            self.assertLess(serialized["calls"], 5)
+            run_dir = Path(result.journal_path).parent
+            self.assertTrue((run_dir / "records.jsonl").exists())
+            # Every record still survives into the consolidated journal.
+            self.assertEqual(len(executor.load_run(result.run_id)["records"]), count)
+
+    def test_interrupted_run_recovers_records_from_the_append_log(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths, plan = self._bulk_plan(Path(temp_dir), 3)
+            executor = SortExecutor(paths)
+            approved = [item.metadata.path for item in plan.items]
+            result = executor.execute(plan, approved_sources=approved, confirmed=True)
+
+            # Simulate a kill before the final consolidation: the journal still
+            # holds the empty record list written at run start.
+            journal_path = Path(result.journal_path)
+            stale = json.loads(journal_path.read_text(encoding="utf-8"))
+            stale["records"] = []
+            stale["status"] = "running"
+            journal_path.write_text(json.dumps(stale), encoding="utf-8")
+
+            recovered = executor.load_run(result.run_id)
+            self.assertEqual(len(recovered["records"]), 3)
+
     def test_dry_run_writes_preview_journal_without_changing_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths, source, destination, plan = self._plan(Path(temp_dir), SortAction.MOVE, dry_run=True)
