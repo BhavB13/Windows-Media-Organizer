@@ -362,9 +362,34 @@ class SortExecutor:
         if destination.exists():
             if item.conflict != "overwrite":
                 raise OSError("Destination changed after preview; review the plan again.")
-            backup_path = run_root / "replaced" / f"{len(list((run_root / 'replaced').glob('*'))) if (run_root / 'replaced').exists() else 0:06d}_{destination.name}"
+            # Named from the source path rather than a directory count, which
+            # re-listed the whole replaced/ folder for every overwrite.
+            token = hashlib.sha256(str(destination).encode("utf-8", "replace")).hexdigest()[:12]
+            backup_path = run_root / "replaced" / f"{token}_{destination.name}"
             backup_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(destination), str(backup_path))
+            journal_path = run_root / "journal.json"
+            # Record the intent before touching the incumbent. run_root is on
+            # the app data drive while destinations are commonly on another
+            # volume, so displacing it is a copy plus a delete. A crash in
+            # between previously left the incumbent gone, an orphan in
+            # replaced/ that nothing referenced, and prune_runs eventually
+            # deleting that orphan too.
+            self._append_record(
+                journal_path,
+                {
+                    "status": "replacing",
+                    "source": item.metadata.path,
+                    "destination": str(destination),
+                    "replaced_backup": str(backup_path),
+                    "created_at": _now(),
+                },
+            )
+            # Verify the copy before removing the original, matching what undo
+            # already does when it displaces a file.
+            incumbent_fingerprint = self._fingerprint(destination)
+            shutil.copy2(str(destination), str(backup_path))
+            self._verify_fingerprint(backup_path, incumbent_fingerprint)
+            destination.unlink()
             backup = str(backup_path)
         try:
             if item.action == SortAction.COPY:

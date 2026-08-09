@@ -448,6 +448,73 @@ class SortExecutorTests(unittest.TestCase):
         plan = SortPlanner(paths).build(profile, metadata, sources=[str(source_dir)], dry_run=False)
         return paths, plan
 
+    def test_overwrite_verifies_the_backup_before_deleting_the_incumbent(self):
+        # The backup lives on the app data drive while destinations are often
+        # another volume, so displacing the incumbent is a copy plus a delete.
+        # It must be verified first, and the journal must name it beforehand,
+        # or a crash loses a file nothing points at.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths, source, destination, plan = self._plan(
+                root, SortAction.MOVE, conflict=ConflictPolicy.OVERWRITE
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"incumbent contents")
+            item = replace(plan.items[0], conflict="overwrite", selected=True)
+            plan = replace(plan, items=(item,))
+
+            executor = SortExecutor(paths)
+            result = executor.execute(
+                plan, approved_sources=[item.metadata.path], confirmed=True
+            )
+            self.assertEqual(result.completed, 1)
+
+            run_dir = Path(result.journal_path).parent
+            backups = list((run_dir / "replaced").glob("*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), b"incumbent contents")
+
+            # The intent was recorded before the incumbent was displaced.
+            lines = [
+                json.loads(line)
+                for line in (run_dir / "records.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            intents = [entry for entry in lines if entry.get("status") == "replacing"]
+            self.assertEqual(len(intents), 1)
+            self.assertEqual(intents[0]["replaced_backup"], str(backups[0]))
+            self.assertIs(lines.index(intents[0]), 0)
+
+    def test_overwrite_backup_is_verified_before_the_incumbent_is_removed(self):
+        # The old path used a bare shutil.move, which across volumes copies and
+        # then deletes with nothing checking the copy. The backup must be
+        # verified while the original still exists.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths, source, destination, plan = self._plan(
+                root, SortAction.MOVE, conflict=ConflictPolicy.OVERWRITE
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(b"incumbent contents")
+            item = replace(plan.items[0], conflict="overwrite", selected=True)
+            plan = replace(plan, items=(item,))
+
+            verified_while_original_present: list[bool] = []
+            original_verify = SortExecutor._verify_fingerprint
+
+            def recording(self, path, expected):
+                if "replaced" in str(path):
+                    verified_while_original_present.append(destination.exists())
+                return original_verify(self, path, expected)
+
+            with patch.object(SortExecutor, "_verify_fingerprint", recording):
+                result = SortExecutor(paths).execute(
+                    plan, approved_sources=[item.metadata.path], confirmed=True
+                )
+
+            self.assertEqual(result.completed, 1)
+            self.assertEqual(verified_while_original_present, [True])
+
     def test_journal_is_not_rewritten_once_per_item(self):
         # The whole journal, including a metadata blob for every planned item,
         # used to be re-serialized after each file. That is O(n^2) bytes: a
