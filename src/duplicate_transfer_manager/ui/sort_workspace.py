@@ -1218,6 +1218,12 @@ class SortWorkspace(QScrollArea):
         panel.update_progress(value, event.message, event.current_item or event.message, f"{value}% • {format_eta(event.eta_seconds)}")
 
     def _on_completed(self, result) -> None:
+        # Undo and retry share this controller, so dispatch on the tag they set
+        # rather than letting their results fall through to the execute path.
+        operation = (result.data or {}).get("sort_operation", "")
+        if operation in {"undo", "retry"}:
+            self._on_history_operation_completed(operation, result)
+            return
         self.preview_progress.hide()
         self.preview_button.setEnabled(True)
         self.run_button.setEnabled(True)
@@ -1504,17 +1510,56 @@ class SortWorkspace(QScrollArea):
         lines = [f"{record.get('status', '')}: {Path(record.get('source', '')).name} → {record.get('destination') or record.get('action', '')}" for record in records[:12]]
         self.history_detail.setText("\n".join(lines) or "This run contains no processed records.")
 
+    def _on_history_operation_completed(self, operation: str, result) -> None:
+        """Record and report an undo or retry that finished on a worker."""
+        sort_result = (result.data or {}).get("sort_result")
+        failed = int(result.counts.get("errors", 0)) if result.counts else 0
+        if operation == "undo":
+            restored = int(result.counts.get("restored", 0)) if result.counts else 0
+            skipped = int(result.counts.get("skipped", 0)) if result.counts else 0
+            self.operations.record(
+                "sorting_undo",
+                "warning" if failed else "completed",
+                title="Undo Sort Files run",
+                counts={"restored": restored, "skipped": skipped, "errors": failed},
+                summary={"journal_path": result.report_path or ""},
+                failures=list(result.warnings or ()),
+            )
+            message = f"Undo finished: {restored} restored, {skipped} skipped, {failed} failed."
+        else:
+            completed = int(result.counts.get("completed", 0)) if result.counts else 0
+            self.operations.record(
+                "sorting_retry",
+                "warning" if failed else "completed",
+                title="Retry Sort Files run",
+                counts={
+                    "completed": completed,
+                    "skipped": int(result.counts.get("skipped", 0)) if result.counts else 0,
+                    "errors": failed,
+                },
+                summary={
+                    "journal_path": result.report_path or "",
+                    "run_id": getattr(sort_result, "run_id", ""),
+                },
+                failures=list(result.warnings or ()),
+                resume_available=bool((result.resume_information or {}).get("undo_available")),
+            )
+            message = f"Retry finished: {completed} completed, {failed} failed."
+        self.banner.set_message(message, "warning" if failed else "success")
+        self.banner.show()
+        self._refresh_history()
+
     def _undo_selected(self) -> None:
         run = self._selected_run()
         if not run:
             return
         if QMessageBox.question(self, "Undo sorting run", "Restore recoverable operations from this run? Recycle Bin actions cannot be undone here.") != QMessageBox.StandardButton.Yes:
             return
-        result = self.executor.undo(str(run.get("run_id", "")))
-        self.operations.record("sorting_undo", "warning" if result.failed else "completed", title="Undo Sort Files run", counts={"restored": result.completed, "skipped": result.skipped, "errors": result.failed}, summary={"journal_path": result.journal_path}, failures=list(result.failures))
-        self.banner.set_message(f"Undo finished: {result.completed} restored, {result.skipped} skipped, {result.failed} failed.", "success" if not result.failed else "warning")
-        self.banner.show()
-        self._refresh_history()
+        # Undo re-hashes and moves every restored file, so it goes through the
+        # worker boundary rather than freezing the window until it finishes.
+        if not self.controller.undo(str(run.get("run_id", ""))):
+            self.banner.set_message("Another sorting operation is still running.", "warning")
+            self.banner.show()
 
     def _retry_selected(self) -> None:
         run = self._selected_run()
@@ -1523,15 +1568,16 @@ class SortWorkspace(QScrollArea):
         run_id = str(run.get("run_id", ""))
         if QMessageBox.question(self, "Retry sorting run", "Retry failed or interrupted files after rechecking the reviewed source metadata?") != QMessageBox.StandardButton.Yes:
             return
-        try:
-            has_failures = any(record.get("status") == "failed" for record in run.get("records", []))
-            result = self.executor.retry_failed(run_id, confirmed=True, retry_attempts=self.retry_count.value()) if has_failures else self.executor.resume_run(run_id, confirmed=True, retry_attempts=self.retry_count.value())
-            self.operations.record("sorting_retry", "warning" if result.failed else "completed", title="Retry Sort Files run", counts={"completed": result.completed, "skipped": result.skipped, "errors": result.failed}, summary={"journal_path": result.journal_path, "run_id": result.run_id}, failures=list(result.failures), resume_available=result.undo_available)
-            self.banner.set_message(f"Retry finished: {result.completed} completed, {result.failed} failed.", "success" if not result.failed else "warning")
+        has_failures = any(record.get("status") == "failed" for record in run.get("records", []))
+        # Retry runs the full execute pipeline: hashing, copying, and moving.
+        if not self.controller.retry(
+            run_id,
+            confirmed=True,
+            retry_attempts=self.retry_count.value(),
+            resume=not has_failures,
+        ):
+            self.banner.set_message("Another sorting operation is still running.", "warning")
             self.banner.show()
-            self._refresh_history()
-        except Exception as exc:
-            self._show_error(exc)
 
     def _open_history_path(self, field: str) -> None:
         run = self._selected_run()

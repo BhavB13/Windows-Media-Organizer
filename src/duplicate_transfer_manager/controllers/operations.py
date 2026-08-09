@@ -125,6 +125,51 @@ class SortController(BaseOperationController):
             )
         return self.start_task(task)
 
+    def undo(self, run_id: str, *, conflict_policy: Any = None, dry_run: bool = False) -> bool:
+        """Roll a sort run back on a worker thread.
+
+        Undo re-hashes and moves every restored file. Running that inline on
+        the Qt main thread froze the window with no progress and no cancel,
+        which on a large run was indistinguishable from a hang.
+        """
+
+        def task(cancellation, reporter):
+            self.execution_control = SortExecutionControl(cancellation)
+            executor = self.service.executor
+            if conflict_policy is None:
+                result = executor.undo(run_id, dry_run=dry_run)
+            else:
+                result = executor.undo(run_id, conflict_policy=conflict_policy, dry_run=dry_run)
+            return OperationResult(
+                status=OperationState.COMPLETED,
+                counts={"restored": result.completed, "skipped": result.skipped, "errors": result.failed},
+                warnings=result.failures,
+                report_path=result.journal_path,
+                data={"sort_result": result, "sort_operation": "undo"},
+            )
+
+        return self.start_task(task)
+
+    def retry(self, run_id: str, *, confirmed: bool, retry_attempts: int = 1, resume: bool = False) -> bool:
+        """Retry failed items, or resume interrupted ones, on a worker thread."""
+
+        def task(cancellation, reporter):
+            self.execution_control = SortExecutionControl(cancellation)
+            executor = self.service.executor
+            runner = executor.resume_run if resume else executor.retry_failed
+            result = runner(run_id, confirmed=confirmed, retry_attempts=retry_attempts)
+            status = OperationState.CANCELLED if result.status == "cancelled" else OperationState.COMPLETED
+            return OperationResult(
+                status=status,
+                counts={"completed": result.completed, "skipped": result.skipped, "errors": result.failed},
+                warnings=result.failures,
+                report_path=result.journal_path,
+                resume_information={"undo_available": result.undo_available},
+                data={"sort_result": result, "sort_operation": "retry"},
+            )
+
+        return self.start_task(task)
+
     def pause(self) -> bool:
         if not self.execution_control or not self.busy:
             return False

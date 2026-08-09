@@ -373,6 +373,11 @@ class Phase2UiTests(unittest.TestCase):
             return_value=QMessageBox.StandardButton.Yes,
         ):
             page._undo_selected()
+        # Undo now runs on a worker rather than blocking the window, so the
+        # test waits for it the same way it waits for a run.
+        page.controller.wait_for_done(10_000)
+        QTest.qWait(100)
+        self.application.processEvents()
         self.assertTrue(original.exists())
         page.deleteLater()
 
