@@ -14,14 +14,29 @@ that was checked against the pre-fix commit and fails there.
 
 ## Fixed during this audit
 
+Each was reproduced, fixed, and given a regression test checked against the
+pre-fix commit.
+
 | Finding | Commit |
 | --- | --- |
 | "Select recommended copies" also selected the copy being kept, so confirming quarantined every copy in the group | `fb8271e` |
 | `prune_runs` deleted the only copies of files displaced by an Overwrite | `fcfb784` |
 | Overwrite backup displaced the incumbent with an unverified, unjournaled cross-volume move | `cd94a07` |
-| The sort journal was rewritten in full per item: measured 38.05 s / 346.9 MB for 600 files, against 6.72 s / 1.3 MB after | `dfdd0fe` |
+| Sampled Fast hashes decided import skipping, so a unique file could be silently left behind | `4909d27` |
+| `is_hidden_or_system` reported every unreadable path as hidden, dropping files and whole subtrees from local scans | `4909d27` |
+| The sort journal was rewritten in full per item: 38.05 s / 346.9 MB for 600 files, against 6.72 s / 1.3 MB after | `dfdd0fe` |
+| Scheduled scan, sort, and organizer tasks opened the GUI instead of running in every packaged install | `3753dc5` |
+| Sort undo and retry ran hashing and moves on the Qt main thread | `b17064e` |
+| The monitored-folder poll ran a recursive walk plus metadata extraction on the main thread every 30 s | `9279486` |
+| Quarantine and restore ran on the Qt main thread | `771056a` |
 | The bundled adb was never used; every call took whatever was on PATH | `3673358` |
 | adb's pipes were not drained during a pull, so a large video could deadlock it | `40f3445` |
+
+Still open, and the largest remaining group: the six Qt controllers built and
+tested but never wired to the UI, the second unreachable organization engine
+(`organizer_service.py`), the drive-cache "count matches" fast path that trusts
+cached hashes without revalidating size and mtime, and conflict-skips being
+reported to the user as duplicates.
 
 ## Summary by severity
 
