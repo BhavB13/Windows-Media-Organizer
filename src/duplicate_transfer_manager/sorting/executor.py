@@ -269,18 +269,55 @@ class SortExecutor:
         return runs
 
     def prune_runs(self, retention_days: int = 90) -> int:
-        """Remove only expired app-owned journals/backups, never sorted files."""
+        """Remove expired sort history, but never a user file held for undo.
+
+        A run directory can contain a ``replaced/`` folder holding the files an
+        Overwrite displaced. Those are the user's originals and there is no
+        other copy of them, so a run that still holds any is kept regardless of
+        age. Deleting them was the opposite of what this method's previous
+        docstring promised, and it ran on every launch.
+        """
+
         cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, retention_days))
         removed = 0
         root = self.paths.sorting / "runs"
         for journal in root.glob("*/journal.json"):
             try:
-                if datetime.fromtimestamp(journal.stat().st_mtime, timezone.utc) < cutoff:
-                    shutil.rmtree(journal.parent)
-                    removed += 1
+                if datetime.fromtimestamp(journal.stat().st_mtime, timezone.utc) >= cutoff:
+                    continue
+                if self._holds_replaced_originals(journal.parent):
+                    continue
+                shutil.rmtree(journal.parent)
+                removed += 1
             except OSError:
                 continue
         return removed
+
+    def runs_retained_for_replaced_files(self) -> list[dict]:
+        """Runs kept past their retention because they still hold originals."""
+        retained = []
+        for journal in (self.paths.sorting / "runs").glob("*/journal.json"):
+            if not self._holds_replaced_originals(journal.parent):
+                continue
+            replaced = journal.parent / "replaced"
+            files = [path for path in replaced.glob("*") if path.is_file()]
+            retained.append(
+                {
+                    "run_id": journal.parent.name,
+                    "replaced_files": len(files),
+                    "bytes": sum(path.stat().st_size for path in files),
+                }
+            )
+        return retained
+
+    @staticmethod
+    def _holds_replaced_originals(run_dir: Path) -> bool:
+        replaced = run_dir / "replaced"
+        try:
+            return replaced.is_dir() and any(path.is_file() for path in replaced.iterdir())
+        except OSError:
+            # Unreadable is treated as occupied: never delete on a guess.
+            return True
 
     def retry_failed(self, run_id: str, *, confirmed: bool, retry_attempts: int = 1) -> SortExecutionResult:
         journal = self.load_run(run_id)

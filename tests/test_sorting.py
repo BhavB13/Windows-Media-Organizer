@@ -448,6 +448,38 @@ class SortExecutorTests(unittest.TestCase):
         plan = SortPlanner(paths).build(profile, metadata, sources=[str(source_dir)], dry_run=False)
         return paths, plan
 
+    def test_pruning_never_deletes_an_overwritten_original(self):
+        # replaced/ holds the user's own files, displaced by an Overwrite, with
+        # no other copy anywhere. Pruning ran on every launch and removed them.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = get_runtime_paths(Path(temp_dir) / "data")
+            runs = paths.sorting / "runs"
+            expired = time.time() - (200 * 86400)
+
+            with_backup = runs / "sort_20250101_000000_000000"
+            (with_backup / "replaced").mkdir(parents=True)
+            (with_backup / "replaced" / "000_original.jpg").write_bytes(b"the only copy")
+            (with_backup / "journal.json").write_text("{}", encoding="utf-8")
+            os.utime(with_backup / "journal.json", (expired, expired))
+
+            plain = runs / "sort_20250101_000000_000001"
+            plain.mkdir(parents=True)
+            (plain / "journal.json").write_text("{}", encoding="utf-8")
+            os.utime(plain / "journal.json", (expired, expired))
+
+            executor = SortExecutor(paths)
+            self.assertEqual(executor.prune_runs(retention_days=90), 1)
+
+            self.assertFalse(plain.exists(), "an expired run with no backups should be pruned")
+            self.assertTrue((with_backup / "replaced" / "000_original.jpg").exists())
+            self.assertEqual(
+                (with_backup / "replaced" / "000_original.jpg").read_bytes(), b"the only copy"
+            )
+
+            retained = executor.runs_retained_for_replaced_files()
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0]["replaced_files"], 1)
+
     def test_overwrite_verifies_the_backup_before_deleting_the_incumbent(self):
         # The backup lives on the app data drive while destinations are often
         # another volume, so displacing the incumbent is a copy plus a delete.
