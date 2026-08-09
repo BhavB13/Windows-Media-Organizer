@@ -865,6 +865,10 @@ class DuplicatesPage(BasePage):
             self.table.setCellWidget(row, 1, keep)
             check = QCheckBox()
             check.setChecked(item.id in group.selected_item_ids)
+            # Disable the keeper's row up front. _keep_item does this, but only
+            # when the user changes the keeper, so a freshly rendered review
+            # left the kept file selectable for quarantine.
+            check.setEnabled(item.id != group.keep_item_id)
             check.setAccessibleName(f"Quarantine {item.filename}")
             check.toggled.connect(
                 lambda _checked, item_id=item.id: self._duplicate_selection_changed(item_id)
@@ -906,9 +910,18 @@ class DuplicatesPage(BasePage):
         self._refresh_recoverable()
 
     def _select_recommended_duplicates(self) -> None:
+        """Select every copy except the one chosen to keep in each group.
+
+        This selected every *enabled* box, and relied on the keeper's box being
+        disabled to exclude it. That only happened once the user changed a
+        keeper, so on a freshly rendered review the button selected the kept
+        file too and confirming moved every copy of a group into quarantine.
+        The keep selection is now read from the review itself.
+        """
+
+        keep_ids = {group.keep_item_id for group in (self.review.groups if self.review else ())}
         for item_id, check in self.quarantine_checks.items():
-            if check.isEnabled():
-                check.setChecked(True)
+            check.setChecked(item_id not in keep_ids)
         self._refresh_recoverable()
 
     def _clear_duplicate_selection(self) -> None:

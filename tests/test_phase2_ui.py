@@ -685,6 +685,41 @@ class Phase2UiTests(unittest.TestCase):
         window.close()
         window.deleteLater()
 
+    def test_select_recommended_never_selects_the_kept_copy(self):
+        # The button's tooltip promises "every copy except the file chosen to
+        # keep". It selected every enabled box instead, and the keeper's box is
+        # only disabled once the user changes a keeper, so on a freshly
+        # rendered review confirming quarantined every copy in the group.
+        import tempfile
+        from pathlib import Path as _Path
+        from duplicate_transfer_manager.services import build_duplicate_review
+        from models import FileInfo
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = _Path(temp_dir)
+            files = [root / "a.jpg", root / "b.jpg", root / "c.jpg"]
+            for item in files:
+                item.write_bytes(b"identical")
+            review = build_duplicate_review(
+                [[FileInfo(str(item), 9, 100 + index) for index, item in enumerate(files)]],
+                thumbnail_root=root / "thumbs",
+            )
+            page = DuplicatesPage()
+            page.review = review
+            page._render_review()
+            for _ in range(10):
+                page._render_next_batch()
+
+            group = review.groups[0]
+            keeper = page.quarantine_checks[group.keep_item_id]
+            self.assertFalse(keeper.isEnabled(), "the kept copy must not be selectable")
+
+            page._select_recommended_duplicates()
+            self.assertFalse(keeper.isChecked())
+            selected = [item_id for item_id, check in page.quarantine_checks.items() if check.isChecked()]
+            self.assertEqual(len(selected), len(files) - 1)
+            self.assertNotIn(group.keep_item_id, selected)
+
 
 if __name__ == "__main__":
     unittest.main()
