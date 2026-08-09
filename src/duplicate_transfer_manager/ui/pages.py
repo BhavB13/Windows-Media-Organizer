@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt, Signal, QUrl
+from PySide6.QtCore import QThreadPool, QTimer, Qt, Signal, QUrl
 from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -40,7 +40,8 @@ from transfer_safety import cleanup_partial_files
 from utils import DEFAULT_EXCLUDES, DEFAULT_MEDIA_EXTS, HashCache
 
 from ..controllers import DuplicateScanController, TransferController
-from ..core import AppSettings
+from ..controllers.base import OperationWorker
+from ..core import AppSettings, CancellationToken, OperationResult, OperationState
 from ..runtime_paths import get_runtime_paths
 from ..sorting import SortExecutor
 from ..services import (
@@ -120,6 +121,36 @@ class BasePage(QScrollArea):
         viewport_layout.addWidget(self.canvas, 20)
         viewport_layout.addStretch(1)
         self.setWidget(self.viewport_container)
+
+    def run_in_background(self, work, on_result, on_error=None) -> None:
+        """Run a blocking service call off the Qt main thread.
+
+        Quarantine and restore move, copy, and pull files one at a time. Called
+        inline they froze the window for the whole operation, with no progress
+        and no way to tell the app from a hang. ``work`` takes no arguments and
+        its return value is delivered to ``on_result`` on the main thread.
+        """
+
+        worker = OperationWorker(
+            lambda _cancellation, _reporter: OperationResult(
+                status=OperationState.COMPLETED, data={"value": work()}
+            ),
+            CancellationToken(),
+        )
+        # QThreadPool owns the C++ runnable, but nothing owns the Python
+        # wrapper or the QObject carrying its signals. Without this reference
+        # they can be collected before the result is delivered and the callback
+        # never runs.
+        if not hasattr(self, "_background_workers"):
+            self._background_workers = []
+        self._background_workers.append(worker)
+        worker.signals.result.connect(lambda result: on_result((result.data or {}).get("value")))
+        if on_error is not None:
+            worker.signals.error.connect(on_error)
+        worker.signals.finished.connect(
+            lambda: self._background_workers.remove(worker) if worker in self._background_workers else None
+        )
+        QThreadPool.globalInstance().start(worker)
 
     def finish(self) -> None:
         self.content.addStretch(1)
@@ -1053,12 +1084,27 @@ class DuplicatesPage(BasePage):
         response = QMessageBox.question(self, title, message)
         if response != QMessageBox.StandardButton.Yes:
             return
-        result = self.quarantine_service.quarantine(
-            self.review,
-            selected,
-            adb_serial=self.adb_serial,
-            dry_run=self.dry_run_quarantine.isChecked(),
+        review = self.review
+        adb_serial = self.adb_serial
+        dry_run = self.dry_run_quarantine.isChecked()
+        self.quarantine_button.setEnabled(False)
+        self.banner.set_message("Quarantining selected duplicates…", "info")
+        self.banner.show()
+        self.run_in_background(
+            lambda: self.quarantine_service.quarantine(
+                review, selected, adb_serial=adb_serial, dry_run=dry_run
+            ),
+            self._quarantine_finished,
+            self._quarantine_failed,
         )
+
+    def _quarantine_failed(self, error) -> None:
+        self.quarantine_button.setEnabled(True)
+        self.banner.set_message(f"Quarantine failed: {getattr(error, 'message', error)}", "error")
+        self.banner.show()
+
+    def _quarantine_finished(self, result) -> None:
+        self.quarantine_button.setEnabled(True)
         self.operation_service.record(
             "duplicate_quarantine",
             "warning" if result.failures else "completed",
@@ -2466,11 +2512,18 @@ class QuarantinePage(BasePage):
             self.banner.show()
             return
         operation_id = selected[0].operation_id
-        result = self.service.restore_operation(
-            operation_id,
-            conflict_policy=self.conflict.currentData(),
-            dry_run=self.dry_run_restore.isChecked(),
+        conflict_policy = self.conflict.currentData()
+        dry_run = self.dry_run_restore.isChecked()
+        self.banner.set_message("Restoring quarantined files…", "info")
+        self.banner.show()
+        self.run_in_background(
+            lambda: self.service.restore_operation(
+                operation_id, conflict_policy=conflict_policy, dry_run=dry_run
+            ),
+            self._restore_finished,
         )
+
+    def _restore_finished(self, result) -> None:
         self._show_restore_result(len(result.restored), len(result.skipped), len(result.failures))
         self.refresh()
 

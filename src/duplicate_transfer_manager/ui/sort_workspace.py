@@ -459,6 +459,7 @@ class SortWorkspace(QScrollArea):
         self._refresh_history()
         self._show_section(self.SOURCE_STAGE)
         self._monitor_poll_running = False
+        self._monitor_worker = None
         self.change_timer = QTimer(self)
         self.change_timer.setInterval(30_000)
         self.change_timer.timeout.connect(self._poll_change_monitors)
@@ -1500,6 +1501,10 @@ class SortWorkspace(QScrollArea):
 
         self._monitor_poll_running = True
         worker = OperationWorker(poll_all, CancellationToken())
+        # QThreadPool owns the C++ runnable but not the Python wrapper or the
+        # QObject carrying its signals, which can otherwise be collected before
+        # the result is delivered.
+        self._monitor_worker = worker
         worker.signals.result.connect(self._on_monitor_poll_result)
         worker.signals.error.connect(lambda _error: None)
         worker.signals.finished.connect(self._on_monitor_poll_finished)

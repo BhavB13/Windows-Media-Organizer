@@ -19,6 +19,7 @@ from duplicate_transfer_manager.core import AppSettings, QuarantineRecord, Servi
 from duplicate_transfer_manager.runtime_paths import get_runtime_paths
 from duplicate_transfer_manager.services import (
     DuplicateQuarantineService,
+    build_duplicate_review,
     OperationRecordService,
     ReportService,
     SettingsService,
@@ -55,6 +56,7 @@ from duplicate_transfer_manager.ui.widgets import (
     ToastBanner,
 )
 from duplicate_transfer_manager.version import __version__
+from models import FileInfo
 
 
 class Phase2UiTests(unittest.TestCase):
@@ -724,6 +726,46 @@ class Phase2UiTests(unittest.TestCase):
             selected = [item_id for item_id, check in page.quarantine_checks.items() if check.isChecked()]
             self.assertEqual(len(selected), len(files) - 1)
             self.assertNotIn(group.keep_item_id, selected)
+
+    def test_quarantine_confirm_runs_on_a_worker_and_still_moves_the_file(self):
+        # Quarantine moves and pulls files one at a time. Run inline it froze
+        # the window for the whole operation with no way to tell it from a hang.
+        from PySide6.QtCore import QThreadPool
+
+        root = Path(self.temp_dir.name) / "quarantine-worker"
+        root.mkdir(parents=True, exist_ok=True)
+        keeper = root / "keep.jpg"
+        duplicate = root / "copy.jpg"
+        keeper.write_bytes(b"identical")
+        duplicate.write_bytes(b"identical")
+
+        page = self.window.pages["duplicates"]
+        page.review = build_duplicate_review(
+            [[FileInfo(str(keeper), 9, 100), FileInfo(str(duplicate), 9, 200)]],
+            thumbnail_root=root / "thumbs",
+        )
+        page._render_review()
+        while page._render_queue:
+            page._render_next_batch()
+        page._select_recommended_duplicates()
+        self.application.processEvents()
+
+        with patch(
+            "duplicate_transfer_manager.ui.pages.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            page._confirm_quarantine()
+
+        # The button is held disabled while the worker runs.
+        self.assertFalse(page.quarantine_button.isEnabled())
+        self.assertTrue(QThreadPool.globalInstance().waitForDone(15_000))
+        QTest.qWait(150)
+        self.application.processEvents()
+
+        self.assertTrue(page.quarantine_button.isEnabled())
+        self.assertTrue(keeper.exists(), "the kept copy must stay in place")
+        self.assertFalse(duplicate.exists(), "the duplicate should have moved to quarantine")
+        page.deleteLater()
 
 
 if __name__ == "__main__":
