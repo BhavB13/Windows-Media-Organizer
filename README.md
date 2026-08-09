@@ -131,6 +131,8 @@ The GitHub Actions workflow in `.github/workflows/release.yml` builds the
 PyInstaller app, signs the executable, builds and signs the Inno installer,
 generates a signed update manifest, and uploads a draft GitHub Release.
 
+See [docs/PROGRAM_AUDIT.md](docs/PROGRAM_AUDIT.md) for the whole-program audit
+findings and their implementation plan.
 See [docs/PHASE_6_7_AUDIT.md](docs/PHASE_6_7_AUDIT.md) for the Phase 6-7
 completion audit and the remaining external release gates.
 See [docs/TARGETED_FIX_MANUAL_CHECKLIST.md](docs/TARGETED_FIX_MANUAL_CHECKLIST.md)
