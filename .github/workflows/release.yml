@@ -71,11 +71,24 @@ jobs:
           Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
           $adb = Join-Path $extract "platform-tools\adb.exe"
           if (-not (Test-Path $adb)) { throw "Downloaded Android Platform Tools did not contain adb.exe" }
-          $adbVersion = & $adb version
-          if ($adbVersion -notmatch [regex]::Escape($manifest.version)) {
-            throw "Downloaded Android Platform Tools version did not match pinned version $($manifest.version): $adbVersion"
+          # Current platform-tools are only served from the -latest- URL, so an
+          # exact-version assertion failed on every Google release. Require a
+          # floor and record what actually shipped.
+          # adb prints the protocol version first ("Android Debug Bridge version
+          # 1.0.41"); the platform-tools release is on its own "Version" line.
+          $adbVersionLines = @(& $adb version)
+          $versionLine = $adbVersionLines | Where-Object { $_ -cmatch '^\s*Version\s+(\d+)\.(\d+)\.(\d+)' } | Select-Object -First 1
+          if (-not $versionLine) {
+            throw "Could not read the Android Platform Tools version from: $($adbVersionLines -join ' | ')"
           }
+          $versionLine -cmatch '^\s*Version\s+(\d+)\.(\d+)\.(\d+)' | Out-Null
+          $bundledVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+          if ([version]$bundledVersion -lt [version]$manifest.minimum_version) {
+            throw "Android Platform Tools $bundledVersion is older than the required minimum $($manifest.minimum_version)."
+          }
+          Write-Host "Android Platform Tools bundled: $bundledVersion"
           Copy-Item -Recurse -Force (Join-Path $extract "platform-tools") "dist\DuplicateTransferManager\platform-tools"
+          Set-Content -Encoding utf8 "dist\DuplicateTransferManager\platform-tools\bundled_version.txt" $bundledVersion
 
       - name: Build and sign installer
         shell: pwsh

@@ -292,8 +292,13 @@ class Phase7PackagingUpdateTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         payload = json.loads((root / "packaging" / "android_platform_tools_manifest.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(payload["version"], "37.0.0")
+        # A floor, not an exact match. Google serves current platform-tools only
+        # from the -latest- URL, so asserting an exact version broke the release
+        # build every time they shipped an update.
+        self.assertIn("minimum_version", payload)
+        self.assertNotIn("version", payload)
         self.assertIn("platform-tools", payload["download_url"])
+        self.assertRegex(payload["minimum_version"], r"^\d+\.\d+\.\d+$")
 
 
 class PackagingMetadataTests(unittest.TestCase):
@@ -312,6 +317,30 @@ class PackagingMetadataTests(unittest.TestCase):
             self.assertIn(field, spec)
         # Read from version.py rather than hardcoded, so it cannot drift.
         self.assertIn("version.py", spec)
+
+    def test_manifest_and_version_files_survive_a_byte_order_mark(self):
+        # The build writes both of these with PowerShell's Set-Content -Encoding
+        # UTF8, which emits a BOM. json.loads rejects a BOM outright, so signing
+        # failed on every release build, and the recorded platform-tools version
+        # came back with a stray ﻿ glued to the front.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = Path(temp_dir) / "update-manifest.json"
+            manifest.write_bytes(b"\xef\xbb\xbf" + json.dumps({"version": "0.9.0"}).encode("utf-8"))
+
+            with self.assertRaises(json.JSONDecodeError):
+                json.loads(manifest.read_text(encoding="utf-8"))
+
+            from duplicate_transfer_manager.services.support_services import UpdateService
+
+            paths = get_runtime_paths(Path(temp_dir) / "data")
+            self.assertEqual(UpdateService(paths).load_manifest(manifest)["version"], "0.9.0")
+
+            signer = (self.root / "scripts" / "sign_update_manifest.py").read_text(encoding="utf-8")
+            self.assertIn('encoding="utf-8-sig"', signer)
+
+            recorded = Path(temp_dir) / "bundled_version.txt"
+            recorded.write_bytes(b"\xef\xbb\xbf37.0.1\n")
+            self.assertEqual(recorded.read_text(encoding="utf-8-sig").strip(), "37.0.1")
 
     def test_installer_writes_into_the_repository_dist_folder(self):
         # OutputDir is relative to the .iss file, so without the prefix the

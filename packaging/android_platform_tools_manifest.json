@@ -1,9 +1,10 @@
 {
   "name": "Android SDK Platform-Tools",
-  "version": "37.0.0",
+  "minimum_version": "35.0.0",
   "platform": "windows",
   "source_url": "https://developer.android.com/tools/releases/platform-tools",
   "download_url": "https://dl.google.com/android/repository/platform-tools-latest-windows.zip",
+  "version_policy": "Google no longer publishes versioned archives for current platform-tools releases; only the -latest- URL serves them. The build therefore requires at least minimum_version rather than asserting an exact match, which would fail every time Google ships an update, and records the version actually downloaded in platform-tools/bundled_version.txt.",
   "license": "Android Software Development Kit License Agreement",
   "bundled_path": "platform-tools/adb.exe",
   "system_path_policy": "Never modify system-wide ADB installations or environment variables."

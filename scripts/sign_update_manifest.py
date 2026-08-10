@@ -21,7 +21,10 @@ def main() -> int:
     parser.add_argument("private_key", type=Path)
     args = parser.parse_args()
 
-    payload = json.loads(args.manifest.read_text(encoding="utf-8"))
+    # utf-8-sig, because the build writes this file with PowerShell's
+    # Set-Content -Encoding UTF8, which emits a byte-order mark that
+    # json.loads rejects outright. Signing failed on every release build.
+    payload = json.loads(args.manifest.read_text(encoding="utf-8-sig"))
     with tempfile.TemporaryDirectory() as temp_dir:
         data_path = Path(temp_dir) / "manifest.canonical.json"
         signature_path = Path(temp_dir) / "manifest.sig"

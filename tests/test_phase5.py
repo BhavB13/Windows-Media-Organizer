@@ -274,12 +274,15 @@ class Phase5OverviewActivitySettingsTests(unittest.TestCase):
         self.assertIn("DAILY", command)
         self.assertIn("duplicate_transfer_manager.scheduled_organizer", command[-1])
 
-    def test_diagnostics_reports_pinned_platform_tools_without_system_mutation(self):
+    def test_diagnostics_reports_platform_tools_without_system_mutation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             diagnostics = DiagnosticsService(get_runtime_paths(temp_dir)).collect(include_devices=False)
 
         platform_tools = diagnostics["android_platform_tools"]
-        self.assertEqual(platform_tools["pinned_version"], "37.0.0")
+        # A minimum, not a pin. Google serves only the latest platform-tools, so
+        # asserting an exact version failed the release build on every update.
+        self.assertRegex(platform_tools["minimum_version"], r"^\d+\.\d+\.\d+$")
+        self.assertIn("version", platform_tools)
         self.assertFalse(platform_tools["system_path_modified"])
         self.assertIn("Never modify", platform_tools["system_path_policy"])
 

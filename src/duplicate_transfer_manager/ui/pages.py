@@ -2671,10 +2671,18 @@ class SettingsPage(BasePage):
         self.keep_awake = QCheckBox("Keep Android awake during imports")
         self.keep_awake.setChecked(settings.keep_android_awake)
         platform_tools = DiagnosticsService(service.paths).collect(include_devices=False)["android_platform_tools"]
-        self.platform_tools = QLabel(
-            f"Pinned Android Platform Tools: {platform_tools['pinned_version']} "
-            f"({platform_tools['license']})"
-        )
+        # Report what is actually bundled. The build cannot pin an exact
+        # version, because Google serves only the latest platform-tools, so
+        # this shows the version recorded at build time and the required floor.
+        bundled = platform_tools.get("version", "Unknown")
+        if platform_tools.get("bundled"):
+            tools_summary = f"Bundled Android Platform Tools: {bundled}"
+        else:
+            tools_summary = (
+                "Android Platform Tools: using the adb found on PATH "
+                f"(minimum {platform_tools.get('minimum_version', 'Unknown')})"
+            )
+        self.platform_tools = QLabel(f"{tools_summary} ({platform_tools['license']})")
         self.platform_tools.setProperty("muted", True)
         self.update_channel = QComboBox()
         for channel in ("stable", "beta", "development"):

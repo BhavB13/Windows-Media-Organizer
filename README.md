@@ -70,9 +70,10 @@ is tracked in [OVERHAUL_PLAN.md](OVERHAUL_PLAN.md).
 - Android Platform Tools available on `PATH` when using Android features during
   development
 
-The repository pins the license-compatible Android Platform Tools release that
-will be bundled by Windows packaging, and diagnostics display that pinned
-version. Development runs may still use the installed `adb` command, but the
+Windows packaging bundles the license-compatible Android Platform Tools. Google
+publishes only the latest release at a stable URL, so the build requires a
+minimum version rather than an exact one and records what it actually shipped;
+diagnostics report that recorded version. Development runs may still use the installed `adb` command, but the
 application does not alter system-wide ADB installations or environment
 variables.
 

@@ -76,10 +76,17 @@ update. Raise it when an upgrade cannot be applied safely from older builds.
 3. Builds the executable with PyInstaller, stamping a Windows version resource
    read from `src/duplicate_transfer_manager/version.py`.
 4. Signs the executable, unless `-SkipSigning`.
-5. Downloads the pinned Android Platform Tools, verifies the version matches
-   `packaging/android_platform_tools_manifest.json`, and copies `platform-tools`
-   next to the executable. The application prefers this copy over anything on
-   `PATH`.
+5. Downloads the Android Platform Tools, checks the release is at least
+   `minimum_version` from `packaging/android_platform_tools_manifest.json`,
+   copies `platform-tools` next to the executable, and records the version it
+   actually got in `platform-tools/bundled_version.txt`. The application prefers
+   this copy over anything on `PATH`, and diagnostics report the recorded
+   version.
+
+   Google publishes only the latest platform-tools at a stable URL — the
+   versioned archives stop before 36 — so an exact-version assertion is not
+   possible and previously failed the build on every Google release. The check
+   is a floor, not a pin.
 6. Compiles the Inno Setup installer, signing it and the uninstaller unless
    `-SkipSigning`.
 7. Writes the portable ZIP.

@@ -365,9 +365,21 @@ class DiagnosticsService:
             manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             pass
-        pinned_version = str(manifest_payload.get("version", "Unknown"))
+        minimum_version = str(manifest_payload.get("minimum_version", "Unknown"))
         is_bundled = resolved_adb.parent.name == "platform-tools" and resolved_adb.is_file()
-        bundled_version = pinned_version if is_bundled else "Not bundled"
+        # Report the version actually shipped, written at build time, rather
+        # than repeating a manifest number the build does not control: Google
+        # serves only the latest platform-tools, so the two can differ.
+        bundled_version = "Not bundled"
+        if is_bundled:
+            bundled_version = "Unknown"
+            try:
+                # utf-8-sig: the build writes this with PowerShell, which adds a BOM.
+                recorded = (resolved_adb.parent / "bundled_version.txt").read_text(encoding="utf-8-sig").strip()
+                if recorded:
+                    bundled_version = recorded
+            except OSError:
+                pass
         payload = {
             "application_version": __version__,
             "python_version": platform.python_version(),
@@ -383,7 +395,7 @@ class DiagnosticsService:
                 "bundled": is_bundled,
                 "resolved_adb": str(resolved_adb),
                 "version": bundled_version,
-                "pinned_version": pinned_version,
+                "minimum_version": minimum_version,
                 "license": manifest_payload.get("license", ""),
                 "system_path_policy": manifest_payload.get(
                     "system_path_policy",
@@ -702,7 +714,9 @@ class UpdateService:
 
     def load_manifest(self, path: str | os.PathLike[str]) -> dict[str, Any]:
         try:
-            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            # utf-8-sig so a manifest written by a Windows toolchain, which
+            # emits a byte-order mark, is still readable.
+            payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ServiceError(
                 ErrorCode.INVALID_DATA,

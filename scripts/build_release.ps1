@@ -50,11 +50,26 @@ $adb = Join-Path $platformToolsTemp "platform-tools\adb.exe"
 if (-not (Test-Path $adb)) {
     throw "Downloaded Android Platform Tools did not contain adb.exe"
 }
-$adbVersion = & $adb version
-if ($adbVersion -notmatch [regex]::Escape($platformToolsManifest.version)) {
-    throw "Downloaded Android Platform Tools version did not match pinned version $($platformToolsManifest.version): $adbVersion"
+# Google serves current platform-tools only from the -latest- URL, so asserting
+# an exact version broke the build every time they shipped an update. Require a
+# floor instead, and record what was actually downloaded.
+# "adb version" prints the ADB protocol version first ("Android Debug Bridge
+# version 1.0.41") and the platform-tools release on its own "Version" line, so
+# the match is case-sensitive and anchored to avoid reading 1.0.41.
+$adbVersionLines = @(& $adb version)
+$versionLine = $adbVersionLines | Where-Object { $_ -cmatch '^\s*Version\s+(\d+)\.(\d+)\.(\d+)' } | Select-Object -First 1
+if (-not $versionLine) {
+    throw "Could not read the Android Platform Tools version from: $($adbVersionLines -join ' | ')"
 }
+$versionLine -cmatch '^\s*Version\s+(\d+)\.(\d+)\.(\d+)' | Out-Null
+$bundledVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+$minimumVersion = $platformToolsManifest.minimum_version
+if ([version]$bundledVersion -lt [version]$minimumVersion) {
+    throw "Android Platform Tools $bundledVersion is older than the required minimum $minimumVersion."
+}
+Write-Host "Android Platform Tools bundled: $bundledVersion (minimum $minimumVersion)"
 Copy-Item -Recurse -Force (Join-Path $platformToolsTemp "platform-tools") "dist\DuplicateTransferManager\platform-tools"
+Set-Content -Encoding utf8 "dist\DuplicateTransferManager\platform-tools\bundled_version.txt" $bundledVersion
 
 # winget installs Inno Setup per-user by default, so Program Files is only one
 # of the places it can live. Check all of them before giving up.

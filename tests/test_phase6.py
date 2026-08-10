@@ -42,6 +42,17 @@ class Phase6ReliabilitySecurityTests(unittest.TestCase):
         self.assertNotIn("IMG_1234.jpg", sanitized)
         self.assertIn("<redacted:filename:", sanitized)
 
+    def test_diagnostics_expose_the_platform_tools_keys_the_settings_page_reads(self):
+        # Renaming a key here previously raised a KeyError inside SettingsPage,
+        # which is built during MainWindow construction, so the application
+        # would not start at all.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = get_runtime_paths(temp_dir)
+            payload = DiagnosticsService(paths).collect(include_devices=False)
+            tools = payload["android_platform_tools"]
+            for key in ("bundled", "version", "minimum_version", "license", "resolved_adb"):
+                self.assertIn(key, tools, f"SettingsPage reads android_platform_tools[{key!r}]")
+
     def test_diagnostics_are_sanitized_and_sentry_is_opt_in(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = get_runtime_paths(temp_dir)

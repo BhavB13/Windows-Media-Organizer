@@ -121,7 +121,8 @@ Android defaults, diagnostics consent, update channel, and first-run onboarding
 completion. Simple mode is the default; Advanced mode reveals technical controls
 without changing backend behavior by itself.
 
-Diagnostics include the pinned Android Platform Tools release metadata and
+Diagnostics include the bundled Android Platform Tools version recorded at
+build time and
 explicitly report that Duplicate & Transfer Manager does not mutate system-wide
 ADB installations or environment variables.
 
