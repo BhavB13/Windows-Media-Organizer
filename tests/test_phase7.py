@@ -296,5 +296,48 @@ class Phase7PackagingUpdateTests(unittest.TestCase):
         self.assertIn("platform-tools", payload["download_url"])
 
 
+class PackagingMetadataTests(unittest.TestCase):
+    """Guard the metadata a downloaded build shows to a user."""
+
+    root = Path(__file__).resolve().parents[1]
+
+    def test_spec_stamps_a_windows_version_resource_from_version_py(self):
+        # Without this the built exe carries no ProductName, CompanyName, or
+        # FileVersion at all: the Properties dialog is blank, and an unsigned
+        # binary with no version information fares much worse with SmartScreen.
+        spec = (self.root / "packaging" / "duplicate_transfer_manager.spec").read_text(encoding="utf-8")
+        self.assertIn("version=version_resource", spec)
+        self.assertIn("VSVersionInfo", spec)
+        for field in ("CompanyName", "FileDescription", "FileVersion", "ProductName", "LegalCopyright"):
+            self.assertIn(field, spec)
+        # Read from version.py rather than hardcoded, so it cannot drift.
+        self.assertIn("version.py", spec)
+
+    def test_installer_writes_into_the_repository_dist_folder(self):
+        # OutputDir is relative to the .iss file, so without the prefix the
+        # installer lands in packaging\dist and the release script fails its
+        # own existence check.
+        installer = (self.root / "packaging" / "installer.iss").read_text(encoding="utf-8")
+        self.assertIn(r"OutputDir=..\dist\installer", installer)
+
+    def test_installer_can_build_without_a_signing_certificate(self):
+        # Signing must be opt-in, or no downloadable build can be produced at
+        # all until a certificate exists.
+        installer = (self.root / "packaging" / "installer.iss").read_text(encoding="utf-8")
+        self.assertIn("#ifdef SIGNED", installer)
+        signed_block = installer.split("#ifdef SIGNED", 1)[1].split("#endif", 1)[0]
+        self.assertIn("SignTool=signtool", signed_block)
+        self.assertIn("SignedUninstaller=yes", signed_block)
+
+        script = (self.root / "scripts" / "build_release.ps1").read_text(encoding="utf-8")
+        self.assertIn("[switch]$SkipSigning", script)
+        self.assertIn("/DSIGNED", script)
+
+    def test_installer_shows_the_license_and_publisher_details(self):
+        installer = (self.root / "packaging" / "installer.iss").read_text(encoding="utf-8")
+        for directive in ("LicenseFile=", "AppPublisherURL=", "AppSupportURL=", "AppCopyright=", "VersionInfoVersion="):
+            self.assertIn(directive, installer)
+
+
 if __name__ == "__main__":
     unittest.main()

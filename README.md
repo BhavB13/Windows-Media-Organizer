@@ -119,13 +119,22 @@ python legacy_main.py
 
 ## Windows release build
 
-Release packaging requires Windows, Python 3.12, Inno Setup 6, Windows SDK
-`signtool`, a code-signing certificate, and a protected update-manifest private
-key.
+Release packaging requires Windows, Python 3.12, and Inno Setup 6
+(`winget install --id JRSoftware.InnoSetup -e`). Signing additionally requires
+Windows SDK `signtool`, a code-signing certificate, and a protected
+update-manifest private key.
+
+Without a certificate you can still produce a real, installable download:
 
 ```powershell
-.\scripts\build_release.ps1 -Version 0.8.0 -Channel stable
+.\scripts\build_release.ps1 -Version 0.8.0 -Channel stable -SkipSigning
 ```
+
+That writes a per-user installer, a portable ZIP, and an update manifest into
+`dist\installer`. Unsigned builds raise a Windows SmartScreen warning on first
+run, so publish them as previews rather than stable releases. See
+[docs/RELEASING.md](docs/RELEASING.md) for the full process, the prerequisites,
+and the checklist before calling a build stable.
 
 The GitHub Actions workflow in `.github/workflows/release.yml` builds the
 PyInstaller app, signs the executable, builds and signs the Inno installer,

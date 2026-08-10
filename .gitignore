@@ -34,3 +34,7 @@ quarantine/
 
 # Generated helper from schedule_adb_cache.ps1
 refresh_adb_cache.ps1
+
+# Local build verification output
+build_test/
+dist_test/
