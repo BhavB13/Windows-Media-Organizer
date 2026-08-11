@@ -31,12 +31,13 @@ pre-fix commit.
 | Quarantine and restore ran on the Qt main thread | `771056a` |
 | The bundled adb was never used; every call took whatever was on PATH | `3673358` |
 | adb's pipes were not drained during a pull, so a large video could deadlock it | `40f3445` |
+| A stale drive-cache entry could make a file skip import entirely, because the fast path validated only a file count | `8fed87d` |
+| Name conflicts were counted and reported as duplicates, so a file that was never imported looked already present | `8fed87d` |
 
-Still open, and the largest remaining group: the six Qt controllers built and
-tested but never wired to the UI, the second unreachable organization engine
-(`organizer_service.py`), the drive-cache "count matches" fast path that trusts
-cached hashes without revalidating size and mtime, and conflict-skips being
-reported to the user as duplicates.
+Still open: the six Qt controllers built and tested but never wired to the UI,
+so device refresh and phone-folder browsing still run on the main thread
+(bounded at a few seconds each), and `organizer_service.py`, a second
+organization engine unreachable from any route.
 
 ## Summary by severity
 
