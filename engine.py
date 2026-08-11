@@ -627,22 +627,20 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
     if sleep_inhibited:
         logger.log("Windows sleep prevention enabled for this transfer.")
 
-    adb_cache_count_matches = False
     if adb_cache:
         cached_source_count = adb_cache.active_file_count_under_root(
             settings.source_root,
             algo=hash_settings.hash_algo,
             mode=hash_settings.hash_mode,
         )
-        adb_cache_count_matches = cached_source_count == len(source_files)
+        # Reported, never used as a decision. Each phone file is looked up
+        # individually and its cached hash is accepted only while size and
+        # timestamp still match; a matching total says nothing about whether
+        # the same files are present.
         logger.log(
-            f"ADB cache source count: {cached_source_count} cached file(s), "
-            f"{len(source_files)} file(s) currently present."
+            f"ADB cache holds {cached_source_count} entry(s) for this folder; "
+            f"{len(source_files)} file(s) are present. Each is validated individually."
         )
-        if adb_cache_count_matches:
-            logger.log("ADB cache count matches the recursive source scan. Cached phone hashes will be used.")
-        else:
-            logger.log("ADB cache count differs from the recursive source scan. New or changed phone files will be hashed.")
     
     dest_time = time.time()
     logger.log(f"Scanning Compare Folder: {compare_root}")
@@ -665,72 +663,61 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
     # confirmed against a real file rather than against the digest alone.
     dest_hash_paths = {}
     total_dest = len(dest_files)
-    cache_count_matches = False
+    # There is deliberately no count-based shortcut here. Comparing the number
+    # of cached entries with the number of files on disk says nothing about
+    # whether they are the same files: deleting one file and adding another
+    # leaves the count identical, and the surviving stale hash then made a
+    # source file look like an existing copy, so it was skipped and never
+    # imported. The per-file lookup below already returns a cached hash without
+    # re-reading the file whenever size and timestamp still match, so the
+    # shortcut bought nothing and only removed the validation.
+    cache_hits = 0
     if drive_cache:
-        cached_count = drive_cache.active_file_count_under_root(
-            compare_root,
-            algo=compare_scan_settings.hash_algo,
-            mode=compare_scan_settings.hash_mode,
-        )
-        cache_count_matches = cached_count == total_dest
-        logger.log(f"Drive cache compare count: {cached_count} cached file(s), {total_dest} file(s) currently present.")
-
-    if drive_cache and cache_count_matches:
-        cached_entries = drive_cache.entries_under_root(
-            compare_root,
-            algo=compare_scan_settings.hash_algo,
-            mode=compare_scan_settings.hash_mode,
-        )
-        dest_hashes = {entry["hash"] for entry in cached_entries if entry.get("hash")}
-        for entry in cached_entries:
-            if entry.get("hash") and entry.get("path"):
-                dest_hash_paths.setdefault(entry["hash"], entry["path"])
-        logger.log(f"Drive cache count matches compare folder. Using {len(dest_hashes)} cached hash(es); destination hashing skipped.")
-        if progress_callback:
-            progress_callback(1, 1, f"Using drive cache: {total_dest} compare files")
+        logger.log(f"Validating {total_dest} compare file(s) against cached size and timestamp.")
     else:
+        logger.log("Hashing compare-folder files to build duplicate comparison data.")
+    for i, f in enumerate(dest_files):
+        if stop_event.is_set(): break
+        cached = None
         if drive_cache:
-            logger.log("Drive cache count does not match compare folder. Hashing compare-folder files to refresh usable cache data.")
-        else:
-            logger.log("Hashing compare-folder files to build duplicate comparison data.")
-        for i, f in enumerate(dest_files):
-            if stop_event.is_set(): break
-            cached = None
-            if drive_cache:
-                cached = drive_cache.get_valid_hash(
-                    f.path,
-                    compare_scan_settings.hash_algo,
-                    compare_scan_settings.hash_mode,
-                    f.size,
-                    f.created,
-                )
-            try:
-                h = cached or compute_hash(
-                    f.path,
-                    compare_scan_settings,
-                    stop_event,
-                    hash_cache,
-                    is_adb=False,
-                    logger=logger,
-                )
-            except HashCancelled:
-                break
-            if h and drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
-                drive_cache.set_file_hash(
-                    f.path,
-                    f.size,
-                    f.created,
-                    h,
-                    compare_scan_settings.hash_algo,
-                    compare_scan_settings.hash_mode,
-                    root=compare_root,
-                )
-            if h:
-                dest_hashes.add(h)
-                dest_hash_paths.setdefault(h, f.path)
-            if progress_callback: progress_callback(i + 1, total_dest, f"Building destination cache... {i + 1}/{total_dest}")
-        if drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
-            drive_cache.mark_missing_under_root(compare_root, [f.path for f in dest_files])
+            cached = drive_cache.get_valid_hash(
+                f.path,
+                compare_scan_settings.hash_algo,
+                compare_scan_settings.hash_mode,
+                f.size,
+                f.created,
+            )
+            if cached:
+                cache_hits += 1
+        try:
+            h = cached or compute_hash(
+                f.path,
+                compare_scan_settings,
+                stop_event,
+                hash_cache,
+                is_adb=False,
+                logger=logger,
+            )
+        except HashCancelled:
+            break
+        if h and drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
+            drive_cache.set_file_hash(
+                f.path,
+                f.size,
+                f.created,
+                h,
+                compare_scan_settings.hash_algo,
+                compare_scan_settings.hash_mode,
+                root=compare_root,
+            )
+        if h:
+            dest_hashes.add(h)
+            dest_hash_paths.setdefault(h, f.path)
+        if progress_callback: progress_callback(i + 1, total_dest, f"Building destination cache... {i + 1}/{total_dest}")
+    if drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
+        drive_cache.mark_missing_under_root(compare_root, [f.path for f in dest_files])
+    if drive_cache:
+        logger.log(f"Drive cache served {cache_hits} of {total_dest} compare hash(es); the rest were read.")
 
     logger.log("Processing Source Files. Please wait...")
     logger.log(f"Copy Target Folder: {output_root}")
@@ -741,6 +728,9 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         "and copied using their relative source paths."
     )
     transferred, isolated, skipped, transfer_errors = 0, 0, 0, 0
+    # Counted apart from duplicates: these files are unique and were simply not
+    # copied because the destination name was already taken.
+    conflict_skipped = 0
     bytes_transferred = 0
     resumed = 0
     failures = []
@@ -961,7 +951,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
             conflict_policy = getattr(settings, "conflict_policy", "rename")
             target_path = resolve_conflict_path(target_path, conflict_policy)
             if not target_path:
-                skipped += 1
+                conflict_skipped += 1
                 logger.log(f"SKIPPED existing target due to conflict policy: {f.path}")
                 continue
             if not settings.dry_run:
@@ -996,7 +986,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                             )
                             partial_path = ""
                         if not target_path:
-                            skipped += 1
+                            conflict_skipped += 1
                             logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")
                             continue
                         if not staged_path:
@@ -1016,7 +1006,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                         )
                         partial_path = ""
                         if not target_path:
-                            skipped += 1
+                            conflict_skipped += 1
                             logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")
                             continue
                         if os.path.getsize(target_path) != f.size:
@@ -1159,7 +1149,11 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         "transferred": transferred,
         "duplicates": isolated + skipped,
         "isolated": isolated,
-        "skipped": skipped,
+        "skipped": skipped + conflict_skipped,
+        # A unique file that was not copied because its target name was taken
+        # is not a duplicate. Counting it as one told the user the file was
+        # already in their library when it had never been imported.
+        "conflict_skipped": conflict_skipped,
         "resumed": resumed,
         "errors": transfer_errors,
         "bytes_transferred": bytes_transferred,

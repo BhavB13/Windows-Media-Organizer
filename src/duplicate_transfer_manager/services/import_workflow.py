@@ -187,7 +187,7 @@ def format_transfer_bytes(value: int) -> str:
 def summarize_transfer_result(result) -> dict[str, str]:
     raw = result.data.get("engine_result", {}) if hasattr(result, "data") else {}
     bytes_copied = int(raw.get("bytes_transferred", 0) or raw.get("transferred_bytes", 0) or 0)
-    return {
+    summary = {
         "New files copied": str(result.counts.get("transferred", 0)),
         "Duplicates skipped": str(result.counts.get("duplicates", 0)),
         "Files resumed": str(result.counts.get("resumed", 0)),
@@ -195,6 +195,13 @@ def summarize_transfer_result(result) -> dict[str, str]:
         "Data transferred": format_transfer_bytes(bytes_copied),
         "Report location": result.report_path or "Not written for this run",
     }
+    # Shown only when it happened, and named for what it is. These files are
+    # unique and were not imported; folding them into "Duplicates skipped" told
+    # the user they were already in the library.
+    conflict_skipped = int(raw.get("conflict_skipped", 0) or 0)
+    if conflict_skipped:
+        summary["Not copied, name already taken"] = str(conflict_skipped)
+    return summary
 
 
 def classify_transfer_stage(message: str) -> str:

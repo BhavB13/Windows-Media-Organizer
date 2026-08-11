@@ -560,6 +560,101 @@ class EngineTests(unittest.TestCase):
                 finally:
                     ctypes.windll.kernel32.SetFileAttributesW(str(visible), 0x80)
 
+    def test_conflict_skips_are_not_counted_as_duplicates(self):
+        # A unique file that was not copied because its target name was taken
+        # was counted as a duplicate and shown as "Duplicates skipped", telling
+        # the user it was already in their library when it was never imported.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source_root = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source_root, library, output):
+                os.makedirs(path)
+
+            # Unique content, but the destination name is already occupied.
+            with open(os.path.join(source_root, "photo.jpg"), "wb") as handle:
+                handle.write(b"the source file")
+            with open(os.path.join(output, "photo.jpg"), "wb") as handle:
+                handle.write(b"an unrelated file already there")
+
+            settings = TransferSettings(
+                source_root=source_root, dest_root=library, output_root=output,
+                criteria="hash", hash_algo="sha256", hash_mode="full", only_media=False,
+                extensions=[], min_size_kb=0, exclude_dirs=[], skip_hidden_system=False,
+                dry_run=False, preserve_structure=True, max_hash_workers=1,
+                transfer_mode="copy", duplicate_policy="skip", use_dest_cache=False,
+                source_is_adb=False, update_drive_cache=False, use_adb_cache=False,
+                conflict_policy="skip",
+            )
+            result = engine_module.execute_smart_transfer(
+                settings, threading.Event(), HashCache(os.path.join(root, "cache.json")), DummyLogger()
+            )
+
+            self.assertEqual(result["transferred"], 0)
+            self.assertEqual(result["conflict_skipped"], 1)
+            self.assertEqual(result["duplicates"], 0, "a name conflict is not a duplicate")
+            self.assertEqual(result["skipped"], 1)
+
+    def test_stale_drive_cache_entry_does_not_skip_a_new_file(self):
+        # The compare phase used to take a shortcut whenever the number of
+        # cached entries equalled the number of files on disk. Deleting one
+        # file and adding another keeps that count identical, so the deleted
+        # file's hash survived in the cache and a source file matching it was
+        # skipped as an existing copy and never imported.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source_root = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source_root, library, output):
+                os.makedirs(path)
+
+            gone = os.path.join(library, "was_here.bin")
+            with open(gone, "wb") as handle:
+                handle.write(b"content-that-left")
+            replacement = os.path.join(library, "arrived.bin")
+
+            cache_path = os.path.join(root, "drive_cache.json")
+            cache = DriveHashCache(cache_path)
+            cache.load()
+            cache.set_file_hash(
+                gone,
+                os.path.getsize(gone),
+                os.path.getmtime(gone),
+                hashlib.sha256(b"content-that-left").hexdigest(),
+                "sha256",
+                "full",
+                root=library,
+            )
+            cache.save()
+
+            # The library now holds a different file: same count, different contents.
+            os.remove(gone)
+            with open(replacement, "wb") as handle:
+                handle.write(b"something-else-entirely")
+
+            # The source carries the very file the cache still vouches for.
+            incoming = os.path.join(source_root, "was_here.bin")
+            with open(incoming, "wb") as handle:
+                handle.write(b"content-that-left")
+
+            settings = TransferSettings(
+                source_root=source_root, dest_root=library, output_root=output,
+                criteria="hash", hash_algo="sha256", hash_mode="full", only_media=False,
+                extensions=[], min_size_kb=0, exclude_dirs=[], skip_hidden_system=False,
+                dry_run=False, preserve_structure=True, max_hash_workers=1,
+                transfer_mode="copy", duplicate_policy="skip", use_dest_cache=True,
+                source_is_adb=False, update_drive_cache=False, use_adb_cache=False,
+                drive_cache_path=cache_path,
+            )
+            result = engine_module.execute_smart_transfer(
+                settings, threading.Event(), HashCache(os.path.join(root, "cache.json")), DummyLogger()
+            )
+
+            self.assertEqual(result["transferred"], 1, "a file absent from the library must still be imported")
+            self.assertTrue(os.path.exists(os.path.join(output, "was_here.bin")))
+
     def test_fast_import_does_not_skip_a_file_that_only_matches_a_sampled_hash(self):
         # Fast hashing covers size + first and last 1 MiB. Two different large
         # files can share that digest, and skipping the import on that basis
@@ -1668,7 +1763,7 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(result["duplicates"], 1)
             self.assertEqual(result["skipped"], 1)
 
-    def test_smart_transfer_skips_compare_hashing_when_cache_count_matches(self):
+    def test_smart_transfer_reuses_a_valid_cached_compare_hash_without_rereading(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source_root = os.path.join(temp_dir, "source")
             compare_root = os.path.join(temp_dir, "Pictures")
@@ -1736,7 +1831,11 @@ class EngineTests(unittest.TestCase):
 
             self.assertEqual(result["transferred"], 0)
             self.assertEqual(result["duplicates"], 1)
-            self.assertTrue(any("destination hashing skipped" in message for message in logger.messages))
+            # The guard above already proves the compare file was never
+            # re-read. What matters is that a cache entry still vouched for by
+            # size and mtime is reused; the previous count-based shortcut that
+            # skipped validation entirely is gone.
+            self.assertTrue(any("Drive cache served 1 of 1" in message for message in logger.messages))
 
     def test_smart_transfer_updates_drive_cache_after_copy(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1861,9 +1960,11 @@ class EngineTests(unittest.TestCase):
                     logger,
                 )
 
+            # The real guarantee: a cached phone hash still vouched for by size
+            # and timestamp means the device is never asked to hash again.
             remote_hash.assert_not_called()
             self.assertEqual(result["duplicates"], 1)
-            self.assertTrue(any("ADB cache count matches" in message for message in logger.messages))
+            self.assertTrue(any("validated individually" in message for message in logger.messages))
 
 
 if __name__ == "__main__":
