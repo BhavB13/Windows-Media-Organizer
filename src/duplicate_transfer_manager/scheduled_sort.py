@@ -9,6 +9,23 @@ from .services import OperationRecordService
 from .sorting import SortExecutionControl, SortExecutor, SortMonitorService, SortPlanner, SortingProfileStore
 
 
+_TERMINAL_STATUSES = frozenset({"completed", "ignored", "skipped", "previewed"})
+
+
+def _handled_sources(executor: SortExecutor, result) -> list[str]:
+    """Source paths whose sorting record reached a terminal, non-failed status."""
+
+    try:
+        journal = executor.load_run(result.run_id)
+    except Exception:  # noqa: BLE001 - an unreadable journal must not retire files
+        return []
+    return [
+        str(record.get("source", ""))
+        for record in journal.get("records", [])
+        if record.get("status") in _TERMINAL_STATUSES and record.get("source")
+    ]
+
+
 def run_scheduled_sort(profile_id: str, monitor_id: str, *, data_root: str = "") -> int:
     paths = get_runtime_paths(data_root or None)
     records = OperationRecordService(paths)
@@ -19,16 +36,24 @@ def run_scheduled_sort(profile_id: str, monitor_id: str, *, data_root: str = "")
         monitor = next((value for value in profile.monitored_folders if value.id == monitor_id), None)
         if monitor is None:
             raise ValueError("Monitored folder is unavailable.")
-        changed = SortMonitorService(paths).poll(monitor)
-        plan = SortPlanner(paths).build(profile, changed, sources=[monitor.path], dry_run=monitor.dry_run)
+        monitor_service = SortMonitorService(paths)
+        poll = monitor_service.poll(monitor)
+        plan = SortPlanner(paths).build(profile, poll.changed, sources=[monitor.path], dry_run=monitor.dry_run)
         approved = [
             item.metadata.path for item in plan.items
             if not item.requires_review and item.conflict not in {"review", "duplicate_operation", "self"}
         ]
-        result = SortExecutor(paths).execute(
+        executor = SortExecutor(paths)
+        result = executor.execute(
             plan, approved_sources=approved, confirmed=monitor.live_approved,
             control=SortExecutionControl(), retry_attempts=1,
         )
+        # Only now, and only for files that actually reached a terminal status.
+        # The snapshot used to be written by poll() before any of this ran, so a
+        # planner or executor failure -- swallowed by the except below into a
+        # single "failed" row -- silently retired the change set and no future
+        # run would ever see those files again.
+        monitor_service.commit(monitor.id, poll, handled_paths=_handled_sources(executor, result))
         records.record(
             "scheduled_sort", "warning" if result.failed else "completed", title="Scheduled Sort Files run",
             counts={"completed": result.completed, "skipped": result.skipped, "errors": result.failed, "verified": result.verified},

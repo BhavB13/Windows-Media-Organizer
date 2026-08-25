@@ -601,12 +601,26 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         for unreadable_path in source_discovery.get("unreadable", [])[:20]:
             logger.log(f"WARNING: Source file could not be read: {unreadable_path}")
 
+    # Built before the preflight rather than after it: the free-space check has
+    # to know which sources the journal already completed, or a resume is
+    # hard-blocked precisely when the destination is nearly full.
+    journal = None
+    if not settings.dry_run:
+        journal_path = getattr(settings, "journal_path", "").strip() or default_journal_path(
+            output_root, getattr(settings, "adb_serial", "") or "local"
+        )
+        journal = TransferJournal(journal_path)
+        logger.log(f"Resume journal: {journal_path}")
+    verify_resumed_files = bool(getattr(settings, "verify_resumed_files", False))
+
     preflight_errors, preflight_warnings = preflight_transfer(
         output_root,
         source_files,
         is_adb=getattr(settings, "source_is_adb", False),
         serial=getattr(settings, "adb_serial", ""),
         verify_write=not settings.dry_run,
+        journal=journal,
+        verify_resumed=verify_resumed_files,
     )
     for warning in preflight_warnings:
         logger.log(f"WARNING: Preflight: {warning}")
@@ -627,462 +641,538 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
     if sleep_inhibited:
         logger.log("Windows sleep prevention enabled for this transfer.")
 
-    if adb_cache:
-        cached_source_count = adb_cache.active_file_count_under_root(
-            settings.source_root,
-            algo=hash_settings.hash_algo,
-            mode=hash_settings.hash_mode,
-        )
-        # Reported, never used as a decision. Each phone file is looked up
-        # individually and its cached hash is accepted only while size and
-        # timestamp still match; a matching total says nothing about whether
-        # the same files are present.
-        logger.log(
-            f"ADB cache holds {cached_source_count} entry(s) for this folder; "
-            f"{len(source_files)} file(s) are present. Each is validated individually."
-        )
-    
-    dest_time = time.time()
-    logger.log(f"Scanning Compare Folder: {compare_root}")
-    if progress_callback: progress_callback(0, 0, "Discovering compare-folder files... 0 found")
-    
-    dest_files = []
-    compare_progress = _transfer_discovery_progress("Compare scan", dest_time, progress_callback)
-    for count, f in enumerate(iter_files(compare_root, compare_scan_settings, stop_event, compare_progress, logger), 1):
-        dest_files.append(f)
-        if count % 25 == 0 and progress_callback:
-            elapsed = int(time.time() - dest_time)
-            progress_callback(0, 0, f"Scanning Compare: {count} files found ({elapsed}s)")
-
-    if progress_callback:
-        progress_callback(0, 0, f"Scanning Compare: {len(dest_files)} files found")
-    
-    dest_hashes = set()
-    # One representative destination per digest. A sampled "fast" digest is
-    # only a shortlist, so skipping a source as an existing duplicate has to be
-    # confirmed against a real file rather than against the digest alone.
-    dest_hash_paths = {}
-    total_dest = len(dest_files)
-    # There is deliberately no count-based shortcut here. Comparing the number
-    # of cached entries with the number of files on disk says nothing about
-    # whether they are the same files: deleting one file and adding another
-    # leaves the count identical, and the surviving stale hash then made a
-    # source file look like an existing copy, so it was skipped and never
-    # imported. The per-file lookup below already returns a cached hash without
-    # re-reading the file whenever size and timestamp still match, so the
-    # shortcut bought nothing and only removed the validation.
-    cache_hits = 0
-    if drive_cache:
-        logger.log(f"Validating {total_dest} compare file(s) against cached size and timestamp.")
-    else:
-        logger.log("Hashing compare-folder files to build duplicate comparison data.")
-    for i, f in enumerate(dest_files):
-        if stop_event.is_set(): break
-        cached = None
-        if drive_cache:
-            cached = drive_cache.get_valid_hash(
-                f.path,
-                compare_scan_settings.hash_algo,
-                compare_scan_settings.hash_mode,
-                f.size,
-                f.created,
-            )
-            if cached:
-                cache_hits += 1
-        try:
-            h = cached or compute_hash(
-                f.path,
-                compare_scan_settings,
-                stop_event,
-                hash_cache,
-                is_adb=False,
-                logger=logger,
-            )
-        except HashCancelled:
-            break
-        if h and drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
-            drive_cache.set_file_hash(
-                f.path,
-                f.size,
-                f.created,
-                h,
-                compare_scan_settings.hash_algo,
-                compare_scan_settings.hash_mode,
-                root=compare_root,
-            )
-        if h:
-            dest_hashes.add(h)
-            dest_hash_paths.setdefault(h, f.path)
-        if progress_callback: progress_callback(i + 1, total_dest, f"Building destination cache... {i + 1}/{total_dest}")
-    if drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
-        drive_cache.mark_missing_under_root(compare_root, [f.path for f in dest_files])
-    if drive_cache:
-        logger.log(f"Drive cache served {cache_hits} of {total_dest} compare hash(es); the rest were read.")
-
-    logger.log("Processing Source Files. Please wait...")
-    logger.log(f"Copy Target Folder: {output_root}")
-    logger.log(f"Source files discovered: {len(source_files)}")
-    logger.log(f"Compare-folder files discovered: {len(dest_files)}")
-    logger.log(
-        "Structure-aware sync is enabled. Files are compared recursively across all subfolders "
-        "and copied using their relative source paths."
-    )
-    transferred, isolated, skipped, transfer_errors = 0, 0, 0, 0
-    # Counted apart from duplicates: these files are unique and were simply not
-    # copied because the destination name was already taken.
-    conflict_skipped = 0
-    bytes_transferred = 0
-    resumed = 0
+    # Every counter the summary and the teardown need, initialised before the
+    # try so an early failure still produces a result instead of a traceback.
+    transferred = isolated = skipped = transfer_errors = 0
+    conflict_skipped = bytes_transferred = resumed = 0
     failures = []
     adb_device_failed = False
-    total_src = len(source_files)
-    total_bytes = sum(f.size for f in source_files)
-    source_byte_offsets = []
-    byte_offset = 0
-    for source_info in source_files:
-        source_byte_offsets.append(byte_offset)
-        byte_offset += source_info.size
-    journal = None
-    if not settings.dry_run:
-        journal_path = getattr(settings, "journal_path", "").strip() or default_journal_path(
-            output_root, getattr(settings, "adb_serial", "") or "local"
-        )
-        journal = TransferJournal(journal_path)
-        logger.log(f"Resume journal: {journal_path}")
-    verify_resumed_files = bool(getattr(settings, "verify_resumed_files", False))
-    batched_source_hashes = {}
-    uses_staged_import = (
-        getattr(settings, "source_is_adb", False)
-        and getattr(settings, "transfer_profile", "Balanced") in ("Balanced", "Fast")
-        and not settings.dry_run
-    )
-    if getattr(settings, "source_is_adb", False) and not uses_staged_import:
-        # Staged imports hash the local copy after pulling, so batching would
-        # add an entire extra device-side read. Only the profiles that hash on
-        # the phone benefit from grouping those calls.
-        pending_device_hashes = [
-            source_info
-            for source_info in source_files
-            if not (
-                adb_cache
-                and adb_cache.get_valid_hash(
-                    source_info.path,
-                    hash_settings.hash_algo,
-                    hash_settings.hash_mode,
-                    source_info.size,
-                    source_info.created,
-                )
-            )
-        ]
-        batched_source_hashes = batch_adb_hashes(pending_device_hashes, hash_settings, stop_event, logger)
+    dest_files = []
     previous_stay_awake = None
-    if getattr(settings, "source_is_adb", False) and getattr(settings, "keep_device_awake", True):
-        previous_stay_awake = ADBBridge.enable_usb_stay_awake(getattr(settings, "adb_serial", ""))
-        logger.log("ADB USB keep-awake enabled for this transfer.")
-    
     dup_folder_counts = {}
     transferred_folder_counts = {}
 
-    for i, f in enumerate(source_files):
-        if stop_event.is_set(): break
-        filename = os.path.basename(f.path)
-        bytes_before = source_byte_offsets[i]
-        staged_path = ""
-        partial_path = ""
-        if journal and journal.is_complete(f.path, f.size, verify_resumed_files):
-            resumed += 1
-            if resumed == 1 or resumed % 100 == 0:
-                logger.log(
-                    f"RESUME: {resumed} previously completed file(s) verified by "
-                    f"{'full content' if verify_resumed_files else 'size and timestamp'}."
-                )
-            continue
-        if progress_callback:
-            progress_callback(i, total_src, f"Checking {i}/{total_src}: {filename[:20]} | Copied {transferred}")
-        
-        h = None
-        if adb_cache and f.is_adb:
-            h = adb_cache.get_valid_hash(
-                f.path,
-                hash_settings.hash_algo,
-                hash_settings.hash_mode,
-                f.size,
-                f.created,
+    try:
+        if adb_cache:
+            cached_source_count = adb_cache.active_file_count_under_root(
+                settings.source_root,
+                algo=hash_settings.hash_algo,
+                mode=hash_settings.hash_mode,
             )
-        if not h and f.is_adb:
-            h = batched_source_hashes.get(f.path)
-        if not h:
+            # Reported, never used as a decision. Each phone file is looked up
+            # individually and its cached hash is accepted only while size and
+            # timestamp still match; a matching total says nothing about whether
+            # the same files are present.
+            logger.log(
+                f"ADB cache holds {cached_source_count} entry(s) for this folder; "
+                f"{len(source_files)} file(s) are present. Each is validated individually."
+            )
+    
+        dest_time = time.time()
+        logger.log(f"Scanning Compare Folder: {compare_root}")
+        if progress_callback: progress_callback(0, 0, "Discovering compare-folder files... 0 found")
+    
+        dest_files = []
+        compare_progress = _transfer_discovery_progress("Compare scan", dest_time, progress_callback)
+        for count, f in enumerate(iter_files(compare_root, compare_scan_settings, stop_event, compare_progress, logger), 1):
+            dest_files.append(f)
+            if count % 25 == 0 and progress_callback:
+                elapsed = int(time.time() - dest_time)
+                progress_callback(0, 0, f"Scanning Compare: {count} files found ({elapsed}s)")
+
+        if progress_callback:
+            progress_callback(0, 0, f"Scanning Compare: {len(dest_files)} files found")
+    
+        dest_hashes = set()
+        # One representative destination per digest. A sampled "fast" digest is
+        # only a shortlist, so skipping a source as an existing duplicate has to be
+        # confirmed against a real file rather than against the digest alone.
+        dest_hash_paths = {}
+        total_dest = len(dest_files)
+        # There is deliberately no count-based shortcut here. Comparing the number
+        # of cached entries with the number of files on disk says nothing about
+        # whether they are the same files: deleting one file and adding another
+        # leaves the count identical, and the surviving stale hash then made a
+        # source file look like an existing copy, so it was skipped and never
+        # imported. The per-file lookup below already returns a cached hash without
+        # re-reading the file whenever size and timestamp still match, so the
+        # shortcut bought nothing and only removed the validation.
+        cache_hits = 0
+        if drive_cache:
+            logger.log(f"Validating {total_dest} compare file(s) against cached size and timestamp.")
+        else:
+            logger.log("Hashing compare-folder files to build duplicate comparison data.")
+        for i, f in enumerate(dest_files):
+            if stop_event.is_set(): break
+            cached = None
+            if drive_cache:
+                cached = drive_cache.get_valid_hash(
+                    f.path,
+                    compare_scan_settings.hash_algo,
+                    compare_scan_settings.hash_mode,
+                    f.size,
+                    f.created,
+                )
+                if cached:
+                    cache_hits += 1
             try:
-                single_read_import = (
-                    f.is_adb
-                    and getattr(settings, "transfer_profile", "Balanced") in ("Balanced", "Fast")
-                    and not settings.dry_run
+                h = cached or compute_hash(
+                    f.path,
+                    compare_scan_settings,
+                    stop_event,
+                    hash_cache,
+                    is_adb=False,
+                    logger=logger,
                 )
-                if single_read_import:
-                    stage_key = hashlib.sha256(f.path.encode("utf-8")).hexdigest()
-                    stage_dir = os.path.join(output_root, APP_STAGING_DIRECTORY)
-                    staged_path = os.path.join(stage_dir, f"{stage_key}_{filename}")
-                    pull_with_retries(
-                        f.path,
-                        staged_path,
-                        serial=getattr(settings, "adb_serial", ""),
-                        attempts=getattr(settings, "retry_attempts", 2),
-                        logger=logger,
-                        progress_callback=progress_callback,
-                        expected_size=f.size,
-                        overall_bytes_before=bytes_before,
-                        overall_bytes_total=total_bytes,
-                        reconnect_timeout=getattr(settings, "reconnect_timeout", 300),
-                        stall_timeout=getattr(settings, "stall_timeout", 180),
-                        stop_event=stop_event,
-                        partial_path=f"{staged_path}{APP_PARTIAL_SUFFIX}",
-                    )
-                    h = compute_hash(staged_path, hash_settings, stop_event, hash_cache, False, logger)
-                    if i == 0 or (i + 1) % 25 == 0:
-                        logger.log(
-                            f"{getattr(settings, 'transfer_profile', 'Balanced')} import: "
-                            f"{i + 1}/{total_src} source files processed through single-read staging."
-                        )
-                else:
-                    h = compute_hash(f.path, hash_settings, stop_event, hash_cache, f.is_adb, logger)
             except HashCancelled:
-                if journal:
-                    journal.fail(
-                        f.path,
-                        "Hashing cancelled",
-                        partial_path or (f"{staged_path}{APP_PARTIAL_SUFFIX}" if staged_path else ""),
-                    )
                 break
-            except ADBOperationError:
-                transfer_errors += 1
-                adb_device_failed = True
-                logger.log(
-                    "ERROR: ADB device is unavailable or unauthorized. Transfer stopped. "
-                    "Unlock the phone, reconnect USB debugging, and accept the authorization prompt."
-                )
-                if progress_callback:
-                    progress_callback(i + 1, total_src, "ADB authorization lost; transfer stopped")
-                break
-            except OSError as exc:
-                transfer_errors += 1
-                failures.append({"source": f.path, "error": str(exc)})
-                if journal:
-                    journal.fail(f.path, exc, partial_path or (f"{staged_path}{APP_PARTIAL_SUFFIX}" if staged_path else ""))
-                logger.log(f"WARNING: Single-read import staging failed: {f.path} ({exc})")
-                continue
-            if (
-                h
-                and adb_cache
-                and f.is_adb
-                and getattr(settings, "update_drive_cache", True)
-                and not settings.dry_run
-            ):
-                adb_cache.set_file_hash(
+            if h and drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
+                drive_cache.set_file_hash(
                     f.path,
                     f.size,
                     f.created,
                     h,
+                    compare_scan_settings.hash_algo,
+                    compare_scan_settings.hash_mode,
+                    root=compare_root,
+                )
+            if h:
+                dest_hashes.add(h)
+                dest_hash_paths.setdefault(h, f.path)
+            if progress_callback: progress_callback(i + 1, total_dest, f"Building destination cache... {i + 1}/{total_dest}")
+        if drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
+            drive_cache.mark_missing_under_root(compare_root, [f.path for f in dest_files])
+        if drive_cache:
+            logger.log(f"Drive cache served {cache_hits} of {total_dest} compare hash(es); the rest were read.")
+
+        logger.log("Processing Source Files. Please wait...")
+        logger.log(f"Copy Target Folder: {output_root}")
+        logger.log(f"Source files discovered: {len(source_files)}")
+        logger.log(f"Compare-folder files discovered: {len(dest_files)}")
+        logger.log(
+            "Structure-aware sync is enabled. Files are compared recursively across all subfolders "
+            "and copied using their relative source paths."
+        )
+        transferred, isolated, skipped, transfer_errors = 0, 0, 0, 0
+        # Counted apart from duplicates: these files are unique and were simply not
+        # copied because the destination name was already taken.
+        conflict_skipped = 0
+        bytes_transferred = 0
+        resumed = 0
+        failures = []
+        adb_device_failed = False
+        total_src = len(source_files)
+        total_bytes = sum(f.size for f in source_files)
+        source_byte_offsets = []
+        byte_offset = 0
+        for source_info in source_files:
+            source_byte_offsets.append(byte_offset)
+            byte_offset += source_info.size
+        batched_source_hashes = {}
+        uses_staged_import = (
+            getattr(settings, "source_is_adb", False)
+            and getattr(settings, "transfer_profile", "Balanced") in ("Balanced", "Fast")
+            and not settings.dry_run
+        )
+        if getattr(settings, "source_is_adb", False) and not uses_staged_import:
+            # Staged imports hash the local copy after pulling, so batching would
+            # add an entire extra device-side read. Only the profiles that hash on
+            # the phone benefit from grouping those calls.
+            pending_device_hashes = [
+                source_info
+                for source_info in source_files
+                if not (
+                    adb_cache
+                    and adb_cache.get_valid_hash(
+                        source_info.path,
+                        hash_settings.hash_algo,
+                        hash_settings.hash_mode,
+                        source_info.size,
+                        source_info.created,
+                    )
+                )
+            ]
+            batched_source_hashes = batch_adb_hashes(pending_device_hashes, hash_settings, stop_event, logger)
+        previous_stay_awake = None
+        if getattr(settings, "source_is_adb", False) and getattr(settings, "keep_device_awake", True):
+            previous_stay_awake = ADBBridge.enable_usb_stay_awake(getattr(settings, "adb_serial", ""))
+            logger.log("ADB USB keep-awake enabled for this transfer.")
+    
+        dup_folder_counts = {}
+        transferred_folder_counts = {}
+
+        for i, f in enumerate(source_files):
+            if stop_event.is_set(): break
+            filename = os.path.basename(f.path)
+            bytes_before = source_byte_offsets[i]
+            staged_path = ""
+            partial_path = ""
+            if journal and journal.is_complete(f.path, f.size, verify_resumed_files):
+                resumed += 1
+                if resumed == 1 or resumed % 100 == 0:
+                    logger.log(
+                        f"RESUME: {resumed} previously completed file(s) verified by "
+                        f"{'full content' if verify_resumed_files else 'size and timestamp'}."
+                    )
+                continue
+            if progress_callback:
+                progress_callback(i, total_src, f"Checking {i}/{total_src}: {filename[:20]} | Copied {transferred}")
+        
+            h = None
+            if adb_cache and f.is_adb:
+                h = adb_cache.get_valid_hash(
+                    f.path,
                     hash_settings.hash_algo,
                     hash_settings.hash_mode,
-                    root=settings.source_root,
+                    f.size,
+                    f.created,
                 )
-        if not h:
-            if staged_path:
+            if not h and f.is_adb:
+                h = batched_source_hashes.get(f.path)
+            if not h:
                 try:
-                    os.remove(staged_path)
-                except OSError:
-                    pass
-            transfer_errors += 1
-            logger.log(f"WARNING: Skipping file because a comparison hash could not be read: {f.path}")
-            failures.append({"source": f.path, "error": "Comparison hash could not be read"})
-            if journal:
-                journal.fail(f.path, "Comparison hash could not be read")
-            continue
+                    single_read_import = (
+                        f.is_adb
+                        and getattr(settings, "transfer_profile", "Balanced") in ("Balanced", "Fast")
+                        and not settings.dry_run
+                    )
+                    if single_read_import:
+                        stage_key = hashlib.sha256(f.path.encode("utf-8")).hexdigest()
+                        stage_dir = os.path.join(output_root, APP_STAGING_DIRECTORY)
+                        staged_path = os.path.join(stage_dir, f"{stage_key}_{filename}")
+                        pull_with_retries(
+                            f.path,
+                            staged_path,
+                            serial=getattr(settings, "adb_serial", ""),
+                            attempts=getattr(settings, "retry_attempts", 2),
+                            logger=logger,
+                            progress_callback=progress_callback,
+                            expected_size=f.size,
+                            overall_bytes_before=bytes_before,
+                            overall_bytes_total=total_bytes,
+                            reconnect_timeout=getattr(settings, "reconnect_timeout", 300),
+                            stall_timeout=getattr(settings, "stall_timeout", 180),
+                            stop_event=stop_event,
+                            partial_path=f"{staged_path}{APP_PARTIAL_SUFFIX}",
+                        )
+                        h = compute_hash(staged_path, hash_settings, stop_event, hash_cache, False, logger)
+                        if i == 0 or (i + 1) % 25 == 0:
+                            logger.log(
+                                f"{getattr(settings, 'transfer_profile', 'Balanced')} import: "
+                                f"{i + 1}/{total_src} source files processed through single-read staging."
+                            )
+                    else:
+                        h = compute_hash(f.path, hash_settings, stop_event, hash_cache, f.is_adb, logger)
+                except HashCancelled:
+                    if journal:
+                        journal.fail(
+                            f.path,
+                            "Hashing cancelled",
+                            partial_path or (f"{staged_path}{APP_PARTIAL_SUFFIX}" if staged_path else ""),
+                        )
+                    break
+                except ADBOperationError:
+                    transfer_errors += 1
+                    adb_device_failed = True
+                    logger.log(
+                        "ERROR: ADB device is unavailable or unauthorized. Transfer stopped. "
+                        "Unlock the phone, reconnect USB debugging, and accept the authorization prompt."
+                    )
+                    if progress_callback:
+                        progress_callback(i + 1, total_src, "ADB authorization lost; transfer stopped")
+                    break
+                except OSError as exc:
+                    transfer_errors += 1
+                    failures.append({"source": f.path, "error": str(exc)})
+                    if journal:
+                        journal.fail(f.path, exc, partial_path or (f"{staged_path}{APP_PARTIAL_SUFFIX}" if staged_path else ""))
+                    logger.log(f"WARNING: Single-read import staging failed: {f.path} ({exc})")
+                    continue
+                if (
+                    h
+                    and adb_cache
+                    and f.is_adb
+                    and getattr(settings, "update_drive_cache", True)
+                    and not settings.dry_run
+                ):
+                    adb_cache.set_file_hash(
+                        f.path,
+                        f.size,
+                        f.created,
+                        h,
+                        hash_settings.hash_algo,
+                        hash_settings.hash_mode,
+                        root=settings.source_root,
+                    )
+            if not h:
+                if staged_path:
+                    try:
+                        os.remove(staged_path)
+                    except OSError:
+                        pass
+                transfer_errors += 1
+                logger.log(f"WARNING: Skipping file because a comparison hash could not be read: {f.path}")
+                failures.append({"source": f.path, "error": "Comparison hash could not be read"})
+                if journal:
+                    journal.fail(f.path, "Comparison hash could not be read")
+                continue
         
-        is_duplicate = h in dest_hashes
-        if is_duplicate and hash_settings.hash_mode == "fast" and not f.is_adb:
-            # A sampled match is a shortlist entry, not proof. Confirm against
-            # the real destination file before skipping the import.
-            if not confirm_duplicate_by_content(
-                f.path, dest_hash_paths.get(h, ""), hash_settings, stop_event, hash_cache, logger
-            ):
-                is_duplicate = False
-                logger.log(
-                    f"Sampled hash matched but full contents differ; importing anyway: {f.path}"
-                )
-        if is_duplicate:
-            if staged_path:
-                try:
-                    os.remove(staged_path)
-                except OSError:
-                    pass
-            folder = os.path.dirname(f.path)
-            dup_folder_counts[folder] = dup_folder_counts.get(folder, 0) + 1
+            is_duplicate = h in dest_hashes
+            if is_duplicate and hash_settings.hash_mode == "fast" and not f.is_adb:
+                # A sampled match is a shortlist entry, not proof. Confirm against
+                # the real destination file before skipping the import.
+                if not confirm_duplicate_by_content(
+                    f.path, dest_hash_paths.get(h, ""), hash_settings, stop_event, hash_cache, logger
+                ):
+                    is_duplicate = False
+                    logger.log(
+                        f"Sampled hash matched but full contents differ; importing anyway: {f.path}"
+                    )
+            if is_duplicate:
+                if staged_path:
+                    try:
+                        os.remove(staged_path)
+                    except OSError:
+                        pass
+                folder = os.path.dirname(f.path)
+                dup_folder_counts[folder] = dup_folder_counts.get(folder, 0) + 1
             
-            if settings.duplicate_policy == "isolate" and settings.isolate_folder:
-                os.makedirs(settings.isolate_folder, exist_ok=True)
-                target_path = ensure_unique_path(os.path.join(settings.isolate_folder, filename))
+                if settings.duplicate_policy == "isolate" and settings.isolate_folder:
+                    os.makedirs(settings.isolate_folder, exist_ok=True)
+                    target_path = ensure_unique_path(os.path.join(settings.isolate_folder, filename))
+                    if not settings.dry_run:
+                        try:
+                            if f.is_adb:
+                                ADBBridge.pull(f.path, target_path, serial=getattr(settings, "adb_serial", ""))
+                            else:
+                                shutil.copy2(f.path, target_path)
+                        except (OSError, shutil.Error, subprocess.CalledProcessError, ADBOperationError) as exc:
+                            logger.log(f"WARNING: Failed to isolate duplicate: {f.path} -> {target_path} ({exc})")
+                            transfer_errors += 1
+                            if isinstance(exc, ADBOperationError) and exc.device_unavailable:
+                                adb_device_failed = True
+                            continue
+                    isolated += 1
+                else:
+                    skipped += 1
+            else:
+                target_path = build_target_path(
+                    f.path,
+                    settings.source_root,
+                    output_root,
+                    hash_settings.preserve_structure,
+                    is_adb=f.is_adb,
+                    avoid_collisions=False,
+                    destination_template=getattr(settings, "destination_template", "preserve"),
+                    source_timestamp=f.created,
+                )
+                conflict_policy = getattr(settings, "conflict_policy", "rename")
+                target_path = resolve_conflict_path(target_path, conflict_policy)
+                if not target_path:
+                    # A staged import has already pulled the whole file to the
+                    # staging directory by this point. Every other exit removes it;
+                    # this one used to leak a full copy per skipped file, which then
+                    # made the os.rmdir of the staging directory fail silently.
+                    if staged_path:
+                        try:
+                            os.remove(staged_path)
+                        except OSError as exc:
+                            logger.log(f"WARNING: Could not remove staged copy {staged_path}: {exc}")
+                    conflict_skipped += 1
+                    logger.log(f"SKIPPED existing target due to conflict policy: {f.path}")
+                    continue
                 if not settings.dry_run:
+                    replaced_backup = ""
                     try:
                         if f.is_adb:
-                            ADBBridge.pull(f.path, target_path, serial=getattr(settings, "adb_serial", ""))
+                            if staged_path:
+                                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                                target_path, replaced_backup = promote_transfer_file(
+                                    staged_path, target_path, conflict_policy, output_root
+                                )
+                            else:
+                                partial_path = transfer_staging_path(output_root, target_path, "adb")
+                                pulled_path = pull_with_retries(
+                                    f.path,
+                                    target_path,
+                                    serial=getattr(settings, "adb_serial", ""),
+                                    attempts=getattr(settings, "retry_attempts", 3),
+                                    logger=logger,
+                                    progress_callback=progress_callback,
+                                    expected_size=f.size,
+                                    overall_bytes_before=bytes_before,
+                                    overall_bytes_total=total_bytes,
+                                    reconnect_timeout=getattr(settings, "reconnect_timeout", 300),
+                                    stall_timeout=getattr(settings, "stall_timeout", 180),
+                                    stop_event=stop_event,
+                                    partial_path=partial_path,
+                                    promote=False,
+                                )
+                                target_path, replaced_backup = promote_transfer_file(
+                                    pulled_path, target_path, conflict_policy, output_root
+                                )
+                                partial_path = ""
+                            if not target_path:
+                                conflict_skipped += 1
+                                logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")
+                                continue
+                            if not staged_path:
+                                verified_hash = compute_hash(
+                                    target_path, hash_settings, stop_event, hash_cache, False, logger
+                                )
+                                if verified_hash != h:
+                                    failed_path = transfer_staging_path(output_root, target_path, "failed")
+                                    os.replace(target_path, failed_path)
+                                    partial_path = failed_path
+                                    raise OSError(f"Post-transfer hash verification failed; retained as {failed_path}")
                         else:
-                            shutil.copy2(f.path, target_path)
-                    except (OSError, shutil.Error, subprocess.CalledProcessError, ADBOperationError) as exc:
-                        logger.log(f"WARNING: Failed to isolate duplicate: {f.path} -> {target_path} ({exc})")
-                        transfer_errors += 1
-                        if isinstance(exc, ADBOperationError) and exc.device_unavailable:
-                            adb_device_failed = True
-                        continue
-                isolated += 1
-            else:
-                skipped += 1
-        else:
-            target_path = build_target_path(
-                f.path,
-                settings.source_root,
-                output_root,
-                hash_settings.preserve_structure,
-                is_adb=f.is_adb,
-                avoid_collisions=False,
-                destination_template=getattr(settings, "destination_template", "preserve"),
-                source_timestamp=f.created,
-            )
-            conflict_policy = getattr(settings, "conflict_policy", "rename")
-            target_path = resolve_conflict_path(target_path, conflict_policy)
-            if not target_path:
-                conflict_skipped += 1
-                logger.log(f"SKIPPED existing target due to conflict policy: {f.path}")
-                continue
-            if not settings.dry_run:
-                replaced_backup = ""
-                try:
-                    if f.is_adb:
-                        if staged_path:
-                            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                            partial_path = transfer_staging_path(output_root, target_path, "local")
+                            shutil.copy2(f.path, partial_path)
                             target_path, replaced_backup = promote_transfer_file(
-                                staged_path, target_path, conflict_policy, output_root
-                            )
-                        else:
-                            partial_path = transfer_staging_path(output_root, target_path, "adb")
-                            pulled_path = pull_with_retries(
-                                f.path,
-                                target_path,
-                                serial=getattr(settings, "adb_serial", ""),
-                                attempts=getattr(settings, "retry_attempts", 3),
-                                logger=logger,
-                                progress_callback=progress_callback,
-                                expected_size=f.size,
-                                overall_bytes_before=bytes_before,
-                                overall_bytes_total=total_bytes,
-                                reconnect_timeout=getattr(settings, "reconnect_timeout", 300),
-                                stall_timeout=getattr(settings, "stall_timeout", 180),
-                                stop_event=stop_event,
-                                partial_path=partial_path,
-                                promote=False,
-                            )
-                            target_path, replaced_backup = promote_transfer_file(
-                                pulled_path, target_path, conflict_policy, output_root
+                                partial_path, target_path, conflict_policy, output_root
                             )
                             partial_path = ""
-                        if not target_path:
-                            conflict_skipped += 1
-                            logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")
-                            continue
-                        if not staged_path:
-                            verified_hash = compute_hash(
-                                target_path, hash_settings, stop_event, hash_cache, False, logger
-                            )
-                            if verified_hash != h:
+                            if not target_path:
+                                conflict_skipped += 1
+                                logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")
+                                continue
+                            if os.path.getsize(target_path) != f.size:
                                 failed_path = transfer_staging_path(output_root, target_path, "failed")
                                 os.replace(target_path, failed_path)
                                 partial_path = failed_path
-                                raise OSError(f"Post-transfer hash verification failed; retained as {failed_path}")
-                    else:
-                        partial_path = transfer_staging_path(output_root, target_path, "local")
-                        shutil.copy2(f.path, partial_path)
-                        target_path, replaced_backup = promote_transfer_file(
-                            partial_path, target_path, conflict_policy, output_root
-                        )
-                        partial_path = ""
-                        if not target_path:
-                            conflict_skipped += 1
-                            logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")
-                            continue
-                        if os.path.getsize(target_path) != f.size:
-                            failed_path = transfer_staging_path(output_root, target_path, "failed")
-                            os.replace(target_path, failed_path)
-                            partial_path = failed_path
-                            raise OSError(f"Post-transfer size verification failed; retained as {failed_path}")
-                except HashCancelled:
-                    if target_path and os.path.exists(target_path):
-                        partial_path = transfer_staging_path(output_root, target_path, "cancelled")
-                        os.replace(target_path, partial_path)
-                        if replaced_backup and os.path.exists(replaced_backup):
-                            os.replace(replaced_backup, target_path)
-                    if journal:
-                        journal.fail(f.path, "Verification cancelled", partial_path)
-                    break
-                except (OSError, shutil.Error, subprocess.CalledProcessError, ADBOperationError) as exc:
-                    logger.log(f"WARNING: Failed to copy file: {f.path} -> {target_path} ({exc})")
-                    transfer_errors += 1
-                    failures.append({"source": f.path, "target": target_path, "error": str(exc)})
-                    if journal:
-                        journal.fail(f.path, exc, partial_path)
-                    if isinstance(exc, ADBOperationError) and exc.device_unavailable:
-                        adb_device_failed = True
-                        logger.log(
-                            "ERROR: ADB device is unavailable or unauthorized. Transfer stopped. "
-                            "Unlock the phone, reconnect USB debugging, and accept the authorization prompt."
-                        )
-                        if progress_callback:
-                            progress_callback(i + 1, total_src, "ADB authorization lost; transfer stopped")
+                                raise OSError(f"Post-transfer size verification failed; retained as {failed_path}")
+                    except HashCancelled:
+                        if target_path and os.path.exists(target_path):
+                            partial_path = transfer_staging_path(output_root, target_path, "cancelled")
+                            os.replace(target_path, partial_path)
+                            if replaced_backup and os.path.exists(replaced_backup):
+                                os.replace(replaced_backup, target_path)
+                        if journal:
+                            journal.fail(f.path, "Verification cancelled", partial_path)
                         break
-                    continue
-                if journal:
-                    journal.complete(
-                        f.path,
-                        target_path,
-                        f.size,
-                        h,
-                        replaced_backup,
-                        hash_settings.hash_algo,
-                        hash_settings.hash_mode,
-                    )
-                if h and drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run and os.path.exists(target_path):
-                    try:
-                        drive_cache.set_file_hash(
+                    except (OSError, shutil.Error, subprocess.CalledProcessError, ADBOperationError) as exc:
+                        logger.log(f"WARNING: Failed to copy file: {f.path} -> {target_path} ({exc})")
+                        transfer_errors += 1
+                        failures.append({"source": f.path, "target": target_path, "error": str(exc)})
+                        if journal:
+                            journal.fail(f.path, exc, partial_path)
+                        if isinstance(exc, ADBOperationError) and exc.device_unavailable:
+                            adb_device_failed = True
+                            logger.log(
+                                "ERROR: ADB device is unavailable or unauthorized. Transfer stopped. "
+                                "Unlock the phone, reconnect USB debugging, and accept the authorization prompt."
+                            )
+                            if progress_callback:
+                                progress_callback(i + 1, total_src, "ADB authorization lost; transfer stopped")
+                            break
+                        continue
+                    if journal:
+                        journal.complete(
+                            f.path,
                             target_path,
-                            os.path.getsize(target_path),
-                            os.path.getmtime(target_path),
+                            f.size,
                             h,
-                            compare_scan_settings.hash_algo,
-                            compare_scan_settings.hash_mode,
-                            root=output_root,
+                            replaced_backup,
+                            hash_settings.hash_algo,
+                            hash_settings.hash_mode,
                         )
-                    except OSError as exc:
-                        logger.log(f"WARNING: Failed to update drive cache for copied file: {target_path} ({exc})")
-            if h:
-                dest_hashes.add(h)
-                # Newly copied files join the comparison set, so a later source
-                # matching one of them can be confirmed against a real path too.
-                dest_hash_paths.setdefault(h, target_path)
-            transferred += 1
-            bytes_transferred += f.size
-            source_folder = os.path.dirname(f.path)
-            transferred_folder_counts[source_folder] = transferred_folder_counts.get(source_folder, 0) + 1
+                    if h and drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run and os.path.exists(target_path):
+                        try:
+                            drive_cache.set_file_hash(
+                                target_path,
+                                os.path.getsize(target_path),
+                                os.path.getmtime(target_path),
+                                h,
+                                compare_scan_settings.hash_algo,
+                                compare_scan_settings.hash_mode,
+                                root=output_root,
+                            )
+                        except OSError as exc:
+                            logger.log(f"WARNING: Failed to update drive cache for copied file: {target_path} ({exc})")
+                if h:
+                    dest_hashes.add(h)
+                    # Newly copied files join the comparison set, so a later source
+                    # matching one of them can be confirmed against a real path too.
+                    dest_hash_paths.setdefault(h, target_path)
+                transferred += 1
+                bytes_transferred += f.size
+                source_folder = os.path.dirname(f.path)
+                transferred_folder_counts[source_folder] = transferred_folder_counts.get(source_folder, 0) + 1
             
-        if progress_callback:
-            progress_callback(
-                bytes_before + f.size,
-                total_bytes,
-                f"Processed {i + 1}/{total_src}: {filename[:20]} | "
-                f"Copied {transferred} | Overall "
-                f"{(bytes_before + f.size) / (1024**3):.2f}/{total_bytes / (1024**3):.2f} GB",
-            )
+            if progress_callback:
+                progress_callback(
+                    bytes_before + f.size,
+                    total_bytes,
+                    f"Processed {i + 1}/{total_src}: {filename[:20]} | "
+                    f"Copied {transferred} | Overall "
+                    f"{(bytes_before + f.size) / (1024**3):.2f}/{total_bytes / (1024**3):.2f} GB",
+                )
 
-        if adb_device_failed:
-            break
+            if adb_device_failed:
+                break
+    except OSError as exc:
+        # Destination directory creation, the isolate folder, and the staging
+        # tree all raise outside the per-file try. Letting that escape left the
+        # phone awake, discarded every hash computed so far, saved neither
+        # cache, and wrote no report -- the run vanished with nothing to resume.
+        transfer_errors += 1
+        failures.append({"path": "", "error": f"Transfer stopped: {exc}"})
+        logger.log(f"ERROR: Transfer stopped before all files were processed: {exc}")
+    finally:
+        if drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
+            drive_cache.note_root(compare_root, compare_scan_settings, len(dest_files), 0)
+            try:
+                drive_cache.save()
+                logger.log(f"Drive cache updated: {drive_cache.path}")
+            except OSError as exc:
+                logger.log(f"WARNING: Failed to save drive cache: {drive_cache.path} ({exc})")
+        elif drive_cache:
+            reason = "dry run is enabled" if settings.dry_run else "update after transfer is disabled"
+            logger.log(f"Drive cache was used read-only; {reason}.")
+        if adb_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
+            adb_cache.mark_missing_under_root(settings.source_root, [f.path for f in source_files])
+            adb_cache.note_root(settings.source_root, hash_settings, len(source_files), 0)
+            try:
+                adb_cache.save()
+                logger.log(f"ADB cache updated: {adb_cache.path}")
+            except OSError as exc:
+                logger.log(f"WARNING: Failed to save ADB cache: {adb_cache.path} ({exc})")
+        elif adb_cache:
+            reason = "dry run is enabled" if settings.dry_run else "update after transfer is disabled"
+            logger.log(f"ADB cache was used read-only; {reason}.")
+        if getattr(settings, "source_is_adb", False) and getattr(settings, "keep_device_awake", True):
+            ADBBridge.restore_stay_awake(getattr(settings, "adb_serial", ""), previous_stay_awake)
+            logger.log("ADB keep-awake setting restored.")
+        if journal:
+            try:
+                journal.save(force=True)
+                logger.log("Transfer resume journal checkpoint completed.")
+            except OSError as exc:
+                logger.log(f"WARNING: Failed to finalize transfer journal: {exc}")
+        staging_dir = os.path.join(output_root, APP_STAGING_DIRECTORY)
+        try:
+            os.rmdir(staging_dir)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            # Say what was left behind. Swallowing this hid staged copies that
+            # earlier exits had leaked, so the directory grew run after run with
+            # nothing reporting it.
+            try:
+                leftovers = os.listdir(staging_dir)
+            except OSError:
+                leftovers = []
+            if leftovers:
+                logger.log(
+                    f"WARNING: {len(leftovers)} staged file(s) remain in {staging_dir}; "
+                    "they can be deleted once no transfer is running."
+                )
+            else:
+                logger.log(f"WARNING: Could not remove staging folder {staging_dir}: {exc}")
+        if sleep_inhibited:
+            restore_windows_sleep()
+            logger.log("Windows sleep prevention released.")
+
 
     if progress_callback:
         progress_callback(1, 1, "Report generation complete" if not settings.dry_run else "Dry Run Complete")
@@ -1107,44 +1197,6 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         logger.log("\nTransferred Breakdown by Source Folder:")
         for folder, count in sorted(transferred_folder_counts.items(), key=lambda x: x[1], reverse=True):
             logger.log(f"  -> {count} transferred file(s) from: {folder}")
-    if drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
-        drive_cache.note_root(compare_root, compare_scan_settings, len(dest_files), 0)
-        try:
-            drive_cache.save()
-            logger.log(f"Drive cache updated: {drive_cache.path}")
-        except OSError as exc:
-            logger.log(f"WARNING: Failed to save drive cache: {drive_cache.path} ({exc})")
-    elif drive_cache:
-        reason = "dry run is enabled" if settings.dry_run else "update after transfer is disabled"
-        logger.log(f"Drive cache was used read-only; {reason}.")
-    if adb_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
-        adb_cache.mark_missing_under_root(settings.source_root, [f.path for f in source_files])
-        adb_cache.note_root(settings.source_root, hash_settings, len(source_files), 0)
-        try:
-            adb_cache.save()
-            logger.log(f"ADB cache updated: {adb_cache.path}")
-        except OSError as exc:
-            logger.log(f"WARNING: Failed to save ADB cache: {adb_cache.path} ({exc})")
-    elif adb_cache:
-        reason = "dry run is enabled" if settings.dry_run else "update after transfer is disabled"
-        logger.log(f"ADB cache was used read-only; {reason}.")
-    if getattr(settings, "source_is_adb", False) and getattr(settings, "keep_device_awake", True):
-        ADBBridge.restore_stay_awake(getattr(settings, "adb_serial", ""), previous_stay_awake)
-        logger.log("ADB keep-awake setting restored.")
-    if journal:
-        try:
-            journal.save(force=True)
-            logger.log("Transfer resume journal checkpoint completed.")
-        except OSError as exc:
-            logger.log(f"WARNING: Failed to finalize transfer journal: {exc}")
-    staging_dir = os.path.join(output_root, APP_STAGING_DIRECTORY)
-    try:
-        os.rmdir(staging_dir)
-    except OSError:
-        pass
-    if sleep_inhibited:
-        restore_windows_sleep()
-        logger.log("Windows sleep prevention released.")
     result = {
         "transferred": transferred,
         "duplicates": isolated + skipped,

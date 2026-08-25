@@ -189,7 +189,15 @@ def default_journal_path(output_root, serial="local"):
     return str(get_runtime_paths().journals / f"{safe_serial}_{root_tag}.journal.json")
 
 
-def preflight_transfer(output_root, source_files, is_adb=False, serial="", verify_write=True):
+def preflight_transfer(
+    output_root,
+    source_files,
+    is_adb=False,
+    serial="",
+    verify_write=True,
+    journal=None,
+    verify_resumed=False,
+):
     errors = []
     warnings = []
     if is_adb and verify_write:
@@ -205,10 +213,42 @@ def preflight_transfer(output_root, source_files, is_adb=False, serial="", verif
         except OSError as exc:
             errors.append(f"Output folder is not writable: {exc}")
     try:
-        required = sum(info.size for info in source_files)
+        # Files the journal already proved complete will not be written again,
+        # so charging their bytes against free space made resuming impossible
+        # exactly when the destination was nearly full -- which is the situation
+        # resume exists for. The remaining work is what has to fit.
+        outstanding = []
+        already_complete = 0
+        for info in source_files:
+            if journal is not None:
+                try:
+                    if journal.is_complete(info.path, info.size, verify_resumed):
+                        already_complete += 1
+                        continue
+                except OSError:
+                    pass
+            outstanding.append(info)
+        required = sum(info.size for info in outstanding)
+        largest = max((info.size for info in outstanding), default=0)
         free = shutil.disk_usage(output_root).free
-        if free < required:
-            errors.append(f"Insufficient free space: need up to {required} bytes, have {free} bytes.")
+        if already_complete:
+            warnings.append(
+                f"{already_complete} file(s) are already complete at the destination "
+                "and were excluded from the free-space estimate."
+            )
+        if free < largest:
+            # A hard block only when nothing can be made to fit: even a perfect
+            # run cannot place the single largest outstanding file.
+            errors.append(
+                f"Insufficient free space: the largest remaining file needs {largest} bytes, "
+                f"have {free} bytes."
+            )
+        elif free < required:
+            warnings.append(
+                f"Destination free space is below the remaining transfer size: "
+                f"need up to {required} bytes, have {free} bytes. "
+                "Duplicate files that are skipped may still allow this run to finish."
+            )
         elif free < required * 1.1:
             warnings.append("Destination free space is within 10% of the maximum transfer size.")
     except OSError as exc:

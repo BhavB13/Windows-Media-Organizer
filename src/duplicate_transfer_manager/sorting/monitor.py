@@ -5,12 +5,33 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
 
 from ..core import ErrorCode, ServiceError
 from ..runtime_paths import RuntimePaths, get_runtime_paths
 from .metadata import MetadataExtractor
 from .models import FileMetadata, MonitoredFolder
+
+
+@dataclass(frozen=True)
+class MonitorPoll:
+    """What a poll saw, and the snapshot that would record it as seen.
+
+    The snapshot is deliberately not written by ``poll``. Committing it up
+    front meant that if planning or execution failed afterwards, the changed
+    files were already marked seen and no later run would ever pick them up.
+    """
+
+    changed: tuple[FileMetadata, ...] = ()
+    snapshot: dict = field(default_factory=dict)
+
+    def __iter__(self):
+        return iter(self.changed)
+
+    def __len__(self) -> int:
+        return len(self.changed)
 
 
 class SortMonitorService:
@@ -25,7 +46,7 @@ class SortMonitorService:
         self.extractor = extractor or MetadataExtractor()
         self.snapshot_root = self.paths.sorting / "monitor_snapshots"
 
-    def poll(self, folder: MonitoredFolder) -> tuple[FileMetadata, ...]:
+    def poll(self, folder: MonitoredFolder) -> MonitorPoll:
         self.validate(folder)
         root = Path(folder.path).expanduser().resolve()
         current: dict[str, dict[str, float | int]] = {}
@@ -44,8 +65,31 @@ class SortMonitorService:
                     changed.append(self.extractor.extract(path))
             except OSError:
                 continue
-        self._save(folder.id, current)
-        return tuple(changed)
+        return MonitorPoll(tuple(changed), current)
+
+    def commit(
+        self,
+        monitor_id: str,
+        poll: MonitorPoll,
+        *,
+        handled_paths: Iterable[str] | None = None,
+    ) -> None:
+        """Record the polled state as seen.
+
+        With ``handled_paths``, only changed files that actually reached a
+        terminal sorting status are recorded. Anything else is left out of the
+        snapshot so the next poll reports it again -- a file that was not
+        sorted has not been dealt with, and must not be forgotten.
+        """
+
+        snapshot = dict(poll.snapshot)
+        if handled_paths is not None:
+            handled = {str(Path(value).resolve()) for value in handled_paths}
+            for item in poll.changed:
+                resolved = str(Path(item.path).resolve())
+                if resolved not in handled:
+                    snapshot.pop(resolved, None)
+        self._save(monitor_id, snapshot)
 
     def reset(self, monitor_id: str) -> bool:
         path = self._path(monitor_id)

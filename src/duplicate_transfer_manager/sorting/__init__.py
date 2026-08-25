@@ -3,7 +3,7 @@
 from .metadata import MetadataExtractor, SortScanner
 from .executor import SortExecutionControl, SortExecutor
 from .ml import LocalMLService, MLFeedback
-from .monitor import SortMonitorService
+from .monitor import MonitorPoll, SortMonitorService
 from .migration import SortingMigrationService
 from .models import (
     Association,
@@ -64,6 +64,7 @@ __all__ = [
     "SortSetup",
     "SortWorkflowSession",
     "SortWorkflowStage",
+    "MonitorPoll",
     "SortMonitorService",
     "SortingMigrationService",
     "SortingProfile",

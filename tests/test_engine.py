@@ -1967,5 +1967,151 @@ class EngineTests(unittest.TestCase):
             self.assertTrue(any("validated individually" in message for message in logger.messages))
 
 
+    def test_preflight_does_not_block_a_resume_on_bytes_already_written(self):
+        # The space check summed every source file, including the ones the
+        # journal had already completed. Those bytes are never written again,
+        # so a resume was hard-blocked exactly when the destination was nearly
+        # full -- which is the situation resume exists for.
+        from transfer_safety import preflight_transfer
+
+        class _StubJournal:
+            def __init__(self, complete):
+                self._complete = set(complete)
+
+            def is_complete(self, path, size, verify=False):
+                return path in self._complete
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            done = FileInfo(os.path.join(temp_dir, "big.bin"), 900, 0.0)
+            todo = FileInfo(os.path.join(temp_dir, "small.bin"), 100, 0.0)
+            usage = mock.Mock(free=200, total=1000, used=800)
+            with mock.patch("transfer_safety.shutil.disk_usage", return_value=usage):
+                errors, warnings = preflight_transfer(
+                    temp_dir,
+                    [done, todo],
+                    verify_write=False,
+                    journal=_StubJournal([done.path]),
+                )
+
+            self.assertEqual(errors, [], "the resumable run must not be blocked")
+            self.assertTrue(any("already complete" in warning for warning in warnings))
+
+    def test_preflight_still_blocks_when_the_largest_file_cannot_fit(self):
+        from transfer_safety import preflight_transfer
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            huge = FileInfo(os.path.join(temp_dir, "huge.bin"), 5000, 0.0)
+            usage = mock.Mock(free=10, total=1000, used=990)
+            with mock.patch("transfer_safety.shutil.disk_usage", return_value=usage):
+                errors, _warnings = preflight_transfer(temp_dir, [huge], verify_write=False)
+
+            self.assertTrue(errors)
+            self.assertIn("largest remaining file", errors[0])
+
+    def test_a_failure_outside_the_per_file_guard_still_completes_the_run(self):
+        # build_target_path calls os.makedirs before the per-file try block
+        # opens. An OSError there escaped execute_smart_transfer entirely: no
+        # cache was saved, the phone was left awake, every hash computed so far
+        # was discarded, and no report was written for the user to resume from.
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source_root = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source_root, library, output):
+                os.makedirs(path)
+
+            source = os.path.join(source_root, "photo.jpg")
+            with open(source, "wb") as handle:
+                handle.write(b"a source file")
+
+            # Occupy the dated folder with a file, so os.makedirs cannot create it.
+            stamp = datetime.fromtimestamp(os.stat(source).st_ctime, timezone.utc)
+            blocker = os.path.join(output, "%04d" % stamp.year)
+            with open(blocker, "wb") as handle:
+                handle.write(b"not a directory")
+
+            settings = TransferSettings(
+                source_root=source_root, dest_root=library, output_root=output,
+                criteria="hash", hash_algo="sha256", hash_mode="full", only_media=False,
+                extensions=[], min_size_kb=0, exclude_dirs=[], skip_hidden_system=False,
+                dry_run=False, preserve_structure=True, max_hash_workers=1,
+                transfer_mode="copy", duplicate_policy="skip", use_dest_cache=False,
+                source_is_adb=False, update_drive_cache=False, use_adb_cache=False,
+                destination_template="date",
+            )
+            logger = DummyLogger()
+            result = execute_smart_transfer(
+                settings, threading.Event(), HashCache(os.path.join(root, "cache.json")), logger
+            )
+
+            self.assertGreaterEqual(result["errors"], 1)
+            self.assertEqual(result["transferred"], 0)
+            self.assertIn("report_path", result, "a stopped run must still leave a report")
+            self.assertTrue(
+                any("Transfer stopped" in message for message in logger.messages),
+                logger.messages[-5:],
+            )
+
+    def test_a_conflict_skip_does_not_leave_the_staged_copy_behind(self):
+        # A staged import pulls the whole file before its hash is known. Every
+        # other exit removes the staged copy; the conflict-policy skip did not,
+        # so a full copy of each skipped file was left in the staging folder and
+        # the cleanup rmdir then failed silently on the non-empty directory.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (library, output):
+                os.makedirs(path)
+
+            # The destination name is already taken by unrelated content.
+            with open(os.path.join(output, "photo.jpg"), "wb") as handle:
+                handle.write(b"an unrelated file already there")
+
+            remote_path = "/sdcard/DCIM/photo.jpg"
+            payload = b"the phone copy"
+            source_info = FileInfo(remote_path, len(payload), 123.0, is_adb=True)
+
+            settings = TransferSettings(
+                source_root="/sdcard/DCIM", dest_root=library, output_root=output,
+                criteria="hash", hash_algo="sha256", hash_mode="full", only_media=False,
+                extensions=[], min_size_kb=0, exclude_dirs=[], skip_hidden_system=False,
+                dry_run=False, preserve_structure=False, max_hash_workers=1,
+                transfer_mode="copy", duplicate_policy="skip", use_dest_cache=False,
+                source_is_adb=True, adb_serial="phone-123", update_drive_cache=False,
+                use_adb_cache=False, transfer_profile="Balanced", conflict_policy="skip",
+                keep_device_awake=False,
+            )
+
+            def fake_iter(scan_root, *_args, **_kwargs):
+                return iter([source_info] if scan_root == settings.source_root else [])
+
+            def fake_pull(source_path, target_path, **_kwargs):
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                with open(target_path, "wb") as handle:
+                    handle.write(payload)
+                return target_path
+
+            logger = DummyLogger()
+            with (
+                mock.patch.object(engine_module, "validate_transfer_paths", return_value=""),
+                mock.patch.object(engine_module, "iter_files", side_effect=fake_iter),
+                mock.patch.object(engine_module, "pull_with_retries", side_effect=fake_pull),
+                mock.patch.object(ADBBridge, "probe_device", return_value=(True, "ready")),
+            ):
+                result = execute_smart_transfer(
+                    settings, threading.Event(),
+                    HashCache(os.path.join(root, "cache.json")), logger,
+                )
+
+            self.assertEqual(result["conflict_skipped"], 1)
+            staging = os.path.join(output, engine_module.APP_STAGING_DIRECTORY)
+            leftovers = os.listdir(staging) if os.path.isdir(staging) else []
+            self.assertEqual(leftovers, [], "the staged copy was left on disk")
+
+
 if __name__ == "__main__":
     unittest.main()

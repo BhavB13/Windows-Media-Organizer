@@ -33,11 +33,37 @@ pre-fix commit.
 | adb's pipes were not drained during a pull, so a large video could deadlock it | `40f3445` |
 | A stale drive-cache entry could make a file skip import entirely, because the fast path validated only a file count | `8fed87d` |
 | Name conflicts were counted and reported as duplicates, so a file that was never imported looked already present | `8fed87d` |
+| A staged import left a full copy of every conflict-skipped file in the staging folder | _this commit_ |
+| `execute_smart_transfer` had no `try/finally`: an OSError outside the per-file guard stranded the phone awake, discarded every hash, saved neither cache and wrote no report | _this commit_ |
+| Closing the window neither cancelled nor waited for in-flight workers | _this commit_ |
+| `resume_run` re-executed legacy records the user had already rolled back | _this commit_ |
+| A failed scheduled sort still retired its monitored-folder change set, so those files were never sorted by any later run | _this commit_ |
+| EXIF capture times were read as local wall clock and rendered back as UTC, shifting the date folder by the local offset | _this commit_ |
+| The free-space preflight was keyed per destination folder, so two folders on one drive each got the whole volume's free space | _this commit_ |
+| The transfer preflight summed every source file, hard-blocking a resume exactly when the destination was nearly full | _this commit_ |
 
-Still open: the six Qt controllers built and tested but never wired to the UI,
-so device refresh and phone-folder browsing still run on the main thread
-(bounded at a few seconds each), and `organizer_service.py`, a second
-organization engine unreachable from any route.
+All fourteen TIER 0 findings are now closed, each with a regression test
+checked against the pre-fix commit and failing there.
+
+Still open, and **not** a clean bill of health for release:
+
+- **TIER 1 #17 and #18** — dry-run and failed quarantine records are still
+  indistinguishable from real ones, and a transfer with per-file errors still
+  reports COMPLETED. Both make the program describe a run inaccurately.
+- **TIER 3 #38** — `UpdateController` is defined and tested but never
+  instantiated in `ui/`, so the whole update feature is unreachable while
+  `PRIVACY.md` describes network requests the app never makes.
+- **TIER 3 #40** — `README.md` still documents `python legacy_main.py`, a
+  frontend that moves duplicates inside the scan loop with no manifest and no
+  restore, contradicting the product's stated safety model.
+- **TIER 3 #41** — `organizer_service.py`, a second organization engine
+  unreachable from any route.
+- Eight of the eleven Qt controllers are built and tested but never
+  instantiated. Quarantine, restore, sort undo/retry and the monitor poll were
+  moved off the main thread through `BasePage.run_in_background()` instead, so
+  the freezes are gone, but there are now two worker patterns and the
+  controller layer is largely unused. Device refresh and phone-folder browsing
+  still run on the main thread (bounded at a few seconds each).
 
 ## Summary by severity
 

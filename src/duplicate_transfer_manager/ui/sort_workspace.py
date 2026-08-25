@@ -1455,8 +1455,15 @@ class SortWorkspace(QScrollArea):
         if not profile or row < 0:
             return
         try:
-            changed = self.monitor.poll(profile.monitored_folders[row])
+            monitor = profile.monitored_folders[row]
+            poll = self.monitor.poll(monitor)
+            changed = poll.changed
             self._add_sources([item.path for item in changed])
+            # The interactive poll commits in full: the files are now listed in
+            # front of the user, and leaving them out of the snapshot would make
+            # every later poll re-extract metadata for the whole folder. The
+            # unattended path in scheduled_sort.py commits only what it sorted.
+            self.monitor.commit(monitor.id, poll)
             self._show_section(self.SOURCE_STAGE)
             self.banner.set_message(f"Found {len(changed)} new or changed file(s) in the monitored folder.", "success")
             self.banner.show()
@@ -1494,7 +1501,9 @@ class SortWorkspace(QScrollArea):
             found: list[str] = []
             for monitor in monitors:
                 try:
-                    found.extend(item.path for item in service.poll(monitor))
+                    poll = service.poll(monitor)
+                    found.extend(item.path for item in poll.changed)
+                    service.commit(monitor.id, poll)
                 except Exception:
                     continue
             return OperationResult(status=OperationState.COMPLETED, data={"monitor_paths": found})

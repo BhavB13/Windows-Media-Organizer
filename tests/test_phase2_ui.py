@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PySide6.QtCore import Qt
+    from PySide6.QtGui import QCloseEvent
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QCheckBox, QLabel, QMessageBox, QPushButton
     from shiboken6 import delete
@@ -80,6 +81,47 @@ class Phase2UiTests(unittest.TestCase):
         delete(self.window)
         self.application.processEvents()
         self.temp_dir.cleanup()
+
+    def test_closing_the_window_cancels_and_waits_for_running_work(self):
+        # closeEvent used to save settings and return. A scan, import or sort
+        # kept running with no window: the process lingered copying files, and
+        # a worker emitting into its signals during interpreter teardown could
+        # abort it outright, leaving a stale journal and partial files.
+        controller = self.window.pages["import"].controller
+        with (
+            patch.object(type(controller), "busy", new_callable=PropertyMock, return_value=True),
+            patch.object(controller, "cancel") as cancel,
+            patch.object(controller, "wait_for_done", return_value=True) as wait,
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+        ):
+            event = QCloseEvent()
+            self.window.closeEvent(event)
+
+        cancel.assert_called_once()
+        wait.assert_called_once()
+        self.assertTrue(event.isAccepted())
+
+    def test_declining_the_close_prompt_leaves_the_window_open(self):
+        controller = self.window.pages["import"].controller
+        with (
+            patch.object(type(controller), "busy", new_callable=PropertyMock, return_value=True),
+            patch.object(controller, "cancel") as cancel,
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No),
+        ):
+            event = QCloseEvent()
+            event.accept()
+            self.window.closeEvent(event)
+
+        cancel.assert_not_called()
+        self.assertFalse(event.isAccepted())
+
+    def test_closing_an_idle_window_does_not_prompt(self):
+        with patch.object(QMessageBox, "question") as question:
+            event = QCloseEvent()
+            self.window.closeEvent(event)
+
+        question.assert_not_called()
+        self.assertTrue(event.isAccepted())
 
     def test_shell_contains_all_required_routes(self):
         self.assertEqual(

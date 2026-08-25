@@ -9,6 +9,7 @@ from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QButtonGroup,
     QApplication,
+    QMessageBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -347,7 +348,49 @@ class MainWindow(QMainWindow):
             spinbox.setProperty("wheelChangesDisabled", True)
             spinbox.installEventFilter(self.selection_wheel_filter)
 
+    SHUTDOWN_WAIT_MS = 30000
+
+    def _busy_controllers(self) -> list:
+        controllers = []
+        for key in ("duplicates", "import", "sort"):
+            controller = getattr(self.pages.get(key), "controller", None)
+            if controller is not None and controller.busy:
+                controllers.append(controller)
+        return controllers
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        """Cancel and wait for in-flight work before the window goes away.
+
+        This used to save settings and close. A scan, import or sort kept
+        running with no window: the process lingered copying files, and a worker
+        emitting into its signals during interpreter teardown could abort it
+        outright, leaving a stale journal checkpoint and partial destination
+        files behind.
+        """
+
+        busy = self._busy_controllers()
+        if busy:
+            answer = QMessageBox.question(
+                self,
+                "Stop the running operation?",
+                f"{len(busy)} operation(s) are still running. "
+                "Closing will stop them safely; work already finished is kept.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            for controller in busy:
+                try:
+                    controller.cancel()
+                except Exception:  # noqa: BLE001 - shutdown must not be blocked
+                    pass
+            for controller in busy:
+                try:
+                    controller.wait_for_done(self.SHUTDOWN_WAIT_MS)
+                except Exception:  # noqa: BLE001 - shutdown must not be blocked
+                    pass
         self.settings_service.save(self.settings)
         super().closeEvent(event)
 

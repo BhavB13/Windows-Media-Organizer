@@ -916,14 +916,172 @@ class SortWorkflowAndMonitorTests(unittest.TestCase):
             folder = MonitoredFolder(str(watched), scan_mode="filesystem_change")
 
             first = service.poll(folder)
+            service.commit(folder.id, first)
             second = service.poll(folder)
             item.write_text("changed", encoding="utf-8")
             third = service.poll(folder)
+            service.commit(folder.id, third)
 
-            self.assertEqual([Path(value.path).name for value in first], ["one.txt"])
-            self.assertEqual(second, ())
-            self.assertEqual([Path(value.path).name for value in third], ["one.txt"])
+            self.assertEqual([Path(value.path).name for value in first.changed], ["one.txt"])
+            self.assertEqual(second.changed, ())
+            self.assertEqual([Path(value.path).name for value in third.changed], ["one.txt"])
             self.assertTrue(service.reset(folder.id))
+
+    def test_a_polled_file_that_was_not_sorted_is_reported_again(self):
+        # The snapshot used to be written by poll() itself, before planning or
+        # execution had a chance to fail. When they did, the change set was
+        # already marked seen and no later run would ever pick those files up.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            watched = root / "watched"
+            watched.mkdir()
+            (watched / "sorted.txt").write_text("a", encoding="utf-8")
+            (watched / "unsorted.txt").write_text("b", encoding="utf-8")
+            service = SortMonitorService(get_runtime_paths(root / "data"))
+            folder = MonitoredFolder(str(watched), scan_mode="filesystem_change")
+
+            first = service.poll(folder)
+            self.assertEqual(len(first.changed), 2)
+            # Only one of the two actually reached a terminal sorting status.
+            service.commit(
+                folder.id,
+                first,
+                handled_paths=[str(watched / "sorted.txt")],
+            )
+
+            second = service.poll(folder)
+            self.assertEqual(
+                [Path(value.path).name for value in second.changed],
+                ["unsorted.txt"],
+                "a file that was never sorted must not be forgotten",
+            )
+
+    def test_a_failed_scheduled_sort_does_not_retire_the_change_set(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            watched = root / "watched"
+            watched.mkdir()
+            (watched / "photo.txt").write_text("content", encoding="utf-8")
+            paths = get_runtime_paths(root / "data")
+            monitor = MonitoredFolder(str(watched), scan_mode="scheduled", schedule="daily", dry_run=True)
+            profile = SortingProfile("Scheduled", (), monitored_folders=(monitor,))
+            SortingProfileStore(paths).save(profile)
+
+            with patch(
+                "duplicate_transfer_manager.scheduled_sort.SortPlanner.build",
+                side_effect=RuntimeError("planning blew up"),
+            ):
+                code = run_scheduled_sort(profile.id, monitor.id, data_root=str(root / "data"))
+            self.assertEqual(code, 1)
+
+            # The run failed, so nothing was sorted and nothing may be retired.
+            after = SortMonitorService(paths).poll(monitor)
+            self.assertEqual(
+                [Path(value.path).name for value in after.changed],
+                ["photo.txt"],
+                "a failed scheduled run must leave the change set intact",
+            )
+
+    def test_free_space_is_checked_per_volume_not_per_destination_folder(self):
+        # The requirement was keyed on each destination's nearest existing
+        # parent, so two category folders on one drive became two independent
+        # budgets and each was compared against the whole volume's free space.
+        # A plan needing twice the available space passed the check.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            items = []
+            for index, folder in enumerate(("photos", "videos")):
+                (root / folder).mkdir()
+                source = root / ("source%d.bin" % index)
+                source.write_bytes(b"x")
+                items.append(
+                    SortPlanItem(
+                        metadata(str(source), size=60),
+                        "test",
+                        SortAction.COPY,
+                        str(root / folder / source.name),
+                        ConflictPolicy.RENAME,
+                        1.0,
+                        "test",
+                    )
+                )
+
+            # Enough for either folder alone (60 + 1 MiB reserve), not for both.
+            usage = Mock(free=(1024 * 1024) + 100, total=0, used=0)
+            with patch("duplicate_transfer_manager.sorting.executor.shutil.disk_usage", return_value=usage):
+                with self.assertRaises(ServiceError):
+                    SortExecutor._validate_space(items)
+
+    def test_resume_skips_records_the_user_already_rolled_back(self):
+        # The terminal set was an allow-list that omitted "undone", the status
+        # the legacy-manifest import writes for an item the user already
+        # restored. Resuming re-executed moves they had deliberately reversed.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = get_runtime_paths(root / "data")
+            source = root / "one.txt"
+            source.write_text("one", encoding="utf-8")
+            item = SortPlanItem(
+                metadata(str(source), size=3),
+                "legacy_organizer",
+                SortAction.MOVE,
+                str(root / "dest" / "one.txt"),
+                ConflictPolicy.RENAME,
+                1.0,
+                "Legacy organizer plan",
+            )
+            run_id = "sort_legacyundone"
+            run_dir = paths.sorting / "runs" / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            journal = {
+                "run_id": run_id,
+                "profile_id": "legacy",
+                "sources": [str(root)],
+                "dry_run": False,
+                "status": "legacy_imported",
+                "planned_items": [SortExecutor._serialize_item(item)],
+                "records": [
+                    {
+                        "source": str(source),
+                        "destination": str(root / "dest" / "one.txt"),
+                        "status": "undone",
+                        "undone_at": "2026-01-01T00:00:00+00:00",
+                    }
+                ],
+            }
+            (run_dir / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
+
+            with self.assertRaises(ServiceError):
+                SortExecutor(paths).resume_run(run_id, confirmed=True)
+
+    def test_exif_capture_time_keeps_its_own_digits_through_the_utc_folder(self):
+        # EXIF wall clocks carry no zone. Reading them in the sorting machine's
+        # local zone and rendering them back as UTC shifted the date folder by
+        # the local offset, so an evening photo landed under the next day.
+        from datetime import datetime, timezone
+
+        try:
+            from PIL import Image
+        except ImportError:  # pragma: no cover - Pillow ships with the app
+            self.skipTest("Pillow is required for EXIF metadata")
+
+        if datetime.now().astimezone().utcoffset().total_seconds() == 0:
+            self.skipTest("Machine is on UTC, so the shift is unobservable here")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "photo.jpg"
+            image = Image.new("RGB", (4, 4), "red")
+            exif = image.getexif()
+            exif[306] = "2024:01:31 21:00:00"
+            image.save(path, exif=exif)
+
+            extracted = MetadataExtractor().extract(path)
+            stamp = datetime.fromtimestamp(extracted.captured, timezone.utc)
+            self.assertEqual(
+                (stamp.year, stamp.month, stamp.day, stamp.hour),
+                (2024, 1, 31, 21),
+                "the date folder must show the time the camera recorded",
+            )
 
     def test_live_monitoring_requires_explicit_approval(self):
         with tempfile.TemporaryDirectory() as temp_dir:

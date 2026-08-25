@@ -330,9 +330,15 @@ class SortExecutor:
 
     def resume_run(self, run_id: str, *, confirmed: bool, retry_attempts: int = 1) -> SortExecutionResult:
         journal = self.load_run(run_id)
+        # A record is terminal when it is not resumable, not when it matches a
+        # known-good list. "undone" is what the legacy-manifest import writes for
+        # an item the user already rolled back (migration.py), and a native undo
+        # leaves "completed" plus an undone_at stamp. Neither was in the old
+        # allow-list, so resuming re-executed moves the user had reversed.
         terminal_sources = {
             str(record.get("source", "")) for record in journal.get("records", [])
-            if record.get("status") in {"completed", "ignored", "skipped", "previewed"}
+            if record.get("status") in {"completed", "ignored", "skipped", "previewed", "undone"}
+            or str(record.get("undone_at", ""))
         }
         items = [self._deserialize_item(value) for value in journal.get("planned_items", []) if value.get("metadata", {}).get("path") not in terminal_sources]
         if not items:
@@ -449,8 +455,38 @@ class SortExecutor:
         return self._record(item, "completed", fingerprint=fingerprint, verified=True, replaced_backup=backup)
 
     @staticmethod
-    def _validate_space(items: list[SortPlanItem]) -> None:
-        required_by_root: dict[Path, int] = {}
+    def _existing_ancestor(destination: Path) -> Path:
+        probe = destination.parent
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        return probe
+
+    @classmethod
+    def _volume_key(cls, destination: Path) -> tuple[object, Path]:
+        """Identify the volume a destination will consume space on.
+
+        Free space is a property of the volume, not of a directory. Keying the
+        requirement on each destination's nearest existing parent meant two
+        category folders on one drive became two independent budgets, each
+        compared against the whole volume's free space -- so a plan needing 2x
+        the free space passed. It only looked right on a first run, when the
+        folders did not exist yet and collapsed to a shared ancestor.
+        """
+
+        probe = cls._existing_ancestor(destination)
+        if os.name == "nt":
+            anchor = destination.anchor.casefold()
+            if anchor:
+                return anchor, probe
+        try:
+            return os.stat(probe).st_dev, probe
+        except OSError:
+            return str(probe), probe
+
+    @classmethod
+    def _validate_space(cls, items: list[SortPlanItem]) -> None:
+        required_by_volume: dict[object, int] = {}
+        probe_by_volume: dict[object, Path] = {}
         for item in items:
             if not item.destination or item.action in {SortAction.IGNORE, SortAction.RECYCLE}:
                 continue
@@ -459,12 +495,12 @@ class SortExecutor:
             requires_copy_space = item.action == SortAction.COPY or source.anchor.casefold() != destination.anchor.casefold()
             if not requires_copy_space:
                 continue
-            parent = destination.parent
-            while not parent.exists() and parent != parent.parent:
-                parent = parent.parent
-            required_by_root[parent] = required_by_root.get(parent, 0) + item.metadata.size
+            key, probe = cls._volume_key(destination)
+            required_by_volume[key] = required_by_volume.get(key, 0) + item.metadata.size
+            probe_by_volume.setdefault(key, probe)
         reserve = 1024 * 1024
-        for root, required in required_by_root.items():
+        for key, required in required_by_volume.items():
+            root = probe_by_volume[key]
             try:
                 free = shutil.disk_usage(root).free
             except OSError as exc:
