@@ -33,14 +33,14 @@ pre-fix commit.
 | adb's pipes were not drained during a pull, so a large video could deadlock it | `40f3445` |
 | A stale drive-cache entry could make a file skip import entirely, because the fast path validated only a file count | `8fed87d` |
 | Name conflicts were counted and reported as duplicates, so a file that was never imported looked already present | `8fed87d` |
-| A staged import left a full copy of every conflict-skipped file in the staging folder | _this commit_ |
-| `execute_smart_transfer` had no `try/finally`: an OSError outside the per-file guard stranded the phone awake, discarded every hash, saved neither cache and wrote no report | _this commit_ |
-| Closing the window neither cancelled nor waited for in-flight workers | _this commit_ |
-| `resume_run` re-executed legacy records the user had already rolled back | _this commit_ |
-| A failed scheduled sort still retired its monitored-folder change set, so those files were never sorted by any later run | _this commit_ |
-| EXIF capture times were read as local wall clock and rendered back as UTC, shifting the date folder by the local offset | _this commit_ |
-| The free-space preflight was keyed per destination folder, so two folders on one drive each got the whole volume's free space | _this commit_ |
-| The transfer preflight summed every source file, hard-blocking a resume exactly when the destination was nearly full | _this commit_ |
+| A staged import left a full copy of every conflict-skipped file in the staging folder | `4fdf22f` |
+| `execute_smart_transfer` had no `try/finally`: an OSError outside the per-file guard stranded the phone awake, discarded every hash, saved neither cache and wrote no report | `4fdf22f` |
+| Closing the window neither cancelled nor waited for in-flight workers | `4fdf22f` |
+| `resume_run` re-executed legacy records the user had already rolled back | `4fdf22f` |
+| A failed scheduled sort still retired its monitored-folder change set, so those files were never sorted by any later run | `4fdf22f` |
+| EXIF capture times were read as local wall clock and rendered back as UTC, shifting the date folder by the local offset | `4fdf22f` |
+| The free-space preflight was keyed per destination folder, so two folders on one drive each got the whole volume's free space | `4fdf22f` |
+| The transfer preflight summed every source file, hard-blocking a resume exactly when the destination was nearly full | `4fdf22f` |
 
 All fourteen TIER 0 findings are now closed, each with a regression test
 checked against the pre-fix commit and failing there.
