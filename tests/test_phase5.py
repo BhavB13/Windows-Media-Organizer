@@ -35,6 +35,46 @@ class Phase5OverviewActivitySettingsTests(unittest.TestCase):
         self.assertEqual(records[1]["id"], first["id"])
         self.assertTrue(records[0]["resume_available"])
 
+    def test_records_written_in_the_same_clock_tick_keep_their_order(self):
+        # Windows clock granularity lets several operations share a timestamp.
+        # The id then collided and one record silently overwrote another, and
+        # "newest first" fell back to the reverse-alphabetical filename, so an
+        # older operation could appear above a newer one in Activity. The clock
+        # is frozen here so the collision is certain rather than a matter of
+        # how fast the machine happens to be.
+        from datetime import datetime as _datetime, timezone as _timezone
+
+        frozen = _datetime(2026, 1, 1, 12, 0, 0, tzinfo=_timezone.utc)
+
+        class FrozenDatetime(_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen if tz is None else frozen.astimezone(tz)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = OperationRecordService(get_runtime_paths(temp_dir))
+            OperationRecordService._last_timestamp = None
+            with patch(
+                "duplicate_transfer_manager.services.support_services.datetime",
+                FrozenDatetime,
+            ):
+                written = [
+                    service.record(
+                        "import" if index % 2 else "duplicate_scan",
+                        "completed",
+                        title=f"Operation {index}",
+                    )
+                    for index in range(50)
+                ]
+                listed = service.list_records()
+
+        self.assertEqual(len({record["id"] for record in written}), 50, "ids must be unique")
+        self.assertEqual(
+            [record["id"] for record in listed],
+            [record["id"] for record in reversed(written)],
+            "Activity must list operations newest first, with no ties",
+        )
+
     def test_audit_history_is_retained_after_activity_record_removal(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             service = OperationRecordService(get_runtime_paths(temp_dir))

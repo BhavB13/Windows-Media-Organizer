@@ -1097,6 +1097,66 @@ class SortWorkflowAndMonitorTests(unittest.TestCase):
             with self.assertRaises(ServiceError):
                 SortExecutor(paths).resume_run(run_id, confirmed=True)
 
+    def test_a_dry_run_reports_how_many_files_it_previewed(self):
+        # Neither completed nor skipped was incremented for a previewed item,
+        # so a dry run of any size reported "0 completed, 0 skipped, 0 failed"
+        # -- indistinguishable from a run that found nothing to do.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "inbox"
+            source.mkdir()
+            for name in ("a.txt", "b.txt", "c.txt"):
+                (source / name).write_text(name, encoding="utf-8")
+            paths = get_runtime_paths(root / "data")
+            association = Association("Docs", (), SortAction.MOVE, str(root / "sorted"))
+            profile = SortingProfile("Docs", (association,), ml_enabled=False)
+            files = [MetadataExtractor().extract(p) for p in sorted(source.iterdir())]
+            plan = SortPlanner(paths).build(profile, files, sources=[str(source)], dry_run=True)
+
+            result = SortExecutor(paths).execute(
+                plan, approved_sources=[item.metadata.path for item in plan.items],
+                confirmed=True, control=SortExecutionControl(), retry_attempts=0,
+            )
+
+            self.assertEqual(result.previewed, 3, "the preview count must reach the user")
+            self.assertEqual(result.completed, 0, "a dry run completes nothing")
+            self.assertTrue(all((source / name).exists() for name in ("a.txt", "b.txt", "c.txt")))
+
+    def test_history_shows_what_an_interrupted_run_actually_moved(self):
+        # Per-item durability is an appended line in records.jsonl; the journal
+        # is only rewritten at the end. Reading the journal alone showed a run
+        # killed mid-flight as "0 completed" with no undo offered, even though
+        # its files had moved and undo would have worked.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = get_runtime_paths(root / "data")
+            run_id = "sort_interrupted"
+            run_dir = paths.sorting / "runs" / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            # A journal as it looks before the final write: no records yet.
+            (run_dir / "journal.json").write_text(
+                json.dumps({"run_id": run_id, "status": "running", "records": []}),
+                encoding="utf-8",
+            )
+            # ...and the per-item line the run appended before it died.
+            (run_dir / "records.jsonl").write_text(
+                json.dumps({
+                    "source": str(root / "a.txt"),
+                    "destination": str(root / "sorted" / "a.txt"),
+                    "status": "completed",
+                    "action": SortAction.MOVE.value,
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            runs = SortExecutor(paths).list_runs()
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(
+                [record.get("status") for record in runs[0].get("records", [])],
+                ["completed"],
+                "history must show the item the run completed before it died",
+            )
+
     def test_a_file_without_exif_is_filed_under_the_date_windows_shows(self):
         # The fallback for anything with no capture time is the modified time,
         # a real epoch. Rendering it in UTC filed a file saved late in the

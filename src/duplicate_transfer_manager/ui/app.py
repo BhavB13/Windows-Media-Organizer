@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -57,6 +58,13 @@ def create_application(
     return application, window
 
 
+def _is_headless() -> bool:
+    """True when no one can dismiss a dialog: offscreen, minimal, or no display."""
+
+    platform_name = (os.environ.get("QT_QPA_PLATFORM", "") or "").split(":", 1)[0].strip().casefold()
+    return platform_name in {"offscreen", "minimal", "vnc"}
+
+
 def _install_crash_handler(application: QApplication, paths, diagnostic_consent: bool) -> None:
     previous_hook = sys.excepthook
 
@@ -76,6 +84,16 @@ def _install_crash_handler(application: QApplication, paths, diagnostic_consent:
         message.setDetailedText(Path(report["path"]).read_text(encoding="utf-8"))
         copy_button = message.addButton("Copy sanitized report", QMessageBox.ButtonRole.ActionRole)
         message.addButton(QMessageBox.StandardButton.Close)
+        if _is_headless():
+            # A modal has nobody to dismiss it when there is no display, so it
+            # blocked forever: the release smoke check and any CI run hung
+            # instead of failing, and the actual error was never printed.
+            sys.stderr.write(
+                "Duplicate & Transfer Manager hit an unexpected error.\n"
+                f"Sanitized crash report: {report['path']}\n"
+            )
+            previous_hook(exc_type, exc_value, traceback)
+            return
         message.exec()
         if message.clickedButton() is copy_button:
             application.clipboard().setText(Path(report["path"]).read_text(encoding="utf-8"))

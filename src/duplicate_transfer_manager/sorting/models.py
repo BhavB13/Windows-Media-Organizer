@@ -275,3 +275,4 @@ class SortExecutionResult:
     bytes_processed: int = 0
     failures: tuple[str, ...] = ()
     undo_available: bool = False
+    previewed: int = 0

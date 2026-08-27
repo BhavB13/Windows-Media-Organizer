@@ -125,6 +125,7 @@ class SortExecutor:
         started = time.monotonic()
         planned_total = sum(value.metadata.size for value in selected)
         planned_remaining = planned_total
+        previewed = 0
         for index, item in enumerate(selected, 1):
             source = str(Path(item.metadata.path).resolve())
             try:
@@ -138,14 +139,27 @@ class SortExecutor:
                 journal["status"] = "cancelled"
                 journal["updated_at"] = _now()
                 self._write_journal(journal_path, journal)
-                return self._result(run_id, journal_path, "cancelled", completed, skipped, failed, verified, bytes_processed, failures, records)
-            reporter.progress_callback(index - 1, len(selected), f"Sorting {Path(source).name}", phase=OperationPhase.TRANSFER)
+                return self._result(run_id, journal_path, "cancelled", completed, skipped, failed, verified, bytes_processed, failures, records, previewed)
+            # current_item carries the resolved source path. "Skip current
+            # file" used to read the review table's selected row, which is -1
+            # once processing starts, so the button did nothing at all.
+            reporter.emit(
+                f"Sorting {Path(source).name}",
+                phase=OperationPhase.TRANSFER,
+                current=index - 1,
+                total=len(selected),
+                current_item=source,
+            )
             if plan.dry_run or item.action == SortAction.IGNORE:
                 status = "previewed" if plan.dry_run else "ignored"
                 entry = self._record(item, status)
                 records.append(entry)
                 self._append_record(journal_path, entry)
                 skipped += int(item.action == SortAction.IGNORE)
+                # Counted separately from skipped: a preview is work the run
+                # did, not work it declined. Without this a dry run of any size
+                # reported "0 completed, 0 skipped, 0 failed".
+                previewed += int(bool(plan.dry_run))
                 continue
             error = ""
             record: dict = {}
@@ -160,7 +174,7 @@ class SortExecutor:
                     journal["status"] = "cancelled"
                     journal["updated_at"] = _now()
                     self._write_journal(journal_path, journal)
-                    return self._result(run_id, journal_path, "cancelled", completed, skipped, failed, verified, bytes_processed, failures, records)
+                    return self._result(run_id, journal_path, "cancelled", completed, skipped, failed, verified, bytes_processed, failures, records, previewed)
                 except OSError as exc:
                     error = str(exc)
                     if attempt >= max(0, retry_attempts):
@@ -196,7 +210,7 @@ class SortExecutor:
         journal["completed_at"] = _now()
         journal["updated_at"] = _now()
         self._write_journal(journal_path, journal)
-        return self._result(run_id, journal_path, status, completed, skipped, failed, verified, bytes_processed, failures, records)
+        return self._result(run_id, journal_path, status, completed, skipped, failed, verified, bytes_processed, failures, records, previewed)
 
     def undo(self, run_id: str, *, conflict_policy: ConflictPolicy = ConflictPolicy.RENAME, dry_run: bool = False) -> SortExecutionResult:
         journal_path = self.paths.sorting / "runs" / run_id / "journal.json"
@@ -263,9 +277,16 @@ class SortExecutor:
         runs: list[dict] = []
         for path in sorted((self.paths.sorting / "runs").glob("*/journal.json"), reverse=True):
             try:
-                runs.append(json.loads(path.read_text(encoding="utf-8")))
+                journal = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
+            # Per-item durability is an appended line in records.jsonl; the
+            # journal itself is only written at start, cancel and end. Reading
+            # the journal alone showed a run killed by a crash or force-quit as
+            # "0 completed, Undo -" even though its files had been moved and
+            # undo would have worked. load_run already merges these.
+            self._merge_appended_records(path, journal)
+            runs.append(journal)
         return runs
 
     def prune_runs(self, retention_days: int = 90) -> int:
@@ -732,6 +753,6 @@ class SortExecutor:
             raise
 
     @staticmethod
-    def _result(run_id: str, journal: Path, status: str, completed: int, skipped: int, failed: int, verified: int, bytes_processed: int, failures: list[str], records: list[dict]) -> SortExecutionResult:
+    def _result(run_id: str, journal: Path, status: str, completed: int, skipped: int, failed: int, verified: int, bytes_processed: int, failures: list[str], records: list[dict], previewed: int = 0) -> SortExecutionResult:
         undoable = any(record.get("status") == "completed" and record.get("action") != SortAction.RECYCLE.value for record in records)
-        return SortExecutionResult(run_id, status, str(journal), completed, skipped, failed, verified, bytes_processed, tuple(failures), undoable)
+        return SortExecutionResult(run_id, status, str(journal), completed, skipped, failed, verified, bytes_processed, tuple(failures), undoable, previewed)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import platform
 import hashlib
 import csv
@@ -461,8 +462,25 @@ class CrashReportService:
 
 
 class OperationRecordService:
+    # Shared across instances: two services in one process still write into the
+    # same folder, and the ordering guarantee is about the folder, not the object.
+    _timestamp_lock = threading.Lock()
+    _last_timestamp: datetime | None = None
+
     def __init__(self, paths: RuntimePaths | None = None) -> None:
         self.paths = paths or get_runtime_paths()
+
+    @classmethod
+    def _next_timestamp(cls) -> datetime:
+        """A timestamp strictly later than the last one this process issued."""
+
+        with cls._timestamp_lock:
+            now = datetime.now(timezone.utc)
+            last = cls._last_timestamp
+            if last is not None and now <= last:
+                now = last + timedelta(microseconds=1)
+            cls._last_timestamp = now
+            return now
 
     def record(
         self,
@@ -477,11 +495,15 @@ class OperationRecordService:
         warnings: list[str] | None = None,
         failures: list[str] | None = None,
     ) -> dict[str, Any]:
-        now = datetime.now(timezone.utc).isoformat()
         # Windows clock granularity is coarse enough that two operations
-        # recorded back to back can share a timestamp, and the writer below
-        # overwrites by path -- so one record silently replaced the other.
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        # recorded back to back share a timestamp. That had two consequences:
+        # the id collided and one record silently overwrote the other, and
+        # Activity's "newest first" order fell back to the reverse-alphabetical
+        # filename, so the older operation could be listed above the newer one.
+        # Issuing a strictly increasing timestamp settles both.
+        created = self._next_timestamp()
+        now = created.isoformat()
+        stamp = created.strftime("%Y%m%d_%H%M%S_%f")
         operation_id = f"{operation_type}_{stamp}"
         suffix = 1
         while (self.paths.operations / f"{operation_id}.json").exists():

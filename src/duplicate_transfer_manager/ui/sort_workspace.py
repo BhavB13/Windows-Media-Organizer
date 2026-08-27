@@ -1198,6 +1198,7 @@ class SortWorkspace(QScrollArea):
             f"{'This dry run records the plan without changing files.' if self.plan.dry_run else 'Completed operations are verified and recorded for recovery.'}"
         )
         self._show_section(self.PROCESS_STAGE)
+        self._processing_source = ""
         self.progress.update_progress(0, "Processing approved plan…", "Preparing transaction journal", "0%")
         for button in (self.pause_button, self.resume_button, self.skip_button):
             button.show()
@@ -1209,13 +1210,28 @@ class SortWorkspace(QScrollArea):
             self.banner.show()
 
     def _skip_current(self) -> None:
-        if not self.plan:
+        """Skip the file being processed right now.
+
+        This used to read the review table's selected row. Processing has
+        already switched the workspace away from that table, so the row is -1
+        and the button did nothing. The executor now publishes the in-flight
+        source path on each progress event.
+        """
+
+        source = getattr(self, "_processing_source", "")
+        if not source:
+            self.banner.set_message("No file is being processed right now.", "warning")
+            self.banner.show()
             return
-        row = self.review_table.currentRow()
-        if 0 <= row < len(self.plan.items):
-            self.controller.skip_current(self.plan.items[row].metadata.path)
+        if self.controller.skip_current(source):
+            self.banner.set_message(f"Skipping {Path(source).name}.", "info")
+        else:
+            self.banner.set_message("No sorting run is active.", "warning")
+        self.banner.show()
 
     def _on_progress(self, event) -> None:
+        if not self._planning and event.current_item:
+            self._processing_source = event.current_item
         value = int((event.progress or 0) * 100)
         panel = self.preview_progress if self._planning else self.progress
         panel.update_progress(value, event.message, event.current_item or event.message, f"{value}% • {format_eta(event.eta_seconds)}")
@@ -1252,12 +1268,25 @@ class SortWorkspace(QScrollArea):
                     summary={"journal_path": sort_result.journal_path, "run_id": sort_result.run_id},
                     resume_available=sort_result.undo_available, warnings=list(sort_result.failures),
                 )
-                self.banner.set_message(f"Sorting finished: {sort_result.completed} completed, {sort_result.skipped} skipped, {sort_result.failed} failed.", "success" if not sort_result.failed else "warning")
-                self.result_summary.setText(
-                    f"Latest run: {sort_result.completed} completed • {sort_result.verified} verified • "
-                    f"{sort_result.skipped} skipped • {sort_result.failed} failed • "
-                    f"{'Undo available' if sort_result.undo_available else 'No app-managed undo available'}"
-                )
+                previewed = getattr(sort_result, "previewed", 0)
+                if previewed:
+                    # A dry run completes nothing by design. Reporting it as
+                    # "0 completed, 0 skipped, 0 failed" read like a run that
+                    # had found nothing to do.
+                    self.banner.set_message(
+                        f"Preview finished: {previewed} file(s) would be sorted. Nothing was moved.",
+                        "info",
+                    )
+                    self.result_summary.setText(
+                        f"Latest run: preview only • {previewed} file(s) would be sorted • nothing was moved"
+                    )
+                else:
+                    self.banner.set_message(f"Sorting finished: {sort_result.completed} completed, {sort_result.skipped} skipped, {sort_result.failed} failed.", "success" if not sort_result.failed else "warning")
+                    self.result_summary.setText(
+                        f"Latest run: {sort_result.completed} completed • {sort_result.verified} verified • "
+                        f"{sort_result.skipped} skipped • {sort_result.failed} failed • "
+                        f"{'Undo available' if sort_result.undo_available else 'No app-managed undo available'}"
+                    )
             self._refresh_history()
             if self.history_table.rowCount():
                 self.history_table.selectRow(0)
@@ -1621,13 +1650,18 @@ class SortWorkspace(QScrollArea):
         run_id = str(run.get("run_id", ""))
         if QMessageBox.question(self, "Retry sorting run", "Retry failed or interrupted files after rechecking the reviewed source metadata?") != QMessageBox.StandardButton.Yes:
             return
-        has_failures = any(record.get("status") == "failed" for record in run.get("records", []))
-        # Retry runs the full execute pipeline: hashing, copying, and moving.
+        # Always resume. resume_run re-executes every item without a terminal
+        # record, which includes the failed ones -- retry_failed is a strict
+        # subset of it. Choosing retry_failed whenever any single file had
+        # failed silently abandoned every file the run never reached: cancel a
+        # 1000-file sort after 10 with one failure, press Retry, and it
+        # processed that one file and dropped the other 989. resume_run also
+        # preserves the run's dry_run flag, which retry_failed does not.
         if not self.controller.retry(
             run_id,
             confirmed=True,
             retry_attempts=self.retry_count.value(),
-            resume=not has_failures,
+            resume=True,
         ):
             self.banner.set_message("Another sorting operation is still running.", "warning")
             self.banner.show()

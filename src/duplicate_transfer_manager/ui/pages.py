@@ -630,6 +630,7 @@ class DuplicatesPage(BasePage):
         self.controller.recoverable_error.connect(self._on_scan_error)
         self.controller.failed.connect(self._on_scan_error)
         self._apply_category_defaults()
+        self._apply_android_preferences(self.app_settings)
         self.finish()
 
     def _apply_category_defaults(self) -> None:
@@ -658,6 +659,7 @@ class DuplicatesPage(BasePage):
 
     def update_preferences(self, settings: AppSettings) -> None:
         self.app_settings = settings
+        self._apply_android_preferences(settings)
         self.favorite_location.blockSignals(True)
         self.favorite_location.clear()
         self.favorite_location.addItem("Use a saved location…", "")
@@ -666,6 +668,23 @@ class DuplicatesPage(BasePage):
         self.favorite_location.setCurrentIndex(0)
         self.favorite_location.blockSignals(False)
         self.favorite_location.setVisible(bool(settings.favorite_locations))
+
+    def _apply_android_preferences(self, settings: AppSettings) -> None:
+        """Honour the Android settings the user saved.
+
+        "Enable Android features", the default Android path, and keep-awake
+        were all written to settings.json and never read back, so turning
+        Android off left the tile in place and changing the default path
+        changed nothing.
+        """
+
+        enabled = bool(settings.android_enabled)
+        tile = self.source_picker.cards.get("android")
+        if tile is not None:
+            tile.setVisible(enabled)
+            tile.setEnabled(enabled)
+        if not enabled and self.source_picker.selected_key() == "android":
+            self.source_picker.select("local")
 
     def _browse_adb_path(self, selector: PathSelector) -> None:
         from adb_bridge import ADBBridge
@@ -705,7 +724,12 @@ class DuplicatesPage(BasePage):
         is_android = source == "android"
         self.device_choice.setVisible(is_android)
         if is_android:
-            self.path.entry.setPlaceholderText("/sdcard/DCIM")
+            # The configured default, not a hardcoded literal. This setting was
+            # saved to settings.json and then read by nothing.
+            default_path = self.app_settings.android_default_path or "/sdcard/DCIM"
+            self.path.entry.setPlaceholderText(default_path)
+            if not self.path.path():
+                self.path.set_path(default_path)
             self.path.helper.setText("Authorize USB debugging, then choose or type an Android folder.")
             self._refresh_devices()
         else:
@@ -1367,7 +1391,7 @@ class ImportPage(BasePage):
         self.use_adb_cache = QCheckBox("Use Android hash cache")
         self.use_adb_cache.setChecked(True)
         self.keep_awake = QCheckBox("Keep Android awake during transfer")
-        self.keep_awake.setChecked(True)
+        self.keep_awake.setChecked(bool(self.app_settings.keep_android_awake))
         self.verify_resumed = QCheckBox("Re-read every resumed file to verify it")
         self.verify_resumed.setChecked(False)
         self.verify_resumed.setToolTip(
@@ -1471,6 +1495,7 @@ class ImportPage(BasePage):
         self.controller.failed.connect(self._on_failed)
         self.controller.technical_log.connect(self._on_log)
         self._source_changed("folder")
+        self._apply_android_preferences(self.app_settings)
         self.finish()
 
     def _browse(self, selector: PathSelector, title: str) -> None:
@@ -1493,6 +1518,7 @@ class ImportPage(BasePage):
 
     def update_preferences(self, settings: AppSettings) -> None:
         self.app_settings = settings
+        self._apply_android_preferences(settings)
         for combo in (self.favorite_source, self.favorite_library):
             combo.blockSignals(True)
             combo.clear()
@@ -1502,6 +1528,18 @@ class ImportPage(BasePage):
             combo.setCurrentIndex(0)
             combo.blockSignals(False)
             combo.setVisible(bool(settings.favorite_locations))
+
+    def _apply_android_preferences(self, settings: AppSettings) -> None:
+        """Honour the Android settings the user saved. See DuplicatesPage."""
+
+        enabled = bool(settings.android_enabled)
+        tile = self.source_picker.cards.get("phone")
+        if tile is not None:
+            tile.setVisible(enabled)
+            tile.setEnabled(enabled)
+        if not enabled and self.source_picker.selected_key() == "phone":
+            self.source_picker.select("folder")
+        self.keep_awake.setChecked(bool(settings.keep_android_awake))
 
     def _browse_adb_path(self, selector: PathSelector) -> None:
         from adb_bridge import ADBBridge
@@ -1543,7 +1581,10 @@ class ImportPage(BasePage):
         self.use_adb_cache.setVisible(is_phone)
         self.keep_awake.setVisible(is_phone)
         if is_phone:
-            self.source_path.entry.setPlaceholderText("/sdcard/DCIM")
+            default_path = self.app_settings.android_default_path or "/sdcard/DCIM"
+            self.source_path.entry.setPlaceholderText(default_path)
+            if not self.source_path.path():
+                self.source_path.set_path(default_path)
             self._refresh_devices()
         else:
             self.source_path.entry.setPlaceholderText("Choose a folder or drive")
