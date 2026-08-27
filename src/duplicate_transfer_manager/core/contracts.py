@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -91,7 +93,14 @@ class OperationResult:
 
     @property
     def successful(self) -> bool:
-        return self.status == OperationState.COMPLETED
+        # A run that reached the end with per-file failures is finished, but it
+        # is not successful. Reporting it as such let the import banner say
+        # "Import complete" in success green while files had been left behind.
+        return self.status == OperationState.COMPLETED and not self.failures
+
+    @property
+    def completed_with_problems(self) -> bool:
+        return self.status == OperationState.COMPLETED and bool(self.failures)
 
 
 @dataclass
@@ -180,6 +189,34 @@ class QuarantineRecord:
     device_serial: str = ""
     restored_path: str = ""
     restored_at: str = ""
+    # "completed" means the move happened. A dry run writes "previewed" and a
+    # failed move writes "failed". "pending" is written before the move is
+    # attempted and is only ever left behind by a crash mid-operation. Older
+    # manifests predate the field entirely and only held real moves, which is
+    # why the default is "completed".
+    status: str = "completed"
+
+    @property
+    def is_recoverable(self) -> bool:
+        """Whether this record describes a file that is really in quarantine.
+
+        "previewed" (dry run) and "failed" are decided on the status alone:
+        neither ever moved a file. "pending" is the ambiguous one -- the
+        process died between the move and the manifest checkpoint, so the file
+        may or may not be there. Rejecting those outright would make a genuinely
+        moved file unrecoverable, and accepting them all put phantom rows on the
+        Quarantine page, so it is settled by looking: the stored file either
+        exists or it does not.
+        """
+
+        if self.status in {"previewed", "failed"}:
+            return False
+        if self.status == "pending":
+            try:
+                return bool(self.stored_path) and os.path.isfile(self.stored_path)
+            except OSError:
+                return False
+        return True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -198,4 +235,5 @@ class QuarantineRecord:
             device_serial=str(values.get("device_serial", "")),
             restored_path=str(values.get("restored_path", "")),
             restored_at=str(values.get("restored_at", "")),
+            status=str(values.get("status", "") or "completed"),
         )

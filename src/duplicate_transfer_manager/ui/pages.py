@@ -54,6 +54,7 @@ from ..services import (
     IOSTransferService,
     OperationRecordService,
     ReportService,
+    RestoreResult,
     ScheduledScanService,
     SettingsService,
     STAGE_LABELS,
@@ -336,8 +337,14 @@ class OverviewPage(BasePage):
         interrupted = summary["interrupted_transfers"]
         devices = summary.get("connected_devices", [])
         self.metrics.widgets[0].layout().itemAt(0).widget().setText(format_duplicate_size(summary["recoverable_bytes"]))
-        self.metrics.widgets[1].layout().itemAt(0).widget().setText(str(len(recent)))
-        self.metrics.widgets[2].layout().itemAt(0).widget().setText(str(len(interrupted)))
+        # summary["recent_operations"] is a five-item preview for the card
+        # below. Counting it reported "5" to anyone with more than five.
+        self.metrics.widgets[1].layout().itemAt(0).widget().setText(
+            str(summary.get("recent_operations_total", len(recent)))
+        )
+        self.metrics.widgets[2].layout().itemAt(0).widget().setText(
+            str(summary.get("interrupted_transfers_total", len(interrupted)))
+        )
         self.metrics.widgets[3].layout().itemAt(0).widget().setText(str(len(devices)))
         self.recent.set_items(
             [
@@ -811,17 +818,37 @@ class DuplicatesPage(BasePage):
         self.progress_panel.update_progress(value, event.message, detail, metrics)
 
     def _on_scan_completed(self, result) -> None:
+        """Hand review building to a worker instead of freezing on it.
+
+        Building the review decodes every duplicate image and writes a
+        thumbnail. Doing that here, in a slot on the GUI thread, froze the
+        window for the whole batch with the progress panel already hidden --
+        roughly a minute per thousand photos, indistinguishable from a hang.
+        """
+
+        prefer = "quality" if self.quality.isChecked() else "newest" if self.newest.isChecked() else "oldest"
+        groups = result.data.get("groups", [])
+        thumbnail_root = self.paths.cache / "thumbnails"
+        scanned_files = result.counts.get("files_scanned", 0)
+        warnings = tuple(result.warnings)
+        self.progress_panel.update_progress(100, "Preparing previews…", "Building the review", "")
+        self.run_in_background(
+            lambda: build_duplicate_review(
+                groups,
+                prefer=prefer,
+                thumbnail_root=thumbnail_root,
+                scanned_files=scanned_files,
+                warnings=warnings,
+            ),
+            lambda review: self._on_review_built(review, result),
+            self._on_scan_error,
+        )
+
+    def _on_review_built(self, review, result) -> None:
         self.review_button.setEnabled(True)
         self.scan_button.setEnabled(True)
         self.progress_panel.hide()
-        prefer = "quality" if self.quality.isChecked() else "newest" if self.newest.isChecked() else "oldest"
-        self.review = build_duplicate_review(
-            result.data.get("groups", []),
-            prefer=prefer,
-            thumbnail_root=self.paths.cache / "thumbnails",
-            scanned_files=result.counts.get("files_scanned", 0),
-            warnings=result.warnings,
-        )
+        self.review = review
         self._render_review()
         if self.review.groups:
             self.banner.set_message("Scan complete. Review checked duplicates before confirming quarantine.", "success")
@@ -1781,7 +1808,19 @@ class ImportPage(BasePage):
             resume_available=bool(result.resume_information),
             failures=[failure.message for failure in result.failures],
         )
-        self.banner.set_message("Import complete. Review the summary cards and detailed activity log.", "success")
+        errors = int(result.counts.get("errors", 0))
+        if errors:
+            # A green "Import complete" next to a non-zero error count told the
+            # user everything had arrived when some of it had not.
+            self.banner.set_message(
+                f"Import finished, but {errors} file(s) could not be copied. "
+                "Open the detailed activity log and the report to see which.",
+                "warning",
+            )
+        else:
+            self.banner.set_message(
+                "Import complete. Review the summary cards and detailed activity log.", "success"
+            )
         self.banner.show()
 
     def _on_cancelled(self, _result) -> None:
@@ -2205,13 +2244,17 @@ class ActivityPage(BasePage):
             report_count = 0
             record_count = 0
             for record in removable:
+                # A record and its report are two files, not two alternatives.
+                # Removing only the report left the operation record in place,
+                # so the row was rebuilt on the next refresh and the user could
+                # never clear it.
+                dry_run = self.dry_run_reports.isChecked()
                 if record.get("report_path"):
-                    self.reports.remove_report(record["report_path"], dry_run=self.dry_run_reports.isChecked())
+                    self.reports.remove_report(record["report_path"], dry_run=dry_run)
                     report_count += 1
-                elif not self.dry_run_reports.isChecked():
-                    self.operations.remove_record(str(record["id"]))
-                    record_count += 1
-                else:
+                if record.get("id") and record.get("path"):
+                    if not dry_run:
+                        self.operations.remove_record(str(record["id"]))
                     record_count += 1
             action = "Would remove" if self.dry_run_reports.isChecked() else "Removed"
             message = f"{action} {report_count} report(s) and {record_count} activity record(s) from local storage."
@@ -2490,20 +2533,31 @@ class QuarantinePage(BasePage):
             self.banner.set_message("Choose at least one quarantined file to restore.", "warning")
             self.banner.show()
             return
-        restored = []
-        skipped = []
-        failures = []
-        for record in selected:
-            result = self.service.restore_record(
-                record,
-                conflict_policy=self.conflict.currentData(),
-                dry_run=self.dry_run_restore.isChecked(),
-            )
-            restored.extend(result.restored)
-            skipped.extend(result.skipped)
-            failures.extend(result.failures)
-        self._show_restore_result(len(restored), len(skipped), len(failures))
-        self.refresh()
+        conflict_policy = self.conflict.currentData()
+        dry_run = self.dry_run_restore.isChecked()
+
+        def restore_all():
+            # Each record is a full read, a move, and a second full read to
+            # verify it. Run inline this froze the window for the whole
+            # selection, unlike the sibling "restore whole operation" action
+            # right below, which already used a worker.
+            restored: list[str] = []
+            skipped: list[str] = []
+            failures: list[str] = []
+            for record in selected:
+                outcome = self.service.restore_record(
+                    record, conflict_policy=conflict_policy, dry_run=dry_run
+                )
+                restored.extend(outcome.restored)
+                skipped.extend(outcome.skipped)
+                failures.extend(outcome.failures)
+            return RestoreResult(tuple(restored), tuple(skipped), tuple(failures), dry_run=dry_run)
+
+        self.banner.set_message(
+            "Previewing restore destinations…" if dry_run else "Restoring quarantined files…", "info"
+        )
+        self.banner.show()
+        self.run_in_background(restore_all, self._restore_finished)
 
     def restore_selected_operation(self) -> None:
         selected = self._checked_records()
@@ -2524,15 +2578,32 @@ class QuarantinePage(BasePage):
         )
 
     def _restore_finished(self, result) -> None:
-        self._show_restore_result(len(result.restored), len(result.skipped), len(result.failures))
+        self._show_restore_result(
+            len(result.restored),
+            len(result.skipped),
+            len(result.failures),
+            dry_run=bool(getattr(result, "dry_run", False)),
+        )
         self.refresh()
 
-    def _show_restore_result(self, restored: int, skipped: int, failures: int) -> None:
+    def _show_restore_result(
+        self, restored: int, skipped: int, failures: int, *, dry_run: bool = False
+    ) -> None:
         kind = "success" if failures == 0 else "warning"
-        self.banner.set_message(
-            f"Restore complete: {restored} restored, {skipped} skipped, {failures} failed.",
-            kind,
-        )
+        if dry_run:
+            # A preview moves nothing. Reporting "N restored" in success green
+            # was word-for-word what a real restore said, so the user could not
+            # tell whether their files had come back.
+            self.banner.set_message(
+                f"Preview only, nothing was moved: {restored} file(s) would be restored, "
+                f"{skipped} skipped, {failures} would fail.",
+                "info" if failures == 0 else "warning",
+            )
+        else:
+            self.banner.set_message(
+                f"Restore complete: {restored} restored, {skipped} skipped, {failures} failed.",
+                kind,
+            )
         self.banner.show()
 
 
@@ -2546,7 +2617,9 @@ class SettingsPage(BasePage):
         service: SettingsService,
         dashboard_service: DashboardService | None = None,
         parent: QWidget | None = None,
+        hash_cache=None,
     ) -> None:
+        self.hash_cache = hash_cache
         super().__init__(
             "Settings",
             "Choose how the application looks and how much technical detail it shows.",
@@ -2799,6 +2872,13 @@ class SettingsPage(BasePage):
 
     def _clear_cache(self) -> None:
         removed = self.dashboard_service.clear_cache()
+        # The running app holds the hash cache in memory and rewrites it on the
+        # next save, so deleting the file alone cleared nothing the user could
+        # observe: the entries came straight back.
+        if self.hash_cache is not None:
+            clear = getattr(self.hash_cache, "clear", None)
+            if callable(clear):
+                clear()
         self.banner.set_message(f"Cleared {format_duplicate_size(removed)} of cache data.", "success")
         self.banner.show()
 

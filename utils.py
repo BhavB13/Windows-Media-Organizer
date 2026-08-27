@@ -103,6 +103,16 @@ class HashCache:
         with self.lock:
             self.data[key] = {"size": size, "mtime": mtime, "hash": digest}
 
+    def clear(self):
+        """Forget every cached digest, in memory and on disk.
+
+        Deleting the file alone did nothing observable: the running app still
+        held the entries and wrote them back on the next save.
+        """
+        with self.lock:
+            self.data = {}
+        self.save()
+
 def format_bytes(num_bytes):
     for unit in ['B','KB','MB','GB','TB']:
         if num_bytes < 1024: return f"{num_bytes:.2f} {unit}"

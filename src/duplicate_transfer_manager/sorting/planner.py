@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,7 +96,25 @@ class SortPlanner:
             if destination and destination == source:
                 item = replace(item, conflict="self", selected=False, warnings=(*item.warnings, "Source and destination are the same file."), requires_review=True, approved=False)
             if destination and any(Path(value).is_dir() and _within(destination, Path(value).resolve()) for value in sources):
-                item = replace(item, conflict="recursive", selected=False, warnings=(*item.warnings, "Destination would create recursive sorting."), requires_review=True, approved=False)
+                # Sorting a folder into category subfolders OF THAT FOLDER is
+                # the headline use case ("sort my Downloads into Pictures,
+                # Videos, Documents"). This used to deselect the row and force
+                # review, so a plain quick sort came back with every file
+                # unchecked and refused to run.
+                #
+                # It is not recursion. A destination is computed from the
+                # file's metadata -- extension, media type, capture date --
+                # never from where the file currently sits, so once a file has
+                # moved, planning it again yields the same path, which
+                # _resolve_conflict now recognises as the file itself and
+                # deselects. A second sort of the same folder is therefore a
+                # no-op. The warning is worth keeping so the user knows sorted
+                # files stay inside the folder they chose; blocking on it is not.
+                item = replace(
+                    item,
+                    conflict=item.conflict or "nested",
+                    warnings=(*item.warnings, "Sorted files stay inside the folder you selected."),
+                )
             if destination:
                 reserved.add(destination)
             items.append(item)
@@ -125,7 +145,12 @@ class SortPlanner:
         else:
             root = Path(association.destination).expanduser() if association.destination else source.parent
         captured = metadata.captured or metadata.modified
-        stamp = datetime.fromtimestamp(captured, timezone.utc)
+        # Local time, deliberately. These folders are named for a human date:
+        # the one on the camera for an EXIF capture, and the one Windows
+        # Explorer shows for the modified-time fallback. Rendering in UTC moved
+        # an evening photo into the next day, and around New Year into the next
+        # year, while the review table beside it showed the local date.
+        stamp = datetime.fromtimestamp(captured)
         values = {
             "name": source.name, "stem": source.stem, "suffix": source.suffix,
             "extension": metadata.extension.lstrip(".") or "extensionless",
@@ -147,6 +172,20 @@ class SortPlanner:
         if not item.destination or item.action in {SortAction.IGNORE, SortAction.RECYCLE}:
             return item
         target = Path(item.destination)
+        if _is_same_file(target, Path(item.metadata.path)):
+            # The file is already where the rules want it. Every branch below
+            # treats target.exists() as a collision, so without this the RENAME
+            # policy "resolved" a file against itself and planned a move to
+            # photo_1.jpg -- meaning a second sort of the same folder renamed
+            # everything again, and a third did it once more.
+            return replace(
+                item,
+                conflict="self",
+                selected=False,
+                requires_review=True,
+                approved=False,
+                warnings=(*item.warnings, "This file is already in its sorted location."),
+            )
         if target in reserved:
             if item.conflict_policy == ConflictPolicy.RENAME:
                 candidate = self._renamed_target(target, reserved)
@@ -180,6 +219,17 @@ class SortPlanner:
             candidate = target.with_name(f"{target.stem} ({index}){target.suffix}")
             index += 1
         return candidate
+
+
+def _is_same_file(left: Path, right: Path) -> bool:
+    """True when two paths name the same file on disk."""
+
+    try:
+        if left.exists() and right.exists():
+            return os.path.samefile(left, right)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
 
 
 def _within(path: Path, root: Path) -> bool:

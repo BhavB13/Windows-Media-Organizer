@@ -7,11 +7,14 @@ from unittest.mock import patch
 from duplicate_transfer_manager.runtime_paths import get_runtime_paths
 from duplicate_transfer_manager.core import ServiceError
 from duplicate_transfer_manager.services import (
+    DashboardService,
     DuplicateQuarantineService,
+    OperationRecordService,
     build_duplicate_review,
     duplicate_review_to_dict,
 )
 from models import FileInfo
+from utils import HashCache
 
 
 class Phase3DuplicateWorkflowTests(unittest.TestCase):
@@ -371,6 +374,129 @@ class Phase3DuplicateWorkflowTests(unittest.TestCase):
             self.assertTrue(result.records[0].source_is_adb)
             self.assertEqual(result.records[0].device_serial, "device-1")
             self.assertTrue(Path(result.records[0].stored_path).exists())
+
+
+    def test_a_dry_run_quarantine_is_not_listed_as_recoverable(self):
+        # A dry run moves nothing, but its manifest records looked exactly like
+        # real ones: the Quarantine page offered to restore files that were
+        # still in place and the dashboard counted their bytes as recovered.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            keep = root / "keep.bin"
+            copy = root / "copy.bin"
+            for path in (keep, copy):
+                path.write_bytes(b"same")
+            paths = get_runtime_paths(root / "data")
+            review = build_duplicate_review(
+                [[FileInfo(str(keep), 4, 100), FileInfo(str(copy), 4, 200)]],
+                thumbnail_root=root / "thumbs",
+            )
+            service = DuplicateQuarantineService(paths)
+            result = service.quarantine(
+                review, review.groups[0].selected_item_ids, operation_id="op-dry", dry_run=True
+            )
+
+            self.assertTrue(result.dry_run)
+            self.assertTrue(copy.exists(), "a dry run must not move anything")
+            self.assertEqual(
+                service.list_records(), [],
+                "a previewed record is not a file in quarantine",
+            )
+
+    def test_a_failed_quarantine_move_is_not_listed_as_recoverable(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            keep = root / "keep.bin"
+            copy = root / "copy.bin"
+            for path in (keep, copy):
+                path.write_bytes(b"same")
+            paths = get_runtime_paths(root / "data")
+            review = build_duplicate_review(
+                [[FileInfo(str(keep), 4, 100), FileInfo(str(copy), 4, 200)]],
+                thumbnail_root=root / "thumbs",
+            )
+            service = DuplicateQuarantineService(paths)
+            with patch(
+                "duplicate_transfer_manager.services.duplicate_workflow.shutil.move",
+                side_effect=OSError("locked by another process"),
+            ):
+                result = service.quarantine(
+                    review, review.groups[0].selected_item_ids, operation_id="op-failed"
+                )
+
+            self.assertTrue(result.failures)
+            self.assertTrue(copy.exists(), "the move failed, so the file is still there")
+            self.assertEqual(
+                service.list_records(), [],
+                "a failed move did not put anything in quarantine",
+            )
+
+    def test_an_import_appears_once_in_activity_not_once_per_stored_file(self):
+        # Every import writes both an operation record and a transfer report,
+        # and the record names the report. Listing both showed each import
+        # twice in Activity, counted it twice on the dashboard, and exported it
+        # twice to CSV.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = get_runtime_paths(Path(temp_dir) / "data")
+            report = paths.reports / "transfer_report_1.json"
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(
+                json.dumps({"created_at": "2026-01-01T00:00:00+00:00", "transferred": 3, "errors": 0}),
+                encoding="utf-8",
+            )
+            service = OperationRecordService(paths)
+            service.record("import", "completed", title="File import", report_path=str(report))
+
+            records = service.list_records()
+            self.assertEqual(len(records), 1, [r.get("id") for r in records])
+            self.assertEqual(records[0]["title"], "File import")
+
+    def test_an_orphan_report_is_still_listed(self):
+        # De-duplication must not hide a report from an older version, or one
+        # whose operation record the user removed.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = get_runtime_paths(Path(temp_dir) / "data")
+            report = paths.reports / "transfer_report_2.json"
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(
+                json.dumps({"created_at": "2026-01-01T00:00:00+00:00", "transferred": 1, "errors": 0}),
+                encoding="utf-8",
+            )
+            records = OperationRecordService(paths).list_records()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["title"], "Import report")
+
+    def test_dashboard_reports_real_totals_not_the_size_of_its_preview(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = get_runtime_paths(Path(temp_dir) / "data")
+            service = OperationRecordService(paths)
+            for index in range(9):
+                service.record("duplicate_scan", "completed", title=f"Scan {index}")
+
+            summary = DashboardService(paths).summary(include_storage=False)
+            self.assertEqual(len(summary["recent_operations"]), 5, "the card preview stays small")
+            self.assertEqual(
+                summary["recent_operations_total"], 9,
+                "the count tile must report every operation, not just the preview",
+            )
+
+    def test_clearing_the_cache_forgets_hashes_the_running_app_still_holds(self):
+        # Deleting the file alone changed nothing the user could observe: the
+        # running app held the entries and wrote them straight back.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "hash_cache.json"
+            cache = HashCache(str(cache_path))
+            cache.set("C:/photo.jpg", "sha256", "full", 10, 1.0, "abc")
+            cache.save()
+            self.assertEqual(cache.get("C:/photo.jpg", "sha256", "full", 10, 1.0), "abc")
+
+            cache.clear()
+
+            self.assertIsNone(cache.get("C:/photo.jpg", "sha256", "full", 10, 1.0))
+            cache.save()
+            reloaded = HashCache(str(cache_path))
+            reloaded.load()
+            self.assertIsNone(reloaded.get("C:/photo.jpg", "sha256", "full", 10, 1.0))
 
 
 if __name__ == "__main__":

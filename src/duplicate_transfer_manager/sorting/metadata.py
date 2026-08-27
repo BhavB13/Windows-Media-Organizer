@@ -6,7 +6,7 @@ import mimetypes
 import json
 import shutil
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -38,16 +38,12 @@ class MetadataExtractor:
                     exif = image.getexif()
                     raw_date = exif.get(36867) or exif.get(306)
                     if raw_date:
-                        # EXIF capture times carry no zone. Reading them in the
-                        # sorting machine's local zone and rendering them back as
-                        # UTC (planner.py) shifted the date folder by the local
-                        # offset, so an evening photo landed under the next day.
-                        # Tag the wall clock as UTC so the digits survive the trip.
-                        captured = (
-                            datetime.strptime(str(raw_date), "%Y:%m:%d %H:%M:%S")
-                            .replace(tzinfo=timezone.utc)
-                            .timestamp()
-                        )
+                        # An EXIF capture time is a zoneless wall clock. It is
+                        # carried as a local-time epoch so that the local render
+                        # in planner.py returns the camera's own digits, and so
+                        # that it agrees with the modified-time fallback, which
+                        # is a real epoch shown to the user in local time.
+                        captured = datetime.strptime(str(raw_date), "%Y:%m:%d %H:%M:%S").timestamp()
             except (OSError, TypeError, ValueError):
                 pass
         elif media_type == "video":

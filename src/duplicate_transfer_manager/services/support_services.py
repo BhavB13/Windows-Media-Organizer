@@ -320,6 +320,17 @@ class ReportService:
         return str(self.paths.reports)
 
 
+def _normalised_path(value: str) -> str:
+    """Compare paths the way the filesystem does, so one file is one record."""
+
+    if not value:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(str(value)))
+    except (OSError, ValueError):
+        return str(value)
+
+
 class QuarantineService:
     def __init__(self, paths: RuntimePaths | None = None) -> None:
         self.paths = paths or get_runtime_paths()
@@ -341,10 +352,16 @@ class QuarantineService:
                 else []
             )
             if isinstance(values, list):
+                # Same rule as DuplicateQuarantineService: only records whose
+                # move actually happened describe a file that is in quarantine.
                 records.extend(
-                    QuarantineRecord.from_dict(value)
-                    for value in values
-                    if isinstance(value, dict)
+                    record
+                    for record in (
+                        QuarantineRecord.from_dict(value)
+                        for value in values
+                        if isinstance(value, dict)
+                    )
+                    if record.is_recoverable
                 )
         return records
 
@@ -461,7 +478,15 @@ class OperationRecordService:
         failures: list[str] | None = None,
     ) -> dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
-        operation_id = f"{operation_type}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}"
+        # Windows clock granularity is coarse enough that two operations
+        # recorded back to back can share a timestamp, and the writer below
+        # overwrites by path -- so one record silently replaced the other.
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+        operation_id = f"{operation_type}_{stamp}"
+        suffix = 1
+        while (self.paths.operations / f"{operation_id}.json").exists():
+            operation_id = f"{operation_type}_{stamp}_{suffix}"
+            suffix += 1
         payload = {
             "id": operation_id,
             "type": operation_type,
@@ -490,7 +515,23 @@ class OperationRecordService:
             if isinstance(payload, dict):
                 payload["path"] = str(path)
                 records.append(payload)
-        records.extend(self._records_from_reports())
+        # An import writes an operation record AND a transfer report, and the
+        # operation record names the report. Adding both listed every import
+        # twice in Activity, counted it twice on the dashboard, and exported it
+        # twice to CSV. Reports are only worth synthesising when no operation
+        # record already covers them -- an import from an older version, or one
+        # whose record was removed.
+        claimed = {
+            _normalised_path(record.get("report_path", ""))
+            for record in records
+            if record.get("report_path")
+        }
+        claimed.discard("")
+        records.extend(
+            record
+            for record in self._records_from_reports()
+            if _normalised_path(record.get("report_path", "")) not in claimed
+        )
         return sorted(records, key=lambda item: item.get("created_at", ""), reverse=True)
 
     def remove_record(self, record_id: str) -> bool:
@@ -621,6 +662,12 @@ class DashboardService:
             "connected_devices": connected_devices,
             "recent_operations": records[:5],
             "interrupted_transfers": interrupted[:5],
+            # The lists above are previews for the cards. The counts must not be
+            # derived from them: the Overview tiles read len() of the preview,
+            # so a user with 40 operations and 12 interrupted transfers was
+            # shown "5" and "5".
+            "recent_operations_total": len(records),
+            "interrupted_transfers_total": len(interrupted),
             "quarantine_count": len(quarantine_records),
             "recoverable_bytes": storage["quarantine_bytes"],
             "storage": storage,

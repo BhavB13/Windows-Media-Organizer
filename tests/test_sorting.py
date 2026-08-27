@@ -388,7 +388,11 @@ class SortMLAndPlannerTests(unittest.TestCase):
             self.assertEqual(largest.items[0].conflict, "overwrite")
             self.assertTrue(largest.items[0].requires_review)
 
-    def test_recursive_destination_is_not_executable(self):
+    def test_sorting_a_folder_into_its_own_subfolder_is_allowed(self):
+        # This is the feature's headline use case -- "sort my Downloads into
+        # Pictures, Videos, Documents". It used to be marked "recursive",
+        # deselected and forced into review, so a plain quick sort came back
+        # with every row unchecked and nothing to run.
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source = root / "source"
@@ -397,13 +401,52 @@ class SortMLAndPlannerTests(unittest.TestCase):
             destination.mkdir()
             item = source / "file.txt"
             item.write_text("safe", encoding="utf-8")
-            association = Association("Recursive", (), SortAction.MOVE, str(destination))
+            association = Association("Nested", (), SortAction.MOVE, str(destination))
             plan = SortPlanner(get_runtime_paths(root / "data")).build(
-                SortingProfile("Recursive", (association,), ml_enabled=False),
+                SortingProfile("Nested", (association,), ml_enabled=False),
                 [MetadataExtractor().extract(item)], sources=[str(source)], dry_run=False,
             )
-            self.assertEqual(plan.items[0].conflict, "recursive")
-            self.assertFalse(plan.items[0].selected)
+            self.assertTrue(plan.items[0].selected, "the ordinary sort must be runnable")
+            self.assertFalse(plan.items[0].requires_review)
+            self.assertEqual(plan.items[0].conflict, "nested")
+
+    def test_sorting_the_same_folder_twice_moves_nothing_the_second_time(self):
+        # The guard removed above existed to stop runaway nesting. This is what
+        # actually stops it, and it has to keep working: a file already in its
+        # sorted location must be recognised as itself, not treated as a name
+        # collision and renamed to file_1.txt on every subsequent run.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "inbox"
+            source.mkdir()
+            (source / "a.txt").write_text("one", encoding="utf-8")
+            paths = get_runtime_paths(root / "data")
+            association = Association("Nested", (), SortAction.MOVE, str(source / "Sorted"))
+            profile = SortingProfile("Nested", (association,), ml_enabled=False)
+
+            first = SortPlanner(paths).build(
+                profile,
+                [MetadataExtractor().extract(p) for p in sorted(source.rglob("*")) if p.is_file()],
+                sources=[str(source)], dry_run=False,
+            )
+            SortExecutor(paths).execute(
+                first,
+                approved_sources=[item.metadata.path for item in first.items],
+                confirmed=True, control=SortExecutionControl(), retry_attempts=1,
+            )
+            moved = sorted(str(p.relative_to(source)) for p in source.rglob("*") if p.is_file())
+            self.assertEqual(moved, [str(Path("Sorted") / "a.txt")])
+
+            second = SortPlanner(paths).build(
+                profile,
+                [MetadataExtractor().extract(p) for p in sorted(source.rglob("*")) if p.is_file()],
+                sources=[str(source)], dry_run=True,
+            )
+            self.assertEqual([item.conflict for item in second.items], ["self"])
+            self.assertEqual(
+                [item.selected for item in second.items], [False],
+                "a second sort of the same folder must move nothing",
+            )
 
     def test_manual_destination_prevents_sorting_onto_itself(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1054,33 +1097,90 @@ class SortWorkflowAndMonitorTests(unittest.TestCase):
             with self.assertRaises(ServiceError):
                 SortExecutor(paths).resume_run(run_id, confirmed=True)
 
-    def test_exif_capture_time_keeps_its_own_digits_through_the_utc_folder(self):
-        # EXIF wall clocks carry no zone. Reading them in the sorting machine's
-        # local zone and rendering them back as UTC shifted the date folder by
-        # the local offset, so an evening photo landed under the next day.
-        from datetime import datetime, timezone
+    def test_a_file_without_exif_is_filed_under_the_date_windows_shows(self):
+        # The fallback for anything with no capture time is the modified time,
+        # a real epoch. Rendering it in UTC filed a file saved late in the
+        # evening under the next day -- and on 31 December, the next year --
+        # while every date the app displayed for it was local.
+        import os
+        from datetime import datetime
+
+        offset = datetime.now().astimezone().utcoffset().total_seconds()
+        if offset == 0:
+            self.skipTest("Machine is on UTC, so the shift is unobservable here")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "inbox"
+            source.mkdir()
+            path = source / "notes.txt"
+            path.write_text("no exif here", encoding="utf-8")
+
+            # A local wall clock that a UTC render pushes onto another day.
+            local_hour = 0 if offset > 0 else 23
+            stamp = datetime(2024, 1, 31, local_hour, 30, 0).timestamp()
+            os.utime(path, (stamp, stamp))
+
+            association = Association(
+                "Dated", (), SortAction.MOVE, str(root / "sorted" / "{year}" / "{month}" / "{day}")
+            )
+            plan = SortPlanner(get_runtime_paths(root / "data")).build(
+                SortingProfile("Dated", (association,), ml_enabled=False),
+                [MetadataExtractor().extract(path)], sources=[str(source)], dry_run=True,
+            )
+            destination = Path(plan.items[0].destination)
+            self.assertEqual(
+                [
+                    destination.parent.parent.parent.name,
+                    destination.parent.parent.name,
+                    destination.parent.name,
+                ],
+                ["2024", "01", "31"],
+                "the folder must match the date the user sees on the file",
+            )
+
+    def test_a_photo_is_filed_under_the_date_the_camera_recorded(self):
+        # The invariant that matters, checked end to end through the planner:
+        # an EXIF wall clock of 2024:01:31 21:00 must produce 2024/01/31,
+        # whatever zone the sorting machine is in. Rendering these folders in
+        # UTC put an evening photo under the next day, and around New Year
+        # under the next year.
+        from datetime import datetime
 
         try:
             from PIL import Image
         except ImportError:  # pragma: no cover - Pillow ships with the app
             self.skipTest("Pillow is required for EXIF metadata")
 
-        if datetime.now().astimezone().utcoffset().total_seconds() == 0:
+        offset = datetime.now().astimezone().utcoffset().total_seconds()
+        if offset == 0:
             self.skipTest("Machine is on UTC, so the shift is unobservable here")
+        # Pick a capture time that a UTC render would push across midnight for
+        # this machine's offset, otherwise the old behaviour passes by luck.
+        capture_hour = "00:30:00" if offset > 0 else "23:30:00"
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "photo.jpg"
+            root = Path(temp_dir)
+            source = root / "inbox"
+            source.mkdir()
+            path = source / "photo.jpg"
             image = Image.new("RGB", (4, 4), "red")
             exif = image.getexif()
-            exif[306] = "2024:01:31 21:00:00"
+            exif[306] = f"2024:01:31 {capture_hour}"
             image.save(path, exif=exif)
 
-            extracted = MetadataExtractor().extract(path)
-            stamp = datetime.fromtimestamp(extracted.captured, timezone.utc)
+            association = Association(
+                "Dated", (), SortAction.MOVE, str(root / "sorted" / "{year}" / "{month}" / "{day}")
+            )
+            plan = SortPlanner(get_runtime_paths(root / "data")).build(
+                SortingProfile("Dated", (association,), ml_enabled=False),
+                [MetadataExtractor().extract(path)], sources=[str(source)], dry_run=True,
+            )
+            destination = Path(plan.items[0].destination)
             self.assertEqual(
-                (stamp.year, stamp.month, stamp.day, stamp.hour),
-                (2024, 1, 31, 21),
-                "the date folder must show the time the camera recorded",
+                [destination.parent.parent.parent.name, destination.parent.parent.name, destination.parent.name],
+                ["2024", "01", "31"],
+                "the date folder must show the date the camera recorded",
             )
 
     def test_live_monitoring_requires_explicit_approval(self):

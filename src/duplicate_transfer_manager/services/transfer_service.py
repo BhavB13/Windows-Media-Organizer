@@ -123,17 +123,19 @@ class TransferService:
                 ),
             )
 
-        reporter.set_state(
-            status,
-            phase=OperationPhase.FINALIZATION,
-            message=(
-                "Transfer cancelled safely."
-                if status == OperationState.CANCELLED
-                else "Transfer completed."
-                if status == OperationState.COMPLETED
-                else "Transfer stopped because attention is required."
-            ),
-        )
+        if status == OperationState.CANCELLED:
+            closing_message = "Transfer cancelled safely."
+        elif status == OperationState.COMPLETED and error_count:
+            # Reaching the end is not the same as succeeding. Saying "completed"
+            # here contradicted the error count in the very same summary.
+            closing_message = (
+                f"Transfer finished, but {error_count} file operation(s) could not be completed."
+            )
+        elif status == OperationState.COMPLETED:
+            closing_message = "Transfer completed."
+        else:
+            closing_message = "Transfer stopped because attention is required."
+        reporter.set_state(status, phase=OperationPhase.FINALIZATION, message=closing_message)
         return OperationResult(
             status=status,
             counts={

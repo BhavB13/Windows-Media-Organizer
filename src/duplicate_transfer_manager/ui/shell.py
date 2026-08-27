@@ -276,7 +276,9 @@ class MainWindow(QMainWindow):
             "sort": SortWorkspace(runtime_paths, settings, settings_service, self.operation_records),
             "activity": ActivityPage(self.operation_records, self.report_service),
             "quarantine": QuarantinePage(DuplicateQuarantineService(runtime_paths)),
-            "settings": SettingsPage(settings, settings_service, self.dashboard_service),
+            "settings": SettingsPage(
+                settings, settings_service, self.dashboard_service, hash_cache=hash_cache
+            ),
             "help": HelpPage(),
         }
         for page in self.pages.values():
@@ -307,6 +309,16 @@ class MainWindow(QMainWindow):
         self.top_bar.set_route(route)
         self.route_changed.emit(key)
         page = self.pages[key]
+        # Pages read their data once, in their constructor. Without this, files
+        # the user had just quarantined were still absent from the Quarantine
+        # page and a finished import was missing from Activity -- the recovery
+        # screen said nothing had been moved.
+        refresh = getattr(page, "refresh", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:  # noqa: BLE001 - navigation must never fail
+                pass
         page.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def set_theme(self, preference: str) -> None:

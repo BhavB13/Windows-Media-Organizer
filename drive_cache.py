@@ -278,7 +278,22 @@ def build_drive_cache(root, cache_path, settings, stop_event, logger=None, progr
     if not cache.acquire_lock():
         raise RuntimeError(f"Cache is locked: {cache_path}")
     try:
-        discovery = discover_files(root, settings, stop_event, progress_callback=progress_callback, logger=logger)
+        # discover_files reports with a single ScanProgress argument, while the
+        # hashing loop below reports (current, total, text). Handing the same
+        # three-argument callback straight to discovery raised TypeError on the
+        # first folder, so the documented dtm-build-cache CLI crashed on every
+        # run before hashing anything.
+        discovery_progress = None
+        if progress_callback:
+            def discovery_progress(scan):
+                message = scan.message or f"Scanning {scan.source}"
+                progress_callback(
+                    scan.files_found,
+                    scan.total,
+                    f"{message} ({scan.files_found} file(s) found)",
+                )
+
+        discovery = discover_files(root, settings, stop_event, progress_callback=discovery_progress, logger=logger)
         seen_paths = []
         total = len(discovery.files)
         hash_func = hash_func or compute_hash

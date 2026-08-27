@@ -182,6 +182,8 @@ def _thumbnail(path: str, target: Path, is_adb: bool) -> tuple[str, str]:
         return "", "Thumbnail generation requires Pillow."
     if Path(path).suffix.lower() not in IMAGE_EXTENSIONS:
         return "", "No thumbnail for this file type."
+    if _thumbnail_is_current(path, target):
+        return str(target), ""
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         with Image.open(path) as image:
@@ -190,6 +192,31 @@ def _thumbnail(path: str, target: Path, is_adb: bool) -> tuple[str, str]:
         return str(target), ""
     except (OSError, UnidentifiedImageError):
         return "", "Thumbnail unavailable."
+
+
+def _thumbnail_is_current(path: str, target: Path) -> bool:
+    """True when a previously written thumbnail still describes this file.
+
+    Thumbnail paths are derived from the group hash, so re-scanning the same
+    folder recomputed and rewrote an identical JPEG for every duplicate every
+    time. Decoding and re-encoding is the expensive part of building a review.
+    """
+
+    try:
+        return target.stat().st_mtime >= Path(path).stat().st_mtime
+    except OSError:
+        return False
+
+
+def _preview(path: str, target: Path, is_adb: bool) -> tuple[str, str, str]:
+    """Dimensions and thumbnail from a single decode.
+
+    These used to be two separate ``Image.open`` calls over the same file.
+    """
+
+    dimensions, dimension_status = _dimensions(path, is_adb)
+    thumbnail_path, thumbnail_status = _thumbnail(path, target, is_adb)
+    return dimensions, thumbnail_path, thumbnail_status or dimension_status
 
 
 def _quality_key(item: DuplicateItem) -> tuple[int, int, float, str]:
@@ -226,13 +253,11 @@ def build_duplicate_review(
         items: list[DuplicateItem] = []
         for item_index, file_info in enumerate(files, 1):
             item_id = f"{group_hash}-{item_index}"
-            dimensions, dimension_status = _dimensions(file_info.path, file_info.is_adb)
-            thumbnail_path, thumbnail_status = _thumbnail(
+            dimensions, thumbnail_path, status = _preview(
                 file_info.path,
                 thumb_root / group_hash / f"{item_index}.jpg",
                 file_info.is_adb,
             )
-            status = thumbnail_status or dimension_status
             items.append(
                 DuplicateItem(
                     id=item_id,
@@ -491,8 +516,17 @@ class DuplicateQuarantineService:
                 unreadable.append(f"{manifest}: {exc}")
                 continue
             for value in payload.get("records", []):
-                if isinstance(value, dict):
-                    records.append(QuarantineRecord.from_dict(value))
+                if not isinstance(value, dict):
+                    continue
+                record = QuarantineRecord.from_dict(value)
+                # A previewed (dry-run) or failed record describes a file that
+                # provably never moved. Listing them made the Quarantine page
+                # offer to restore files that were still in place, and made the
+                # dashboard report recovered space that was never recovered.
+                # Anything else, including a "pending" record left by a crash,
+                # is kept: it may be the only pointer to a file that did move.
+                if record.is_recoverable:
+                    records.append(record)
         if unreadable:
             raise ServiceError(
                 ErrorCode.INVALID_DATA,
