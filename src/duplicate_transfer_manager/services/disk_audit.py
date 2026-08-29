@@ -804,12 +804,22 @@ class DiskAuditService:
                         except OSError as exc:
                             if len(warnings) < 200:
                                 warnings.append(f"Could not inspect {entry.path}: {exc}")
+                        except RecursionError:
+                            # A tree deeper than the interpreter's limit is one
+                            # unmeasurable branch, not a reason to lose the
+                            # whole audit. Reported like any other location the
+                            # scan could not enter.
+                            if len(warnings) < 200:
+                                warnings.append(f"Too deeply nested to measure: {entry.path}")
             except OSError as exc:
                 if len(warnings) < 200:
                     warnings.append(f"Could not open {directory}: {exc}")
             return size, count
 
-        size, count = visit(path)
+        try:
+            size, count = visit(path)
+        except RecursionError:
+            return 0, 0, warnings + [f"Too deeply nested to measure: {path}"]
         return size, count, warnings
 
     def _deep_findings(
@@ -859,6 +869,9 @@ class DiskAuditService:
                         except OSError as exc:
                             if len(warnings) < 200:
                                 warnings.append(f"Could not inspect {entry.path}: {exc}")
+                        except RecursionError:
+                            if len(warnings) < 200:
+                                warnings.append(f"Too deeply nested to scan: {entry.path}")
             except OSError as exc:
                 if len(warnings) < 200:
                     warnings.append(f"Could not open {directory}: {exc}")
@@ -866,7 +879,10 @@ class DiskAuditService:
                 directories.append((directory, size, count))
             return size, count
 
-        visit(volume.root)
+        try:
+            visit(volume.root)
+        except RecursionError:
+            warnings.append(f"Too deeply nested to scan completely: {volume.root}")
         claimed = [path for item in known_items for path in item.paths if path]
         accepted_paths = list(claimed)
         findings: list[DiskAuditItem] = []

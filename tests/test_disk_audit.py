@@ -1,6 +1,7 @@
 import os
 import json
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -478,6 +479,40 @@ class DiskAuditServiceTests(unittest.TestCase):
             with self.assertRaises(OperationCancelled):
                 service.run(DiskAuditSettings(str(root)), token, OperationReporter())
             self.assertEqual(service.store.list_snapshots(), [])
+
+
+class DeepNestingTests(unittest.TestCase):
+    def test_a_tree_deeper_than_the_recursion_limit_is_a_warning_not_a_lost_audit(self):
+        # Both walkers recurse once per directory level and caught only
+        # OSError, so one pathological branch discarded the whole audit.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = get_runtime_paths(root / "data")
+            deep = root / "deep"
+            deep.mkdir()
+            service = DiskAuditService(paths)
+
+            original = sys.getrecursionlimit()
+            sys.setrecursionlimit(60)
+            try:
+                # Far shallower than the real limit, but deeper than the one set
+                # above, so the walker meets a genuine RecursionError.
+                current = deep
+                for index in range(80):
+                    current = current / f"n{index}"
+                    current.mkdir()
+                (current / "leaf.bin").write_bytes(b"x" * 16)
+
+                size, count, warnings = service._measure_path(
+                    str(deep), CancellationToken()
+                )
+            finally:
+                sys.setrecursionlimit(original)
+
+            self.assertTrue(
+                any("Too deeply nested" in warning for warning in warnings),
+                warnings,
+            )
 
 
 class AuditSnapshotStoreCacheTests(unittest.TestCase):

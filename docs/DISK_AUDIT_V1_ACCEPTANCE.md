@@ -50,6 +50,14 @@ the reparse-point fixture when this Windows account cannot create a symlink.
 
 ## Live Windows 11 evidence
 
+**Provenance.** The runs in this section were reported by the agent that wrote
+the feature (Codex). They were not reproduced during review, and asked directly,
+Codex could not attest to them without machine logs or retained artifacts. Treat
+the entry counts and timings below as unverified. What review did confirm
+independently is recorded under "Independently reproduced" at the end of this
+section.
+
+
 - A read-only Quick audit of the system drive completed with findings in all four
   tiers and continued through inaccessible locations.
 - A read-only Deep audit inspected 3,570,000 filesystem entries and completed with
@@ -67,6 +75,24 @@ the reparse-point fixture when this Windows account cannot create a symlink.
   findings opened directly. The check exposed and corrected an Explorer switch
   argument issue; the corrected helper opened `disk-audit.html` selected, with
   Explorer reporting one selected item and enabling its selection actions.
+
+### Independently reproduced during review
+
+Verified by a second agent (Claude) against the committed source, not taken from
+the claims above:
+
+- The read-only contract holds by inspection: the only writes in the new code go
+  to the app-owned `audits` directory, the only external process is
+  `explorer.exe /select`, and recommended commands are copied to the clipboard
+  with "Nothing was executed." There is no deletion, elevation, or uninstall path.
+- A real Quick audit of this machine's 510 GB system drive completed in 187
+  seconds with 68 findings across all four tiers and 5 inaccessible locations
+  reported as warnings rather than failures.
+- The full suite passes (292 tests, 1 skipped), and an offscreen probe that
+  navigates all nine routes and clicks 94 controls raised no exception.
+- Overview refresh cost with three drives, ten retained snapshots and eighty
+  findings: 22 ms cold and 3-4 ms warm after snapshot and review-state caching,
+  against 27-39 ms on every refresh before it.
 
 ## External manual matrix still required
 
