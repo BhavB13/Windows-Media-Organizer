@@ -30,6 +30,11 @@ matter most are:
 
 ## How updates are verified
 
+**This flow is not yet reachable.** No release source is configured and no code
+path in the application invokes the update service, so the application never
+checks for or installs an update today. The verification below is implemented
+and tested, and describes what will happen once a release channel exists.
+
 An update is rejected unless all of the following hold:
 
 - The manifest carries every required field and its channel matches the install.

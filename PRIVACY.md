@@ -7,15 +7,20 @@ and does not upload them anywhere.
 
 Under default settings, nothing.
 
-The application makes network requests in exactly two situations, both of which
-you control:
+This build makes **no network requests at all**.
 
-1. **Update checks.** If "Check for updates automatically" is enabled, the app
-   fetches a signed update manifest no more than once per day, and downloads an
-   installer only after you approve it. The request carries no identifier for
-   you or your library.
-2. **Crash diagnostics.** Disabled by default. Nothing is transmitted unless you
-   explicitly turn on "Share sanitized crash diagnostics" in Settings.
+1. **Update checks do not happen.** No release source is configured, and no code
+   path in the application reaches the update service, so the app never contacts
+   a server to look for a new version. Manifest verification is implemented and
+   tested, ready for a future release channel, but it is dormant: nothing calls
+   it. Earlier versions of this document described a daily update check. That
+   was never true in a shipped build, and the claim has been removed rather than
+   left to imply traffic that does not occur.
+2. **Crash diagnostics are disabled by default and have no transport.** Reports
+   are written locally and sanitized. Nothing is transmitted.
+
+If either of these ever starts making a request, this document must change in
+the same commit.
 
 There is no usage analytics, telemetry, account system, or advertising
 identifier. The app does not phone home on launch.

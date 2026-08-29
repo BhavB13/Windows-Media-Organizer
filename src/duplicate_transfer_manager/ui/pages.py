@@ -58,6 +58,7 @@ from ..services import (
     ScheduledScanService,
     SettingsService,
     STAGE_LABELS,
+    UpdateService,
     TRANSFER_PROFILES,
     build_import_review,
     build_import_settings,
@@ -2802,10 +2803,19 @@ class SettingsPage(BasePage):
         self.diagnostics.setToolTip(
             "Disabled by default. Filenames, paths, hashes, and device serials are excluded."
         )
-        self.updates = QCheckBox("Check for updates automatically")
-        self.updates.setChecked(settings.check_updates_automatically)
+        # No checkbox here. Nothing in the app reaches UpdateService, and no
+        # release source is configured, so offering "check automatically" was a
+        # control that could not do anything.
+        update_state = UpdateService(service.paths).status(
+            channel=settings.update_channel
+        )
+        self.update_status = QLabel(
+            f"Version {update_state['current_version']}. {update_state['message']}"
+        )
+        self.update_status.setWordWrap(True)
+        self.update_status.setProperty("muted", True)
         exp_layout.addWidget(self.diagnostics)
-        exp_layout.addWidget(self.updates)
+        exp_layout.addWidget(self.update_status)
         exp_layout.addWidget(
             InlineMessage(
                 "All scans, hashes, reports, and settings remain local. "
@@ -2855,10 +2865,6 @@ class SettingsPage(BasePage):
             )
         self.platform_tools = QLabel(f"{tools_summary} ({platform_tools['license']})")
         self.platform_tools.setProperty("muted", True)
-        self.update_channel = QComboBox()
-        for channel in ("stable", "beta", "development"):
-            self.update_channel.addItem(channel.title(), channel)
-        self.update_channel.setCurrentIndex(max(0, self.update_channel.findData(settings.update_channel)))
         advanced_layout.addWidget(self.cache_days)
         advanced_layout.addWidget(self.sorting_retention_days)
         advanced_layout.addWidget(clear_cache)
@@ -2867,8 +2873,6 @@ class SettingsPage(BasePage):
         advanced_layout.addWidget(self.android_path)
         advanced_layout.addWidget(self.keep_awake)
         advanced_layout.addWidget(self.platform_tools)
-        advanced_layout.addWidget(QLabel("Update channel"))
-        advanced_layout.addWidget(self.update_channel)
         self.scheduled_frequency = QComboBox()
         self.scheduled_frequency.addItem("Off", "off")
         self.scheduled_frequency.addItem("Daily read-only duplicate scan", "daily")
@@ -2916,13 +2920,15 @@ class SettingsPage(BasePage):
             )
         )
         self.settings.diagnostic_consent = self.diagnostics.isChecked()
-        self.settings.check_updates_automatically = self.updates.isChecked()
+        # check_updates_automatically and update_channel are deliberately not
+        # written here any more, and deliberately still exist on AppSettings:
+        # from_dict drops unknown keys, so removing the fields would silently
+        # discard them from every existing settings.json.
         self.settings.cache_retention_days = self.cache_days.value()
         self.settings.sorting_history_retention_days = self.sorting_retention_days.value()
         self.settings.android_enabled = self.android_enabled.isChecked()
         self.settings.android_default_path = self.android_path.text().strip() or "/sdcard/DCIM"
         self.settings.keep_android_awake = self.keep_awake.isChecked()
-        self.settings.update_channel = self.update_channel.currentData()
         self.settings.scheduled_scan_frequency = self.scheduled_frequency.currentData()
         self.settings.scheduled_scan_path = self.scheduled_path.path()
         if (
@@ -3061,7 +3067,7 @@ class FirstRunOnboardingDialog(QDialog):
             ("Android authorization", "Enable USB debugging, keep the phone unlocked, and approve the prompt."),
             ("Privacy", "Files, paths, hashes, and media metadata stay on this PC by default."),
             ("Diagnostics", "Crash diagnostics are off unless you opt in, and reports are sanitized."),
-            ("Updates", "Automatic update checks follow your selected channel and never change system ADB."),
+            ("Updates", "This build has no release source configured, so it never checks for updates. It also never changes system ADB."),
             ("Sort Files", "Deterministic rules override local suggestions. Every live run is reviewed, verified, journaled, and undoable where possible."),
         ]
         for heading, body in topics:
@@ -3070,10 +3076,7 @@ class FirstRunOnboardingDialog(QDialog):
             layout.addWidget(label)
         self.diagnostics = QCheckBox("Opt in to sanitized crash diagnostics")
         self.diagnostics.setChecked(settings.diagnostic_consent)
-        self.updates = QCheckBox("Check for updates automatically")
-        self.updates.setChecked(settings.check_updates_automatically)
         layout.addWidget(self.diagnostics)
-        layout.addWidget(self.updates)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Finish setup")
         buttons.accepted.connect(self.accept)
@@ -3081,7 +3084,6 @@ class FirstRunOnboardingDialog(QDialog):
 
     def accept(self) -> None:
         self.settings.diagnostic_consent = self.diagnostics.isChecked()
-        self.settings.check_updates_automatically = self.updates.isChecked()
         self.settings.onboarding_completed = True
         self.settings_service.save(self.settings)
         super().accept()

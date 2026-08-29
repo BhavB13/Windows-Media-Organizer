@@ -166,6 +166,16 @@ class DiagnosticsController(DataController):
 
 
 class UpdateController(DataController):
+    """Deliberately not wired into the UI yet.
+
+    UpdateService can fetch and verify a signed manifest, but no release source
+    is configured (UpdateService.RELEASE_MANIFEST_URL is empty), so there is
+    nothing for this controller to check. It is kept, with its tests, so the
+    verified-install path is ready the moment a release channel exists. Wire it
+    in the same change that sets that URL -- not before, or the UI starts
+    promising a check that cannot happen.
+    """
+
     def __init__(
         self,
         service: UpdateService | None = None,

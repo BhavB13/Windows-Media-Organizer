@@ -815,16 +815,39 @@ class UpdateService:
         self.paths = paths or get_runtime_paths()
         self.public_key_file = _resource_path("packaging/update_public_key.json")
 
-    def status(self) -> dict[str, Any]:
+    # No release manifest is published for this build. check_manifest_url and
+    # download_installer work, but nothing calls them, so setting this to a URL
+    # is the single change that turns update checking on.
+    RELEASE_MANIFEST_URL = ""
+
+    def status(self, *, channel: str = "") -> dict[str, Any]:
+        """Describe the update system without overstating it.
+
+        ``configured`` used to mean "the bundled public key file exists", which
+        is true in every packaged build and says nothing about whether an update
+        can actually be found. Presenting that as "updates are configured" told
+        the user a release channel existed when none does, so the two facts are
+        now reported separately.
+        """
+
         last_check = self._last_check()
+        endpoint_configured = bool(self.RELEASE_MANIFEST_URL)
         return {
             "current_version": __version__,
-            "channel": "stable",
-            "configured": self.public_key_file.exists(),
+            "channel": channel or "",
+            "signing_key_present": self.public_key_file.exists(),
+            "release_source_configured": endpoint_configured,
+            "configured": endpoint_configured,
             "last_check_file": str(self.paths.updates / "last_check.json"),
             "last_checked_at": last_check.get("checked_at", ""),
-            "check_due": self.check_due(),
-            "message": "Signed updates are enabled when a release manifest is available.",
+            "check_due": self.check_due() if endpoint_configured else False,
+            "message": (
+                "Signed updates are available."
+                if endpoint_configured
+                else "Automatic updates are unavailable in this build: no release "
+                "source is configured. Update verification is implemented and "
+                "will be used once a release channel exists."
+            ),
         }
 
     def load_manifest(self, path: str | os.PathLike[str]) -> dict[str, Any]:
