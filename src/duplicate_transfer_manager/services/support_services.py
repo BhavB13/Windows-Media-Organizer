@@ -213,6 +213,21 @@ class DeviceService:
     def list_devices(self) -> list[dict[str, Any]]:
         return ADBBridge.list_devices()
 
+    def list_folders(self, root: str, serial: str) -> dict[str, Any]:
+        """Enumerate one level of folders on the device.
+
+        Returns the normalised root alongside the folders so the caller does not
+        have to normalise a second time on the UI thread. Errors are raised, not
+        swallowed: a device failure is not an empty folder, and reporting it as
+        one sends the user looking for missing files instead of a stalled cable.
+        """
+
+        normalized = ADBBridge.normalize_remote_path(root or "/sdcard")
+        return {
+            "root": normalized,
+            "folders": ADBBridge.get_directory_structure(normalized, serial=serial),
+        }
+
     @staticmethod
     def connection_help(devices: list[dict[str, Any]] | None = None) -> str:
         """Explain what to do about the current Android connection state.

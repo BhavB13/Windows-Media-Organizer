@@ -9,11 +9,7 @@ from unittest.mock import patch
 
 from duplicate_transfer_manager.controllers import (
     DeviceController,
-    DiagnosticsController,
     DuplicateScanController,
-    QuarantineController,
-    ReportsController,
-    SettingsController,
     TransferController,
     UpdateController,
 )
@@ -391,10 +387,6 @@ class ControllerTests(unittest.TestCase):
             DuplicateScanController(HashCache(os.devnull)),
             TransferController(HashCache(os.devnull)),
             DeviceController(),
-            ReportsController(),
-            QuarantineController(),
-            SettingsController(),
-            DiagnosticsController(),
             UpdateController(),
         ]
         for controller in controllers:
@@ -408,16 +400,28 @@ class ControllerTests(unittest.TestCase):
             ):
                 self.assertTrue(hasattr(controller, signal_name))
 
-    def test_settings_controller_returns_data_through_completion_signal(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = SettingsService(get_runtime_paths(temp_dir))
-            service.save(AppSettings(appearance="dark"))
-            controller = SettingsController(service)
-            results = []
-            controller.completed.connect(results.append)
-            controller.load()
-            self.wait(controller)
-            self.assertEqual(results[0].data["settings"].appearance, "dark")
+    def test_a_data_controller_returns_its_payload_through_the_completion_signal(self):
+        """DataController.run_loader is the shared loader path.
+
+        This used to be asserted through SettingsController, which has been
+        removed as unused. DeviceController exercises the same code and is
+        wired into two pages, so the coverage moved here rather than being lost.
+        """
+
+        class StubDeviceService:
+            def list_folders(self, root, serial):
+                return {"root": root, "folders": [{"name": "DCIM", "path": "/sdcard/DCIM"}]}
+
+        controller = DeviceController()
+        controller.service = StubDeviceService()
+        results = []
+        controller.completed.connect(results.append)
+        controller.browse("/sdcard", "serial-1")
+        self.wait(controller)
+
+        payload = results[0].data["folders"]
+        self.assertEqual(payload["root"], "/sdcard")
+        self.assertEqual(payload["folders"][0]["name"], "DCIM")
 
 
 if __name__ == "__main__":

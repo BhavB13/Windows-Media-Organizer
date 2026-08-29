@@ -124,6 +124,59 @@ class Phase2UiTests(unittest.TestCase):
         question.assert_not_called()
         self.assertTrue(event.isAccepted())
 
+    def wait_for_device_work(self, page, timeout_ms: int = 5000) -> None:
+        """Let an asynchronous device call finish and deliver its result.
+
+        Device enumeration and folder browsing moved onto a worker, so a test
+        that calls them and asserts immediately is racing the thread pool.
+        """
+
+        self.assertTrue(page.device_controller.wait_for_done(timeout_ms))
+        for _ in range(20):
+            self.application.processEvents()
+
+    def test_device_enumeration_does_not_run_on_the_gui_thread(self):
+        """adb shells out to a subprocess; that must not block the window.
+
+        On a slow, locked or unauthorised phone these calls take seconds. They
+        used to run inline in _refresh_devices and _browse_adb_path.
+        """
+
+        import threading
+
+        gui_thread = threading.get_ident()
+        callers = []
+
+        def record(*_args, **_kwargs):
+            callers.append(threading.get_ident())
+            return []
+
+        for key, page_attr in (("duplicates", "path"), ("import", "source_path")):
+            page = self.window.pages[key]
+            callers.clear()
+            with patch("adb_bridge.ADBBridge.list_devices", side_effect=record):
+                page._refresh_devices()
+                self.wait_for_device_work(page)
+
+            self.assertEqual(len(callers), 1, f"{key} did not enumerate once")
+            self.assertNotEqual(
+                callers[0], gui_thread, f"{key} enumerated devices on the GUI thread"
+            )
+
+    def test_a_device_failure_is_reported_as_an_error_not_an_empty_folder(self):
+        page = self.window.pages["duplicates"]
+        page.source_picker.cards["android"].setChecked(True)
+        page.device_choice.addItem("Pixel — device", "phone-1")
+
+        with patch(
+            "adb_bridge.ADBBridge.get_directory_structure",
+            side_effect=OSError("device offline"),
+        ):
+            page._browse()
+            self.wait_for_device_work(page)
+
+        self.assertIn("device error", page.banner.label.text().casefold())
+
     def test_shell_contains_all_required_routes(self):
         self.assertEqual(
             set(self.window.pages),
@@ -239,6 +292,7 @@ class Phase2UiTests(unittest.TestCase):
             return_value=("Camera — /sdcard/DCIM/Camera", True),
         ):
             page._browse()
+            self.wait_for_device_work(page)
 
         self.assertEqual(page.path.path(), "/sdcard/DCIM/Camera")
 
@@ -556,6 +610,7 @@ class Phase2UiTests(unittest.TestCase):
             return_value=("Camera — /sdcard/DCIM/Camera", True),
         ):
             page._browse(page.source_path, "Choose import source")
+            self.wait_for_device_work(page)
 
         self.assertEqual(page.source_path.path(), "/sdcard/DCIM/Camera")
 

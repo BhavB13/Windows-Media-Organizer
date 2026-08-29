@@ -78,90 +78,17 @@ class DeviceController(DataController):
             message="Reading Android device information…",
         )
 
+    def browse(self, root: str, serial: str) -> bool:
+        """List one level of device folders without blocking the window.
 
-class ReportsController(DataController):
-    def __init__(
-        self,
-        service: ReportService | None = None,
-        thread_pool: QThreadPool | None = None,
-        parent: QObject | None = None,
-    ) -> None:
-        super().__init__(thread_pool, parent)
-        self.service = service or ReportService()
+        adb shells out to a subprocess. On a slow, locked or unauthorised phone
+        that call takes seconds, and it used to run on the Qt main thread.
+        """
 
-    def refresh(self) -> bool:
         return self.run_loader(
-            self.service.list_reports,
-            data_key="reports",
-            message="Loading transfer reports…",
-        )
-
-    def load(self, path: str) -> bool:
-        return self.run_loader(
-            lambda: self.service.load_report(path),
-            data_key="report",
-            message="Loading transfer report…",
-        )
-
-
-class QuarantineController(DataController):
-    def __init__(
-        self,
-        service: QuarantineService | None = None,
-        thread_pool: QThreadPool | None = None,
-        parent: QObject | None = None,
-    ) -> None:
-        super().__init__(thread_pool, parent)
-        self.service = service or QuarantineService()
-
-    def refresh(self) -> bool:
-        return self.run_loader(
-            self.service.list_records,
-            data_key="records",
-            message="Loading quarantine records…",
-        )
-
-
-class SettingsController(DataController):
-    def __init__(
-        self,
-        service: SettingsService | None = None,
-        thread_pool: QThreadPool | None = None,
-        parent: QObject | None = None,
-    ) -> None:
-        super().__init__(thread_pool, parent)
-        self.service = service or SettingsService()
-
-    def load(self) -> bool:
-        return self.run_loader(
-            self.service.load,
-            data_key="settings",
-            message="Loading settings…",
-        )
-
-    def save(self, settings: AppSettings) -> bool:
-        return self.run_loader(
-            lambda: self.service.save(settings),
-            data_key="settings",
-            message="Saving settings…",
-        )
-
-
-class DiagnosticsController(DataController):
-    def __init__(
-        self,
-        service: DiagnosticsService | None = None,
-        thread_pool: QThreadPool | None = None,
-        parent: QObject | None = None,
-    ) -> None:
-        super().__init__(thread_pool, parent)
-        self.service = service or DiagnosticsService()
-
-    def collect(self, include_devices: bool = True) -> bool:
-        return self.run_loader(
-            lambda: self.service.collect(include_devices),
-            data_key="diagnostics",
-            message="Collecting local diagnostics…",
+            lambda: self.service.list_folders(root, serial),
+            data_key="folders",
+            message="Reading folders on the device…",
         )
 
 

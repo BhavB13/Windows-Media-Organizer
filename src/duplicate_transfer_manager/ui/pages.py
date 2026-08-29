@@ -39,7 +39,7 @@ from models import Settings
 from transfer_safety import cleanup_partial_files
 from utils import DEFAULT_EXCLUDES, DEFAULT_MEDIA_EXTS, HashCache
 
-from ..controllers import DuplicateScanController, TransferController
+from ..controllers import DeviceController, DuplicateScanController, TransferController
 from ..controllers.base import OperationWorker
 from ..core import AppSettings, CancellationToken, OperationResult, OperationState
 from ..runtime_paths import get_runtime_paths
@@ -433,6 +433,14 @@ class DuplicatesPage(BasePage):
         if hash_cache is None:
             self.hash_cache.load()
         self.controller = DuplicateScanController(self.hash_cache)
+        # Its own controller per page: adb enumeration used to run inline on
+        # the Qt main thread, and sharing one controller between two pages makes
+        # result routing ambiguous when both are alive.
+        self.device_controller = DeviceController()
+        self._pending_browse_selector = None
+        self.device_controller.completed.connect(self._on_device_result)
+        self.device_controller.failed.connect(self._on_device_error)
+        self.device_controller.recoverable_error.connect(self._on_device_error)
         self.review: DuplicateReview | None = None
         self.item_groups: dict[str, str] = {}
         self.item_rows: dict[str, int] = {}
@@ -720,21 +728,25 @@ class DuplicatesPage(BasePage):
             self.source_picker.select("local")
 
     def _browse_adb_path(self, selector: PathSelector) -> None:
-        from adb_bridge import ADBBridge
+        """Ask the device for its folders on a worker, not on the main thread."""
 
         serial = self.device_choice.currentData() or ""
         if not serial:
             self.path.set_error("Select an authorized Android device before browsing phone folders.")
             return
-        current = ADBBridge.normalize_remote_path(selector.path() or "/sdcard")
-        try:
-            folders = ADBBridge.get_directory_structure(current, serial=serial)
-        except Exception as exc:
-            # A device error is not an empty folder. Saying so sends the user
-            # looking for missing files instead of a stalled connection.
-            self.banner.set_message(f"Could not list folders under {current}: {exc}", "error")
-            self.banner.show()
+        if self.device_controller.busy:
             return
+        self._pending_browse_selector = selector
+        self.device_controller.browse(selector.path() or "/sdcard", serial)
+
+    def _on_device_folders(self, payload) -> None:
+        selector = self._pending_browse_selector
+        self._pending_browse_selector = None
+        if selector is None:
+            # The user changed source while the device was still answering.
+            return
+        current = str(payload.get("root", ""))
+        folders = payload.get("folders") or []
         if not folders:
             self.banner.set_message(f"No subfolders under {current}. You can type a nested path manually.", "warning")
             self.banner.show()
@@ -774,10 +786,34 @@ class DuplicatesPage(BasePage):
         self.scan_button.hide()
 
     def _refresh_devices(self) -> None:
-        from adb_bridge import ADBBridge
+        """Enumerate devices on a worker. adb shells out to a subprocess."""
 
+        if self.device_controller.busy:
+            return
         self.device_choice.clear()
-        devices = ADBBridge.list_devices()
+        self.device_choice.addItem("Checking for devices…", "")
+        self.device_controller.refresh()
+
+    def _on_device_result(self, result) -> None:
+        data = result.data or {}
+        if "devices" in data:
+            self._on_devices_listed(data.get("devices"))
+        elif "folders" in data:
+            self._on_device_folders(data.get("folders") or {})
+
+    def _on_device_error(self, error) -> None:
+        # A device error is not an empty folder. Saying so sends the user
+        # looking for missing files instead of a stalled connection.
+        self._pending_browse_selector = None
+        message = getattr(error, "message", str(error))
+        self.device_choice.clear()
+        self.device_choice.addItem("No authorized Android device found", "")
+        self.banner.set_message(f"Android device error: {message}", "error")
+        self.banner.show()
+
+    def _on_devices_listed(self, devices) -> None:
+        devices = devices or []
+        self.device_choice.clear()
         for device in devices:
             label = f"{device.get('model') or device.get('serial')} — {device.get('status', 'unknown')}"
             self.device_choice.addItem(label, device.get("serial", ""))
@@ -1235,6 +1271,14 @@ class ImportPage(BasePage):
         self.operation_service = operation_service or OperationRecordService(self.paths)
         self.app_settings = settings or AppSettings()
         self.controller = TransferController(self.hash_cache)
+        # Its own controller per page: adb enumeration used to run inline on
+        # the Qt main thread, and sharing one controller between two pages makes
+        # result routing ambiguous when both are alive.
+        self.device_controller = DeviceController()
+        self._pending_browse_selector = None
+        self.device_controller.completed.connect(self._on_device_result)
+        self.device_controller.failed.connect(self._on_device_error)
+        self.device_controller.recoverable_error.connect(self._on_device_error)
         self.current_settings = None
         self.activity_lines: list[str] = []
         self.adb_serial = ""
@@ -1575,21 +1619,24 @@ class ImportPage(BasePage):
         self.keep_awake.setChecked(bool(settings.keep_android_awake))
 
     def _browse_adb_path(self, selector: PathSelector) -> None:
-        from adb_bridge import ADBBridge
+        """Ask the device for its folders on a worker, not on the main thread."""
 
         serial = self.device_choice.currentData() or ""
         if not serial:
             selector.set_error("Select an authorized Android device before browsing phone folders.")
             return
-        current = ADBBridge.normalize_remote_path(selector.path() or "/sdcard")
-        try:
-            folders = ADBBridge.get_directory_structure(current, serial=serial)
-        except Exception as exc:
-            # A device error is not an empty folder. Saying so sends the user
-            # looking for missing files instead of a stalled connection.
-            self.banner.set_message(f"Could not list folders under {current}: {exc}", "error")
-            self.banner.show()
+        if self.device_controller.busy:
             return
+        self._pending_browse_selector = selector
+        self.device_controller.browse(selector.path() or "/sdcard", serial)
+
+    def _on_device_folders(self, payload) -> None:
+        selector = self._pending_browse_selector
+        self._pending_browse_selector = None
+        if selector is None:
+            return
+        current = str(payload.get("root", ""))
+        folders = payload.get("folders") or []
         if not folders:
             self.banner.set_message(f"No subfolders under {current}. You can type a nested path manually.", "warning")
             self.banner.show()
@@ -1628,10 +1675,34 @@ class ImportPage(BasePage):
         self.run_button.hide()
 
     def _refresh_devices(self) -> None:
-        from adb_bridge import ADBBridge
+        """Enumerate devices on a worker. adb shells out to a subprocess."""
 
+        if self.device_controller.busy:
+            return
         self.device_choice.clear()
-        devices = ADBBridge.list_devices()
+        self.device_choice.addItem("Checking for devices…", "")
+        self.device_controller.refresh()
+
+    def _on_device_result(self, result) -> None:
+        data = result.data or {}
+        if "devices" in data:
+            self._on_devices_listed(data.get("devices"))
+        elif "folders" in data:
+            self._on_device_folders(data.get("folders") or {})
+
+    def _on_device_error(self, error) -> None:
+        # A device error is not an empty folder. Saying so sends the user
+        # looking for missing files instead of a stalled connection.
+        self._pending_browse_selector = None
+        message = getattr(error, "message", str(error))
+        self.device_choice.clear()
+        self.device_choice.addItem("No authorized Android device found", "")
+        self.banner.set_message(f"Android device error: {message}", "error")
+        self.banner.show()
+
+    def _on_devices_listed(self, devices) -> None:
+        devices = devices or []
+        self.device_choice.clear()
         for device in devices:
             label = f"{device.get('model') or device.get('serial')} — {device.get('status', 'unknown')}"
             self.device_choice.addItem(label, device.get("serial", ""))

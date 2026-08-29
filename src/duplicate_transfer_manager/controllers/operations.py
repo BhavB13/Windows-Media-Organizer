@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..services import DiskAuditService, DuplicateScanService, FileOrganizerService, TransferService
+from ..services import DiskAuditService, DuplicateScanService, TransferService
 from ..sorting import HybridSortService, SortExecutionControl
 from ..core import OperationPhase, OperationResult, OperationState
 from .base import BaseOperationController
@@ -65,40 +65,6 @@ class TransferController(BaseOperationController):
                 settings,
                 cancellation,
                 reporter,
-            )
-        )
-
-
-class FileOrganizerController(BaseOperationController):
-    def __init__(
-        self,
-        service: FileOrganizerService | None = None,
-        thread_pool: QThreadPool | None = None,
-        parent: QObject | None = None,
-    ) -> None:
-        super().__init__(thread_pool, parent)
-        self.service = service or FileOrganizerService()
-
-    def plan(self, settings: Any) -> bool:
-        def task(cancellation, reporter):
-            reporter.set_state(OperationState.SCANNING, phase=OperationPhase.DISCOVERY, message="Discovering files to organize…")
-            plan = self.service.build_plan(settings, cancellation, reporter)
-            reporter.set_state(OperationState.COMPLETED, phase=OperationPhase.FINALIZATION, message="Organization plan ready.")
-            return OperationResult(
-                status=OperationState.COMPLETED,
-                counts={"planned": len(plan)},
-                data={"plan": plan},
-            )
-        return self.start_task(task)
-
-    def organize(self, settings: Any, selected_sources: list[str], reviewed_plan: list[Any]) -> bool:
-        return self.start_task(
-            lambda cancellation, reporter: self.service.organize(
-                settings,
-                selected_sources,
-                cancellation,
-                reporter,
-                reviewed_plan=reviewed_plan,
             )
         )
 
