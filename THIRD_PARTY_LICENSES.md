@@ -14,10 +14,6 @@ memory, so they describe what actually ships.
 | [Pillow](https://python-pillow.org/) | 11.3.0 | `MIT-CMU` |
 | [Send2Trash](https://github.com/arsenetar/send2trash) | 1.8.3 | BSD 3-Clause |
 | [packaging](https://github.com/pypa/packaging) | 26.2 | `Apache-2.0 OR BSD-2-Clause` |
-| [tkinterdnd2](https://github.com/pmgagne/tkinterdnd2) | 0.4.3 | MIT |
-
-`tkinterdnd2` is used only by the legacy Tkinter frontend retained for
-compatibility (`legacy_main.py`). It is not used by the PySide6 application.
 
 ## Bundled tools
 

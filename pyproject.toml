@@ -21,7 +21,6 @@ dependencies = [
     "packaging==26.2",
     "PySide6==6.9.1",
     "Send2Trash==1.8.3",
-    "tkinterdnd2==0.4.3",
 ]
 
 [project.urls]
@@ -52,11 +51,9 @@ py-modules = [
     "drive_cache",
     "engine",
     "main",
-    "legacy_main",
     "models",
     "runtime_paths",
     "transfer_safety",
-    "ui_components",
     "utils",
 ]
 

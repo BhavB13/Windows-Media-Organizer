@@ -112,12 +112,6 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe main.py
 ```
 
-The previous Tkinter interface remains temporarily available for compatibility:
-
-```powershell
-python legacy_main.py
-```
-
 ## Windows release build
 
 Release packaging requires Windows, Python 3.12, and Inno Setup 6
@@ -191,7 +185,7 @@ Use `dtm-build-cache --help` for Android and custom-cache options.
 - Root Python modules — stabilized legacy engine and frontend, retained until
   the later package migration is complete
 
-The backend modules do not import Tkinter, PySide6, or UI widgets. Frontends
+The backend modules do not import PySide6 or UI widgets. Frontends
 communicate through `OperationEvent`, `OperationResult`, and controller signals.
 
 ## Safety

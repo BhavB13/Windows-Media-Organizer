@@ -32,7 +32,7 @@ Status: release pipeline and app-side verification implemented; actual signed in
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m compileall -q src tests scripts main.py legacy_main.py ui_components.py engine.py runtime_paths.py
+python -m compileall -q src tests scripts main.py engine.py runtime_paths.py
 python scripts\smoke_ui.py
 ```
 

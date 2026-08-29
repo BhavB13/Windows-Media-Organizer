@@ -10,6 +10,23 @@ release onward.
 
 ## [Unreleased]
 
+### Removed
+
+- **The legacy Tkinter frontend.** `README.md` documented `python legacy_main.py`
+  as a supported way to launch the product, and that frontend moved duplicate
+  originals into a flat folder with no manifest, no quarantine record, and no
+  activity record — only a `MOVED:` line in a session log. Because
+  `DuplicateQuarantineService.list_records` reads only quarantine manifests,
+  those files were invisible to the Quarantine page and could not be restored
+  from inside the app. The only gate was a yes/no dialog shown before the scan
+  started, which could not list files that had not been found yet.
+
+  That contradicted the product's two stated invariants — nothing is deleted,
+  and nothing runs without review — on a path we told people to use. It was the
+  last remaining way for this application to lose a user's file. `legacy_main.py`
+  and `ui_components.py` are gone, along with the `tkinterdnd2` dependency that
+  existed only to serve them.
+
 ### Fixed — data safety
 
 These came out of a two-reviewer audit of the pre-release code. Each is a case

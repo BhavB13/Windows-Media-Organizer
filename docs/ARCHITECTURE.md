@@ -21,9 +21,9 @@ Frontend
 
 Core contracts and services never import a frontend framework. Controllers are
 the only application layer below the UI that imports Qt. The PySide6 shell is
-the primary frontend. The temporary Tkinter compatibility frontend invokes the
-same services from Qt-owned workers and schedules all widget updates on Tk’s
-main thread.
+the sole frontend. A Tkinter compatibility frontend was retained through earlier
+phases and has been removed: it moved duplicate originals with no manifest and
+no restore path, which contradicted the product's recovery guarantee.
 
 ## Design system
 
