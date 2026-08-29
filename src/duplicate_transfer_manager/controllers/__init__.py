@@ -1,6 +1,6 @@
 """Qt-facing controllers for Duplicate & Transfer Manager."""
 
-from .operations import DuplicateScanController, FileOrganizerController, SortController, TransferController
+from .operations import DiskAuditController, DuplicateScanController, FileOrganizerController, SortController, TransferController
 from .support import (
     DeviceController,
     DiagnosticsController,
@@ -13,6 +13,7 @@ from .support import (
 __all__ = [
     "DeviceController",
     "DiagnosticsController",
+    "DiskAuditController",
     "DuplicateScanController",
     "FileOrganizerController",
     "QuarantineController",

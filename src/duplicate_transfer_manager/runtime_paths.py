@@ -29,6 +29,7 @@ class RuntimePaths:
     operations: Path
     organization: Path
     sorting: Path
+    audits: Path
     hash_cache: Path
     settings_file: Path
     migration_marker: Path
@@ -46,6 +47,7 @@ class RuntimePaths:
             self.operations,
             self.organization,
             self.sorting,
+            self.audits,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         return self
@@ -92,6 +94,7 @@ def get_runtime_paths(root: str | os.PathLike[str] | None = None, *, create: boo
         operations=data_root / "operations",
         organization=data_root / "organization",
         sorting=data_root / "sorting",
+        audits=data_root / "audits",
         hash_cache=cache / "hash_cache.json",
         settings_file=data_root / "settings.json",
         migration_marker=data_root / MIGRATION_MARKER_NAME,

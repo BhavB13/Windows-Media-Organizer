@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..services import DuplicateScanService, FileOrganizerService, TransferService
+from ..services import DiskAuditService, DuplicateScanService, FileOrganizerService, TransferService
 from ..sorting import HybridSortService, SortExecutionControl
 from ..core import OperationPhase, OperationResult, OperationState
 from .base import BaseOperationController
@@ -28,6 +28,24 @@ class DuplicateScanController(BaseOperationController):
                 cancellation,
                 reporter,
             )
+        )
+
+
+class DiskAuditController(BaseOperationController):
+    """Run all local-drive enumeration outside the Qt main thread."""
+
+    def __init__(
+        self,
+        service: DiskAuditService | None = None,
+        thread_pool: QThreadPool | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(thread_pool, parent)
+        self.service = service or DiskAuditService()
+
+    def start(self, settings: Any) -> bool:
+        return self.start_task(
+            lambda cancellation, reporter: self.service.run(settings, cancellation, reporter)
         )
 
 

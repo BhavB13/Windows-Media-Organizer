@@ -46,6 +46,7 @@ class RuntimePathTests(unittest.TestCase):
                 paths.quarantine,
                 paths.logs,
                 paths.updates,
+                paths.audits,
             ):
                 self.assertTrue(directory.is_dir())
 

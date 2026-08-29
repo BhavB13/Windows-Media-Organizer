@@ -674,6 +674,51 @@ class DashboardService:
             "quarantine_bytes": quarantine_bytes,
             "measured": include_storage,
         }
+        # Audit snapshots contain only surfaced findings and are cheap to load;
+        # unlike cache sizing this does not walk user data on the landing page.
+        from .disk_audit import AuditSnapshotStore
+
+        audit_store = AuditSnapshotStore(self.paths)
+        latest_audit = audit_store.latest()
+        audit_health: dict[str, Any] = {"available": False}
+        if latest_audit is not None:
+            attention = next(
+                (
+                    item
+                    for item in sorted(latest_audit.items, key=lambda value: value.size_bytes, reverse=True)
+                    if item.tier.value == "protect_reclaim"
+                    and not audit_store.review_state(latest_audit.volume_id, item.stable_id).get("hidden", False)
+                    and audit_store.review_state(latest_audit.volume_id, item.stable_id).get("backup_status", "unknown") != "user_confirmed"
+                ),
+                None,
+            )
+            try:
+                completed = datetime.fromisoformat(latest_audit.completed_at)
+                if completed.tzinfo is None:
+                    completed = completed.replace(tzinfo=timezone.utc)
+                age_seconds = max(0, int((datetime.now(timezone.utc) - completed).total_seconds()))
+                if age_seconds < 3600:
+                    audit_age = "Less than an hour ago"
+                elif age_seconds < 86400:
+                    audit_age = f"{age_seconds // 3600} hour(s) ago"
+                else:
+                    audit_age = f"{age_seconds // 86400} day(s) ago"
+            except ValueError:
+                audit_age = latest_audit.completed_at[:19]
+            audit_health = {
+                "available": True,
+                "audit_id": latest_audit.audit_id,
+                "volume_id": latest_audit.volume_id,
+                "volume_label": latest_audit.volume_label,
+                "scanned_root": latest_audit.scanned_root,
+                "mode": latest_audit.mode,
+                "completed_at": latest_audit.completed_at,
+                "age": audit_age,
+                "free_bytes": latest_audit.free_bytes,
+                "capacity_bytes": latest_audit.capacity_bytes,
+                "attention_label": attention.label if attention else "No unreviewed protect-first item",
+                "attention_bytes": attention.size_bytes if attention else 0,
+            }
         connected_devices = []
         if include_devices:
             try:
@@ -693,6 +738,7 @@ class DashboardService:
             "quarantine_count": len(quarantine_records),
             "recoverable_bytes": storage["quarantine_bytes"],
             "storage": storage,
+            "audit_health": audit_health,
             "runtime_root": str(self.paths.root),
         }
 

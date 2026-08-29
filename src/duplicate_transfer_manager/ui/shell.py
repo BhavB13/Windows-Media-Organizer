@@ -43,6 +43,7 @@ from .pages import (
     QuarantinePage,
     SettingsPage,
 )
+from .disk_audit_page import DiskAuditPage
 from .sort_workspace import SortWorkspace
 from .theme import Spacing, ThemeManager
 from .widgets import add_shortcut, set_accessible
@@ -58,13 +59,14 @@ class Route:
 
 ROUTES = (
     Route("overview", "Overview", "overview", "Alt+1"),
-    Route("duplicates", "Find Duplicates", "duplicates", "Alt+2"),
-    Route("import", "Import Files", "import", "Alt+3"),
-    Route("sort", "Sort Files", "folder", "Alt+4"),
-    Route("activity", "Activity", "activity", "Alt+5"),
-    Route("quarantine", "Quarantine", "quarantine", "Alt+6"),
-    Route("settings", "Settings", "settings", "Alt+7"),
-    Route("help", "Help", "help", "Alt+8"),
+    Route("audit", "Disk Audit", "drive", "Alt+2"),
+    Route("duplicates", "Find Duplicates", "duplicates", "Alt+3"),
+    Route("import", "Import Files", "import", "Alt+4"),
+    Route("sort", "Sort Files", "folder", "Alt+5"),
+    Route("activity", "Activity", "activity", "Alt+6"),
+    Route("quarantine", "Quarantine", "quarantine", "Alt+7"),
+    Route("settings", "Settings", "settings", "Alt+8"),
+    Route("help", "Help", "help", "Alt+9"),
 )
 
 
@@ -113,7 +115,7 @@ class Sidebar(QFrame):
         self.buttons: dict[str, QPushButton] = {}
         self.shortcuts = []
         for index, route in enumerate(ROUTES):
-            if index == 6:
+            if route.key == "settings":
                 layout.addStretch(1)
             button = QPushButton(route.label)
             button.setCheckable(True)
@@ -226,10 +228,10 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.settings_service = settings_service
         self.hash_cache = hash_cache
-        self.runtime_paths = runtime_paths
-        self.dashboard_service = DashboardService(runtime_paths)
-        self.operation_records = OperationRecordService(runtime_paths)
-        self.report_service = ReportService(runtime_paths)
+        self.runtime_paths = runtime_paths or settings_service.paths
+        self.dashboard_service = DashboardService(self.runtime_paths)
+        self.operation_records = OperationRecordService(self.runtime_paths)
+        self.report_service = ReportService(self.runtime_paths)
         self.current_route = "overview"
         self.setWindowTitle("Duplicate & Transfer Manager")
         self.setWindowIcon(icon("duplicates", "#2563EB", 32))
@@ -262,9 +264,15 @@ class MainWindow(QMainWindow):
 
         self.pages = {
             "overview": OverviewPage(self.dashboard_service),
+            "audit": DiskAuditPage(
+                self.runtime_paths,
+                settings,
+                settings_service,
+                self.operation_records,
+            ),
             "duplicates": DuplicatesPage(
                 hash_cache=hash_cache,
-                quarantine_service=DuplicateQuarantineService(runtime_paths),
+                quarantine_service=DuplicateQuarantineService(self.runtime_paths),
                 operation_service=self.operation_records,
                 settings=settings,
             ),
@@ -275,7 +283,7 @@ class MainWindow(QMainWindow):
             ),
             "sort": SortWorkspace(runtime_paths, settings, settings_service, self.operation_records),
             "activity": ActivityPage(self.operation_records, self.report_service),
-            "quarantine": QuarantinePage(DuplicateQuarantineService(runtime_paths)),
+            "quarantine": QuarantinePage(DuplicateQuarantineService(self.runtime_paths)),
             "settings": SettingsPage(
                 settings, settings_service, self.dashboard_service, hash_cache=hash_cache
             ),
@@ -290,6 +298,7 @@ class MainWindow(QMainWindow):
         self.pages["overview"].navigate_requested.connect(self.navigate)
         self.pages["activity"].navigate_requested.connect(self.navigate)
         self.pages["activity"].resume_requested.connect(self._resume_import)
+        self.pages["activity"].audit_requested.connect(self._view_audit)
         self.pages["quarantine"].navigate_requested.connect(self.navigate)
         self.pages["settings"].theme_requested.connect(self.set_theme)
         self.pages["settings"].preferences_saved.connect(self._preferences_saved)
@@ -336,6 +345,10 @@ class MainWindow(QMainWindow):
         import_page.apply_resume_setup(setup)
         self.navigate("import")
 
+    def _view_audit(self, snapshot_path: str) -> None:
+        self.navigate("audit")
+        self.pages["audit"].load_snapshot_path(snapshot_path)
+
     def _preferences_saved(self, settings: AppSettings) -> None:
         self.pages["duplicates"].update_preferences(settings)
         self.pages["import"].update_preferences(settings)
@@ -364,7 +377,7 @@ class MainWindow(QMainWindow):
 
     def _busy_controllers(self) -> list:
         controllers = []
-        for key in ("duplicates", "import", "sort"):
+        for key in ("audit", "duplicates", "import", "sort"):
             controller = getattr(self.pages.get(key), "controller", None)
             if controller is not None and controller.busy:
                 controllers.append(controller)
@@ -410,6 +423,7 @@ class MainWindow(QMainWindow):
         """Launch an approved installer only after foreground operations quiesce."""
 
         controllers = (
+            self.pages["audit"].controller,
             self.pages["duplicates"].controller,
             self.pages["import"].controller,
             self.pages["sort"].controller,

@@ -38,3 +38,8 @@ refresh_adb_cache.ps1
 # Local build verification output
 build_test/
 dist_test/
+
+# Disk Audit reports describe the machine they were produced on. They are the
+# user's own data, not source, and must never be committed to a public repo.
+disk-audit.html
+disk-audit*.html

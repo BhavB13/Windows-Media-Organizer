@@ -156,3 +156,30 @@ Use this checklist on Windows after installing the project dependencies.
 - [ ] Switch light/dark/system themes and resize through 960x720, 1366x768, and
       1920x1080. Confirm all Sort sections remain readable without horizontal
       page scrolling or clipped controls.
+
+## Disk Audit
+
+- [ ] Open Disk Audit from the sidebar and Overview health card. Confirm all
+      nine `Alt+1` through `Alt+9` navigation shortcuts select the documented page.
+- [ ] Run Quick and Deep audits on the Windows system drive and a removable
+      drive. Confirm progress stays responsive, cancellation is prompt, and no
+      user or system file is changed.
+- [ ] Confirm the result shows used/free capacity, authoritative free-space
+      change, item deltas, a conservative protect-first warning, and all four
+      clarified tiers.
+- [ ] Rescan after adding and removing a disposable large fixture. Confirm only
+      a successful audit of the same stable volume and mode becomes the baseline.
+- [ ] Open a folder and an individual file from findings. Confirm Explorer opens
+      the folder directly and selects the file; confirm Copy path, Copy tier
+      paths, and Copy command never execute the copied text.
+- [ ] Mark findings reviewed, hidden, and user-confirmed as backed up. Restart
+      and rescan; confirm state persists, Show hidden restores visibility, and
+      the UI still says backup status is user-declared rather than verified.
+- [ ] Confirm inaccessible locations and reparse points appear as measurement
+      notes without failing the audit or being reported as cleared.
+- [ ] Open a completed Disk Audit from Activity and confirm the native saved
+      result appears rather than raw snapshot JSON.
+- [ ] Switch light/dark/system themes and resize through 960x720, 1366x768, and
+      1920x1080. Confirm finding cards reflow without horizontal page scrolling.
+- [ ] Confirm no audit surface offers delete, clean, uninstall, elevation, or
+      command-execution actions.

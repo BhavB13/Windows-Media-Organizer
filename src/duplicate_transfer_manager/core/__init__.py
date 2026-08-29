@@ -3,6 +3,11 @@
 from .cancellation import CancellationToken, OperationCancelled
 from .contracts import (
     AppSettings,
+    AuditTier,
+    BackupStatus,
+    DiskAuditItem,
+    DiskAuditSettings,
+    DiskAuditSnapshot,
     OperationEvent,
     OperationFailure,
     OperationPhase,
@@ -26,7 +31,12 @@ from .security import (
 
 __all__ = [
     "AppSettings",
+    "AuditTier",
+    "BackupStatus",
     "CancellationToken",
+    "DiskAuditItem",
+    "DiskAuditSettings",
+    "DiskAuditSnapshot",
     "ErrorCode",
     "OperationCancelled",
     "OperationEvent",

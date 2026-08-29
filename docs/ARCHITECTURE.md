@@ -126,6 +126,26 @@ build time and
 explicitly report that Duplicate & Transfer Manager does not mutate system-wide
 ADB installations or environment variables.
 
+## Disk Audit workflow
+
+The native Disk Audit route is backed by a framework-neutral `DiskAuditService`
+and `AuditSnapshotStore`. `DiskAuditController` runs Quick and Deep scans through
+the shared `QThreadPool` operation boundary, so drive enumeration, registry
+inventory, and directory sizing never block or touch widgets.
+
+Quick scans measure curated user-data, cache, application, and Windows-managed
+locations. Deep scans add a read-only volume walk for large unclassified files
+and folders. Both modes skip reparse points, continue past inaccessible or
+disappearing paths, collapse overlapping findings, and never run cleanup,
+uninstall, elevation, or maintenance commands.
+
+Successful versioned snapshots contain only surfaced findings under the
+app-owned `audits` directory. The latest matching drive-and-mode snapshot is the
+comparison baseline, and only the ten newest successful snapshots per stable
+volume identity are retained. Review, hidden, and user-declared backup states
+are kept separately so snapshots remain immutable. Activity records point back
+to the native page rather than exposing snapshot JSON as the primary result.
+
 ## Hybrid Sort Files workflow
 
 The Sort Files route is implemented as separate framework-neutral modules for

@@ -36,6 +36,7 @@ from duplicate_transfer_manager.ui.pages import (
     SettingsPage,
 )
 from duplicate_transfer_manager.ui.shell import MainWindow, ROUTES
+from duplicate_transfer_manager.ui.disk_audit_page import DiskAuditPage
 from duplicate_transfer_manager.ui.sort_workspace import SortWorkspace
 from duplicate_transfer_manager.sorting import (
     Association,
@@ -128,6 +129,7 @@ class Phase2UiTests(unittest.TestCase):
             set(self.window.pages),
             {
                 "overview",
+                "audit",
                 "duplicates",
                 "import",
                 "sort",
@@ -139,6 +141,7 @@ class Phase2UiTests(unittest.TestCase):
         )
         expected_types = {
             "overview": OverviewPage,
+            "audit": DiskAuditPage,
             "duplicates": DuplicatesPage,
             "import": ImportPage,
             "sort": SortWorkspace,
@@ -154,7 +157,7 @@ class Phase2UiTests(unittest.TestCase):
             self.assertTrue(self.window.sidebar.buttons[key].isChecked())
 
     def test_contextual_device_indicator_only_appears_on_source_pages(self):
-        for key in ("overview", "sort", "activity", "quarantine", "settings", "help"):
+        for key in ("overview", "audit", "sort", "activity", "quarantine", "settings", "help"):
             self.window.navigate(key)
             self.application.processEvents()
             self.assertFalse(self.window.top_bar.device.isVisible())
@@ -714,6 +717,10 @@ class Phase2UiTests(unittest.TestCase):
 
     def test_navigation_controls_have_keyboard_shortcuts_and_focus_policy(self):
         self.assertEqual(len(self.window.sidebar.shortcuts), len(ROUTES))
+        self.assertEqual(
+            [shortcut.key().toString() for shortcut in self.window.sidebar.shortcuts],
+            [f"Alt+{index}" for index in range(1, 10)],
+        )
         for route in ROUTES:
             button = self.window.sidebar.buttons[route.key]
             self.assertTrue(button.accessibleName())

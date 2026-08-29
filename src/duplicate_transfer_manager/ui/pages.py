@@ -160,19 +160,29 @@ class BasePage(QScrollArea):
 class DashboardListCard(Card):
     """Compact overview card for recent work, attention items, and storage."""
 
-    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+    action_requested = Signal()
+
+    def __init__(self, title: str, action_text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMaximumHeight(360)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
         layout.setSpacing(Spacing.MD)
+        heading_row = QHBoxLayout()
         self.heading = QLabel(title)
         self.heading.setProperty("role", "section")
         self.heading.setProperty("status", "success")
+        heading_row.addWidget(self.heading)
+        heading_row.addStretch()
+        if action_text:
+            action = QPushButton(action_text)
+            action.setProperty("variant", "quiet")
+            action.clicked.connect(self.action_requested)
+            heading_row.addWidget(action)
         self.rows = QVBoxLayout()
         self.rows.setSpacing(Spacing.SM)
-        layout.addWidget(self.heading)
+        layout.addLayout(heading_row)
         layout.addLayout(self.rows)
         layout.addStretch(1)
 
@@ -318,10 +328,12 @@ class OverviewPage(BasePage):
         self.recent = DashboardListCard("Recent activity")
         self.interrupted = DashboardListCard("Needs attention")
         self.storage = DashboardListCard("Local storage")
+        self.audit_health = DashboardListCard("Disk health", "Run / view audit")
+        self.audit_health.action_requested.connect(lambda: self.navigate_requested.emit("audit"))
         self.summary_sections = ResponsiveGrid(
-            [self.recent, self.interrupted, self.storage],
+            [self.recent, self.interrupted, self.storage, self.audit_health],
             min_column_width=300,
-            max_columns=3,
+            max_columns=4,
         )
         self.content.addWidget(self.summary_sections)
         # Overview is the landing route, so the window must not wait on a walk
@@ -374,6 +386,26 @@ class OverviewPage(BasePage):
                 ("Reports", "Measuring…" if measuring else format_duplicate_size(storage["reports_bytes"])),
                 ("Quarantine", format_duplicate_size(storage["quarantine_bytes"])),
                 ("Connected devices", ", ".join(str(device.get("serial", device)) for device in devices[:3]) or "None"),
+            ]
+        )
+        audit = summary.get("audit_health", {"available": False})
+        self.audit_health.set_items(
+            [
+                ("No audit yet", "Run a Quick or Deep read-only audit."),
+            ]
+            if not audit.get("available")
+            else [
+                (
+                    f"{audit.get('volume_label') or audit.get('scanned_root', 'Drive')} free",
+                    format_duplicate_size(int(audit.get("free_bytes", 0))),
+                ),
+                (
+                    "Top attention",
+                    f"{audit.get('attention_label', 'None')} • {format_duplicate_size(int(audit.get('attention_bytes', 0)))}"
+                    if audit.get("attention_bytes")
+                    else str(audit.get("attention_label", "None")),
+                ),
+                ("Last audit", str(audit.get("age", audit.get("completed_at", "")))),
             ]
         )
 
@@ -1900,6 +1932,7 @@ class ImportPage(BasePage):
 class ActivityPage(BasePage):
     navigate_requested = Signal(str)
     resume_requested = Signal(object)
+    audit_requested = Signal(str)
 
     def __init__(
         self,
@@ -1948,7 +1981,7 @@ class ActivityPage(BasePage):
         self.search.setMinimumWidth(260)
         self.search.textChanged.connect(self.refresh)
         self.filter_choice = QComboBox()
-        self.filter_choice.addItems(["All operations", "Duplicate scans", "Imports", "Sorting", "Warnings", "Reports", "Audit history"])
+        self.filter_choice.addItems(["All operations", "Disk audits", "Duplicate scans", "Imports", "Sorting", "Warnings", "Reports", "Audit history"])
         self.filter_choice.setMinimumWidth(170)
         self.filter_choice.currentIndexChanged.connect(self.refresh)
         self.dry_run_reports = QCheckBox("Dry run report actions")
@@ -1967,6 +2000,9 @@ class ActivityPage(BasePage):
         resume_import = QPushButton("Resume import setup")
         resume_import.setToolTip("Restore a cancelled import setup for review. The import will not start automatically.")
         resume_import.clicked.connect(self.resume_selected_import)
+        view_audit = QPushButton("View audit results")
+        view_audit.setToolTip("Open a completed Disk Audit in the native Disk Audit page.")
+        view_audit.clicked.connect(self.view_selected_audit)
         remove_report = QPushButton("Remove report")
         remove_report.clicked.connect(self.remove_selected_report)
         filter_row.addWidget(QLabel("Find"))
@@ -1980,6 +2016,7 @@ class ActivityPage(BasePage):
         action_row.addWidget(open_reports_folder)
         action_row.addWidget(export_report)
         action_row.addWidget(export_activity)
+        action_row.addWidget(view_audit)
         action_row.addWidget(resume_import)
         action_row.addWidget(remove_report)
         toolbar.addLayout(filter_row)
@@ -2040,6 +2077,8 @@ class ActivityPage(BasePage):
             else self.operations.list_records()
         )
         for record in source_records:
+            if selected_filter == "Disk audits" and record.get("type") != "disk_audit":
+                continue
             if selected_filter == "Duplicate scans" and record.get("type") != "duplicate_scan":
                 continue
             if selected_filter == "Imports" and record.get("type") != "import":
@@ -2137,6 +2176,8 @@ class ActivityPage(BasePage):
         ]
         if record.get("resume_available"):
             details.append("Resume: available")
+        if record.get("type") == "disk_audit" and record.get("summary", {}).get("snapshot_path"):
+            details.append("Audit results: available in the native Disk Audit page")
         if record.get("warnings"):
             details.append("Warnings: " + "; ".join(str(value) for value in record.get("warnings", [])[:3]))
         if record.get("failures"):
@@ -2144,6 +2185,8 @@ class ActivityPage(BasePage):
         self.detail_text.setText("\n".join(details))
 
     def _record_artifact_path(self, record: dict) -> str:
+        if record.get("type") == "disk_audit":
+            return ""
         if record.get("report_path"):
             return str(record["report_path"])
         summary = record.get("summary", {})
@@ -2165,6 +2208,9 @@ class ActivityPage(BasePage):
         if not record:
             self.banner.set_message("Select or check an activity row first.", "warning")
             self.banner.show()
+            return
+        if record.get("type") == "disk_audit":
+            self.view_selected_audit()
             return
         artifact_path = self._record_artifact_path(record)
         if not artifact_path:
@@ -2250,6 +2296,17 @@ class ActivityPage(BasePage):
             return
         self.resume_requested.emit(setup)
         self.banner.set_message("Import setup restored. Review it before resuming.", "success")
+        self.banner.show()
+
+    def view_selected_audit(self) -> None:
+        record = self._primary_action_record()
+        path = record.get("summary", {}).get("snapshot_path") if record else None
+        if not record or record.get("type") != "disk_audit" or not path:
+            self.banner.set_message("Select a completed Disk Audit with saved results first.", "warning")
+            self.banner.show()
+            return
+        self.audit_requested.emit(str(path))
+        self.banner.set_message("Opened saved results in Disk Audit.", "success")
         self.banner.show()
 
     def remove_selected_report(self) -> None:
@@ -2943,11 +3000,26 @@ class HelpPage(BasePage):
                 MetricCard("03", "Connect Android", "Authorize USB debugging and keep the phone unlocked."),
                 MetricCard("04", "Recover files", "Restore quarantined files to their original location."),
                 MetricCard("05", "Sort safely", "Preview rules and local suggestions, approve exact operations, then undo recoverable runs."),
+                MetricCard("06", "Audit a drive", "Quick scans known locations; Deep scans also find large unclassified items. Both are read-only."),
             ],
             min_column_width=280,
             max_columns=2,
         )
         self.content.addWidget(topics)
+        disk_audit_help = DisclosurePanel("Disk Audit safety and tier guide")
+        audit_topics = [
+            "Tier 1 — Protect & reclaim: confirm value and a second copy before removing anything.",
+            "Tier 2 — Regenerable caches: allowlisted caches can return, usually after a download or rebuild.",
+            "Tier 3 — Apps to review: installed does not mean unused; decide through Windows Apps settings.",
+            "Tier 4 — Windows-managed storage: use supported Windows controls and never delete these files directly.",
+            "Backup status is your declaration. Version 1 does not hash-verify a second copy.",
+            "Disk Audit opens locations and copies guidance, but never runs commands, elevates, uninstalls, or cleans files.",
+        ]
+        for value in audit_topics:
+            label = QLabel(value)
+            label.setWordWrap(True)
+            disk_audit_help.body_layout.addWidget(label)
+        self.content.addWidget(disk_audit_help)
         support = Card()
         layout = QVBoxLayout(support)
         layout.setContentsMargins(

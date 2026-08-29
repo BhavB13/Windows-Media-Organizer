@@ -1,6 +1,13 @@
 """UI-independent application services."""
 
 from .duplicate_service import DuplicateScanService
+from .disk_audit import (
+    AuditSnapshotStore,
+    DiskAuditService,
+    VolumeDescriptor,
+    WindowsDiskInventory,
+    compare_snapshots,
+)
 from .duplicate_workflow import (
     DuplicateGroup,
     DuplicateItem,
@@ -44,6 +51,7 @@ __all__ = [
     "CrashReportService",
     "DashboardService",
     "DiagnosticsService",
+    "DiskAuditService",
     "DuplicateScanService",
     "DuplicateGroup",
     "DuplicateItem",
@@ -63,13 +71,17 @@ __all__ = [
     "ScheduledScanService",
     "TransferService",
     "FileOrganizerService",
+    "AuditSnapshotStore",
     "STAGE_LABELS",
     "TRANSFER_PROFILES",
     "UpdateService",
+    "VolumeDescriptor",
+    "WindowsDiskInventory",
     "build_duplicate_review",
     "build_import_review",
     "build_import_settings",
     "classify_transfer_stage",
+    "compare_snapshots",
     "duplicate_review_to_dict",
     "format_duplicate_size",
     "format_transfer_bytes",

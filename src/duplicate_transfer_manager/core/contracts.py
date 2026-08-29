@@ -49,6 +49,22 @@ class Severity(str, Enum):
     ERROR = "error"
 
 
+class AuditTier(str, Enum):
+    """Safety-oriented groups used by the native Disk Audit experience."""
+
+    PROTECT_RECLAIM = "protect_reclaim"
+    REGENERABLE_CACHE = "regenerable_cache"
+    APPS_REVIEW = "apps_review"
+    WINDOWS_MANAGED = "windows_managed"
+
+
+class BackupStatus(str, Enum):
+    """A deliberately conservative, user-declared backup state."""
+
+    UNKNOWN = "unknown"
+    USER_CONFIRMED = "user_confirmed"
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -128,6 +144,8 @@ class AppSettings:
     organization_schedule_frequency: str = "off"
     active_sorting_profile_id: str = ""
     sorting_history_retention_days: int = 90
+    last_audit_drive: str = ""
+    last_audit_mode: str = "quick"
     onboarding_completed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -137,6 +155,121 @@ class AppSettings:
     def from_dict(cls, values: dict[str, Any]) -> "AppSettings":
         known = cls.__dataclass_fields__
         return cls(**{key: value for key, value in values.items() if key in known})
+
+
+@dataclass(frozen=True)
+class DiskAuditSettings:
+    """Inputs for a read-only local-volume audit."""
+
+    volume_root: str
+    mode: str = "quick"
+    large_file_threshold: int = 1 << 30
+    large_folder_threshold: int = 2 << 30
+    max_large_items: int = 50
+
+
+@dataclass(frozen=True)
+class DiskAuditItem:
+    """One surfaced audit finding; full per-file inventories are never persisted."""
+
+    stable_id: str
+    label: str
+    kind: str
+    paths: tuple[str, ...]
+    size_bytes: int
+    file_count: int
+    tier: AuditTier
+    verdict: str
+    rationale: str
+    recommendation: str
+    command: str = ""
+    measurement_confidence: str = "measured"
+    warnings: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        values = asdict(self)
+        values["tier"] = self.tier.value
+        values["paths"] = list(self.paths)
+        values["warnings"] = list(self.warnings)
+        return values
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> "DiskAuditItem":
+        return cls(
+            stable_id=str(values.get("stable_id", "")),
+            label=str(values.get("label", "")),
+            kind=str(values.get("kind", "")),
+            paths=tuple(str(path) for path in values.get("paths", ())),
+            size_bytes=max(0, int(values.get("size_bytes", 0))),
+            file_count=max(0, int(values.get("file_count", 0))),
+            tier=AuditTier(str(values.get("tier", AuditTier.PROTECT_RECLAIM.value))),
+            verdict=str(values.get("verdict", "review")),
+            rationale=str(values.get("rationale", "")),
+            recommendation=str(values.get("recommendation", "")),
+            command=str(values.get("command", "")),
+            measurement_confidence=str(values.get("measurement_confidence", "measured")),
+            warnings=tuple(str(value) for value in values.get("warnings", ())),
+        )
+
+
+@dataclass(frozen=True)
+class DiskAuditSnapshot:
+    """Versioned immutable result for one successful Disk Audit run."""
+
+    schema_version: int
+    audit_id: str
+    volume_id: str
+    volume_label: str
+    scanned_root: str
+    mode: str
+    started_at: str
+    completed_at: str
+    capacity_bytes: int
+    used_bytes: int
+    free_bytes: int
+    items: tuple[DiskAuditItem, ...] = ()
+    warnings: tuple[str, ...] = ()
+    inaccessible_count: int = 0
+    previous_snapshot_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "audit_id": self.audit_id,
+            "volume_id": self.volume_id,
+            "volume_label": self.volume_label,
+            "scanned_root": self.scanned_root,
+            "mode": self.mode,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "capacity_bytes": self.capacity_bytes,
+            "used_bytes": self.used_bytes,
+            "free_bytes": self.free_bytes,
+            "items": [item.to_dict() for item in self.items],
+            "warnings": list(self.warnings),
+            "inaccessible_count": self.inaccessible_count,
+            "previous_snapshot_id": self.previous_snapshot_id,
+        }
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> "DiskAuditSnapshot":
+        return cls(
+            schema_version=int(values.get("schema_version", 1)),
+            audit_id=str(values.get("audit_id", "")),
+            volume_id=str(values.get("volume_id", "")),
+            volume_label=str(values.get("volume_label", "")),
+            scanned_root=str(values.get("scanned_root", "")),
+            mode=str(values.get("mode", "quick")),
+            started_at=str(values.get("started_at", "")),
+            completed_at=str(values.get("completed_at", "")),
+            capacity_bytes=max(0, int(values.get("capacity_bytes", 0))),
+            used_bytes=max(0, int(values.get("used_bytes", 0))),
+            free_bytes=max(0, int(values.get("free_bytes", 0))),
+            items=tuple(DiskAuditItem.from_dict(item) for item in values.get("items", ())),
+            warnings=tuple(str(value) for value in values.get("warnings", ())),
+            inaccessible_count=max(0, int(values.get("inaccessible_count", 0))),
+            previous_snapshot_id=str(values.get("previous_snapshot_id", "")),
+        )
 
 
 @dataclass(frozen=True)
