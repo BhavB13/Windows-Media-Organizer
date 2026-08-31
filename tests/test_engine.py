@@ -2113,5 +2113,179 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(leftovers, [], "the staged copy was left on disk")
 
 
+class ImportJourneyTests(unittest.TestCase):
+    """End-to-end checks that every number the import shows the user is true.
+
+    These are guard tests: they pass on the commit that introduced them. They
+    exist because the counters here have been wrong twice before -- conflict
+    skips were reported as duplicates, and a stale cache entry could make a file
+    skip import entirely -- and both defects were invisible until someone
+    compared the reported totals against the filesystem. Each test computes
+    ground truth from disk so a wrong count cannot agree with itself.
+    """
+
+    @staticmethod
+    def _settings(source, library, output, **over):
+        values = dict(
+            source_root=source, dest_root=library, output_root=output,
+            criteria="hash", hash_algo="sha256", hash_mode="full", only_media=False,
+            extensions=[], min_size_kb=0, exclude_dirs=[], skip_hidden_system=False,
+            dry_run=False, preserve_structure=True, max_hash_workers=1,
+            transfer_mode="copy", duplicate_policy="skip", use_dest_cache=False,
+            source_is_adb=False, update_drive_cache=False, use_adb_cache=False,
+            conflict_policy="skip",
+        )
+        values.update(over)
+        return TransferSettings(**values)
+
+    @staticmethod
+    def _mixed_library(root):
+        """New files, an exact duplicate, and a taken destination name."""
+        source = os.path.join(root, "source")
+        library = os.path.join(root, "library")
+        output = os.path.join(root, "output")
+        for path in (source, library, output):
+            os.makedirs(path)
+        with open(os.path.join(source, "new_a.jpg"), "wb") as handle:
+            handle.write(b"brand new alpha " * 300)
+        with open(os.path.join(source, "new_b.jpg"), "wb") as handle:
+            handle.write(b"brand new beta " * 300)
+        shared = b"already in the library " * 400
+        with open(os.path.join(library, "existing.jpg"), "wb") as handle:
+            handle.write(shared)
+        with open(os.path.join(source, "dupe_of_existing.jpg"), "wb") as handle:
+            handle.write(shared)
+        with open(os.path.join(output, "clash.jpg"), "wb") as handle:
+            handle.write(b"a different file already there " * 100)
+        with open(os.path.join(source, "clash.jpg"), "wb") as handle:
+            handle.write(b"unique source content " * 200)
+        return source, library, output
+
+    def test_every_source_file_is_accounted_for_and_the_counts_are_true(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source, library, output = self._mixed_library(root)
+            result = execute_smart_transfer(
+                self._settings(source, library, output), threading.Event(),
+                HashCache(os.path.join(root, "cache.json")), DummyLogger(),
+            )
+
+            written = sorted(
+                name for name in os.listdir(output) if name != "clash.jpg"
+            )
+            self.assertEqual(written, ["new_a.jpg", "new_b.jpg"])
+            self.assertEqual(result["transferred"], 2)
+            self.assertEqual(result["duplicates"], 1, "the byte-identical file")
+            self.assertEqual(result["conflict_skipped"], 1, "the taken name")
+            self.assertEqual(result["errors"], 0)
+            # Four source files went in; every one must be explained by exactly
+            # one outcome. A file that falls through every branch disappears
+            # from the report without the user ever being told.
+            self.assertEqual(
+                result["transferred"] + result["duplicates"]
+                + result["conflict_skipped"] + result["errors"],
+                4,
+            )
+
+    def test_importing_the_same_folder_twice_copies_nothing_the_second_time(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source, library, output = self._mixed_library(root)
+            cache = os.path.join(root, "cache.json")
+            execute_smart_transfer(
+                self._settings(source, library, output), threading.Event(),
+                HashCache(cache), DummyLogger(),
+            )
+            after_first = sorted(os.listdir(output))
+
+            second = execute_smart_transfer(
+                self._settings(source, library, output), threading.Event(),
+                HashCache(cache), DummyLogger(),
+            )
+
+            self.assertEqual(second["transferred"], 0, "nothing changed on disk")
+            self.assertEqual(sorted(os.listdir(output)), after_first)
+
+    def test_a_source_file_that_cannot_be_read_is_counted_as_an_error(self):
+        # Not copied and not counted would be a silent loss: the summary would
+        # say the import finished with no errors while a file was left behind.
+        import msvcrt
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            with open(os.path.join(source, "readable.jpg"), "wb") as handle:
+                handle.write(b"fine " * 500)
+            locked_path = os.path.join(source, "locked.jpg")
+            with open(locked_path, "wb") as handle:
+                handle.write(b"locked content " * 500)
+
+            handle = open(locked_path, "r+b")
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 4000)
+            except OSError:  # pragma: no cover - platform refused the lock
+                handle.close()
+                self.skipTest("This platform would not take an exclusive lock")
+            try:
+                result = execute_smart_transfer(
+                    self._settings(source, library, output), threading.Event(),
+                    HashCache(os.path.join(root, "cache.json")), DummyLogger(),
+                )
+            finally:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 4000)
+                handle.close()
+
+            self.assertEqual(os.listdir(output), ["readable.jpg"])
+            self.assertEqual(result["errors"], 1, "the unreadable file must be reported")
+            self.assertEqual(
+                result["transferred"] + result["duplicates"]
+                + result["conflict_skipped"] + result["errors"],
+                2,
+            )
+
+    def test_a_file_deleted_after_discovery_is_counted_as_an_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            with open(os.path.join(source, "stays.jpg"), "wb") as handle:
+                handle.write(b"stays " * 500)
+            vanishing = os.path.join(source, "vanishes.jpg")
+            with open(vanishing, "wb") as handle:
+                handle.write(b"gone soon " * 500)
+
+            real_iter = engine_module.iter_files
+            removed = []
+
+            def iter_then_delete(*args, **kwargs):
+                items = list(real_iter(*args, **kwargs))
+                if not removed and any("vanishes" in item.path for item in items):
+                    removed.append(True)
+                    os.remove(vanishing)
+                return iter(items)
+
+            with mock.patch.object(engine_module, "iter_files", iter_then_delete):
+                result = execute_smart_transfer(
+                    self._settings(source, library, output), threading.Event(),
+                    HashCache(os.path.join(root, "cache.json")), DummyLogger(),
+                )
+
+            self.assertEqual(os.listdir(output), ["stays.jpg"])
+            self.assertEqual(result["errors"], 1)
+            self.assertEqual(
+                result["transferred"] + result["duplicates"]
+                + result["conflict_skipped"] + result["errors"],
+                2,
+            )
+
+
+
 if __name__ == "__main__":
     unittest.main()
