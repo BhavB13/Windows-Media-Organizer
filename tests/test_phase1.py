@@ -285,6 +285,33 @@ class ServiceTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_chained_operation_remains_cancellable_after_previous_worker_finishes(self):
+        controller = BaseOperationController()
+        release = threading.Event()
+        tokens = []
+        started = []
+
+        def second(token, _reporter):
+            tokens.append(token)
+            release.wait(5)
+            return OperationResult(status=OperationState.CANCELLED if token.is_set() else OperationState.COMPLETED)
+
+        def chain(_result):
+            if not started:
+                started.append(controller.start_task(second))
+
+        controller.completed.connect(chain)
+        try:
+            controller.start_task(lambda _token, _reporter: OperationResult(status=OperationState.COMPLETED))
+            self.assertTrue(controller.wait_for_done(5000))
+            process_qt_events()
+            self.assertEqual(started, [True])
+            self.assertTrue(controller.cancel())
+        finally:
+            release.set()
+            self.wait(controller)
+        self.assertTrue(tokens[0].is_set())
+
     def wait(self, controller):
         self.assertTrue(controller.wait_for_done(5000))
         process_qt_events()

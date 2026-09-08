@@ -63,6 +63,14 @@ is tracked in [OVERHAUL_PLAN.md](OVERHAUL_PLAN.md).
   happen to end in `.partial` are never deleted.
 - Run copy-only dry runs before making changes.
 
+## Android USB companion
+
+The native Android project in [`android/`](android/README.md) copies files from
+a selected phone folder to a USB drive mounted by Android, skipping identical
+content and retaining phone originals. It is separate from the Windows app's
+ADB workflow. See the Android README for APK build instructions, supported
+storage providers, and the physical-device verification checklist.
+
 ## Requirements
 
 - 64-bit Windows 10 or Windows 11

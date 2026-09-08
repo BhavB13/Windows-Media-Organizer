@@ -62,6 +62,45 @@ from models import FileInfo
 
 
 class Phase2UiTests(unittest.TestCase):
+    def test_partial_cleanup_refuses_to_touch_an_active_transfer(self):
+        page = self.window.pages["import"]
+        with (
+            patch.object(type(page.controller), "busy", new_callable=PropertyMock, return_value=True),
+            patch("duplicate_transfer_manager.ui.pages.cleanup_partial_files") as cleanup,
+            patch.object(QMessageBox, "question") as confirm,
+        ):
+            page._cleanup_partials()
+        cleanup.assert_not_called()
+        confirm.assert_not_called()
+
+    def test_partial_cleanup_runs_off_main_thread_and_blocks_transfer_overlap(self):
+        import threading
+        page = self.window.pages["import"]
+        page.output_path.set_path(self.temp_dir.name)
+        page.dry_run_cleanup.setChecked(True)
+        main_thread = threading.get_ident()
+        threads = []
+        release = threading.Event()
+
+        def cleanup(root, dry_run):
+            threads.append(threading.get_ident())
+            release.wait(5)
+            return [str(Path(root) / "owned-file")]
+
+        with patch("duplicate_transfer_manager.ui.pages.cleanup_partial_files", side_effect=cleanup):
+            try:
+                page._cleanup_partials()
+                self.assertTrue(page.controller.busy)
+                self.assertFalse(page.cleanup_partials_button.isEnabled())
+                self.assertFalse(page.controller.start_task(lambda _token, _reporter: None))
+            finally:
+                release.set()
+                self.assertTrue(page.controller.wait_for_done(5000))
+                self.application.processEvents()
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], main_thread)
+        self.assertTrue(page.cleanup_partials_button.isEnabled())
+
     @classmethod
     def setUpClass(cls):
         cls.application = QApplication.instance() or QApplication([])
@@ -101,6 +140,33 @@ class Phase2UiTests(unittest.TestCase):
         cancel.assert_called_once()
         wait.assert_called_once()
         self.assertTrue(event.isAccepted())
+
+    def test_shutdown_timeout_keeps_the_window_open(self):
+        controller = self.window.pages["import"].controller
+        with (
+            patch.object(type(controller), "busy", new_callable=PropertyMock, return_value=True),
+            patch.object(controller, "cancel"),
+            patch.object(controller, "wait_for_done", return_value=False),
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            event = QCloseEvent()
+            self.window.closeEvent(event)
+        self.assertFalse(event.isAccepted())
+        warning.assert_called_once()
+
+    def test_shutdown_waits_for_background_quarantine_work(self):
+        from PySide6.QtCore import QThreadPool
+        with (
+            patch.object(QThreadPool, "activeThreadCount", return_value=1),
+            patch.object(QThreadPool, "waitForDone", return_value=False) as wait,
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+            patch.object(QMessageBox, "warning"),
+        ):
+            event = QCloseEvent()
+            self.window.closeEvent(event)
+        self.assertFalse(event.isAccepted())
+        wait.assert_called_once()
 
     def test_declining_the_close_prompt_leaves_the_window_open(self):
         controller = self.window.pages["import"].controller

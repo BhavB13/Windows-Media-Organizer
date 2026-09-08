@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -378,9 +378,10 @@ class MainWindow(QMainWindow):
     def _busy_controllers(self) -> list:
         controllers = []
         for key in ("audit", "duplicates", "import", "sort"):
-            controller = getattr(self.pages.get(key), "controller", None)
-            if controller is not None and controller.busy:
-                controllers.append(controller)
+            for attribute in ("controller", "device_controller"):
+                controller = getattr(self.pages.get(key), attribute, None)
+                if controller is not None and controller.busy:
+                    controllers.append(controller)
         return controllers
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -394,11 +395,13 @@ class MainWindow(QMainWindow):
         """
 
         busy = self._busy_controllers()
-        if busy:
+        pool = QThreadPool.globalInstance()
+        background_active = pool.activeThreadCount() > 0
+        if busy or background_active:
             answer = QMessageBox.question(
                 self,
                 "Stop the running operation?",
-                f"{len(busy)} operation(s) are still running. "
+                f"{max(1, len(busy))} operation(s) are still running. "
                 "Closing will stop them safely; work already finished is kept.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -411,11 +414,32 @@ class MainWindow(QMainWindow):
                     controller.cancel()
                 except Exception:  # noqa: BLE001 - shutdown must not be blocked
                     pass
+            for page in self.pages.values():
+                workers = list(getattr(page, "_background_workers", ()))
+                monitor = getattr(page, "_monitor_worker", None)
+                if monitor is not None:
+                    workers.append(monitor)
+                for worker in workers:
+                    worker.cancellation.cancel()
+            stopped = True
             for controller in busy:
                 try:
-                    controller.wait_for_done(self.SHUTDOWN_WAIT_MS)
-                except Exception:  # noqa: BLE001 - shutdown must not be blocked
-                    pass
+                    stopped = controller.wait_for_done(self.SHUTDOWN_WAIT_MS) and stopped
+                except Exception:
+                    stopped = False
+            # Quarantine, restore, and folder browsing can run outside the
+            # primary page controllers. They must also finish before teardown.
+            if background_active:
+                stopped = pool.waitForDone(self.SHUTDOWN_WAIT_MS) and stopped
+            if not stopped:
+                QMessageBox.warning(
+                    self,
+                    "Still stopping",
+                    "An operation is still finishing its current file. The window will stay open "
+                    "to protect your files. Wait for it to stop, then close again.",
+                )
+                event.ignore()
+                return
         self.settings_service.save(self.settings)
         super().closeEvent(event)
 

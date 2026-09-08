@@ -148,25 +148,41 @@ def build_target_path(
     avoid_collisions=True,
     destination_template="preserve",
     source_timestamp=0,
+    create_dirs=True,
 ):
+    """Compute the destination path for a source file.
+
+    ``create_dirs`` exists so a dry run can answer "where would this go?"
+    without answering it by creating the folder. Building the path used to
+    ``os.makedirs`` unconditionally, so a run the UI describes as making no
+    changes left an empty destination tree behind. It defaults to True to keep
+    every existing caller behaving exactly as before.
+    """
+
     filename = os.path.basename(source_path)
+
+    def _prepare(path):
+        if create_dirs:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        return ensure_unique_path(path) if avoid_collisions else path
+
     if destination_template == "date":
         try:
             # Use UTC so the folder is stable across machines and daylight-saving changes.
             dated_folder = datetime.fromtimestamp(float(source_timestamp), UTC).strftime("%Y/%m")
         except (OSError, OverflowError, TypeError, ValueError):
             dated_folder = "Unknown date"
-        target_path = os.path.join(dest_root, *dated_folder.split("/"), filename)
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        return ensure_unique_path(target_path) if avoid_collisions else target_path
+        return _prepare(os.path.join(dest_root, *dated_folder.split("/"), filename))
     if preserve_structure and source_root:
         rel_path = build_relative_path(source_path, source_root, is_adb=is_adb)
         if rel_path:
             target_path = os.path.join(dest_root, *rel_path.split("/")) if is_adb else os.path.join(dest_root, rel_path)
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            return ensure_unique_path(target_path) if avoid_collisions else target_path
+            return _prepare(target_path)
 
-    os.makedirs(dest_root, exist_ok=True)
+    if create_dirs:
+        os.makedirs(dest_root, exist_ok=True)
     target_path = os.path.join(dest_root, filename)
     return ensure_unique_path(target_path) if avoid_collisions else target_path
 
@@ -265,6 +281,111 @@ def promote_transfer_file(staged_path, target_path, policy, output_root):
                         pass
                     return "", ""
                 candidate = ensure_unique_path(candidate)
+
+def _is_separate_output_tree(output_root, compare_root):
+    """Report whether the output folder needs a comparison scan of its own.
+
+    False when the two are the same folder, or when the output folder already
+    sits inside the compare folder and was therefore covered by that scan.
+    """
+
+    if not output_root or not compare_root:
+        return False
+    output_abs = os.path.abspath(output_root)
+    compare_abs = os.path.abspath(compare_root)
+    if output_abs == compare_abs:
+        return False
+    common = _safe_commonpath([output_abs, compare_abs])
+    return common != compare_abs
+
+
+def restore_replaced_original(target_path, replaced_backup, logger=None):
+    """Put a displaced original back after a replace-policy transfer failed.
+
+    ``promote_transfer_file`` moves the existing destination file into the
+    backups folder before writing over its path. If anything afterwards fails,
+    that original is the user's only copy and its own path is now empty, so it
+    has to go back. Returns the backup path that is still outstanding: empty
+    once the original has been restored, unchanged when there was nothing to
+    restore or the target path is occupied again.
+    """
+
+    if not replaced_backup or not target_path:
+        return replaced_backup
+    if not os.path.exists(replaced_backup):
+        return replaced_backup
+    parent = os.path.dirname(target_path)
+    try:
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    except OSError as exc:
+        return _report_failed_restore(target_path, replaced_backup, exc, logger)
+
+    # Never ``os.replace``. Checking that the target is free and then replacing
+    # it is two steps, and anything that lands in between -- a retry, a second
+    # window, the user putting a file back -- is destroyed by the second step.
+    # A hard link is created only if the name is still free, and the exclusive
+    # -creation copy used where links are unavailable has the same guarantee.
+    try:
+        try:
+            os.link(replaced_backup, target_path)
+        except (AttributeError, NotImplementedError):
+            _copy_no_clobber(replaced_backup, target_path)
+        else:
+            os.remove(replaced_backup)
+    except FileExistsError:
+        # Something occupies the name again. The original stays in the backup
+        # folder rather than being forced over whatever is now there.
+        return _report_failed_restore(
+            target_path,
+            replaced_backup,
+            "the destination name was taken again",
+            logger,
+        )
+    except OSError as exc:
+        try:
+            _copy_no_clobber(replaced_backup, target_path)
+        except FileExistsError:
+            return _report_failed_restore(
+                target_path, replaced_backup, "the destination name was taken again", logger
+            )
+        except OSError as copy_exc:
+            return _report_failed_restore(target_path, replaced_backup, copy_exc, logger)
+        else:
+            del exc
+    if logger:
+        logger.log(f"Restored the original file at {target_path} after a failed replacement.")
+    return ""
+
+
+def _recovery_record(target_path, quarantined_path, unrestored_backup):
+    """Describe where a failed transfer left files, for the journal and report.
+
+    Only the paths a person would need to act on. An empty record means nothing
+    was left behind and the destination is as it was.
+    """
+
+    record = {}
+    if quarantined_path:
+        record["quarantined_path"] = os.path.abspath(quarantined_path)
+    if unrestored_backup:
+        record["unrestored_original_backup"] = os.path.abspath(unrestored_backup)
+        if target_path:
+            record["unrestored_original_target"] = os.path.abspath(target_path)
+    return record
+
+
+def _report_failed_restore(target_path, replaced_backup, reason, logger=None):
+    """Say loudly where an original was left when it could not be put back."""
+
+    if logger:
+        logger.log(
+            f"ERROR: Could not restore the original file to {target_path} ({reason}). "
+            f"The original is preserved at {replaced_backup} and is recorded in the "
+            "transfer report and resume journal."
+        )
+    return replaced_backup
+
 
 def validate_transfer_paths(settings):
     source_root = settings.source_root.strip()
@@ -550,6 +671,12 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
     output_root = settings.output_root.strip() or settings.dest_root
     dry_run_label = "Dry run" if settings.dry_run else "Live run"
     hash_settings = build_transfer_hash_settings(settings)
+    # Used to prove a copy landed intact when the comparison digest is only a
+    # sample. Duplicate grouping already keeps a full-content settings object
+    # for the same reason; this is the transfer path's.
+    full_verify_settings = copy(hash_settings)
+    full_verify_settings.hash_algo = "sha256"
+    full_verify_settings.hash_mode = "full"
     source_scan_settings = build_source_scan_settings(hash_settings)
     compare_scan_settings = build_compare_scan_settings(hash_settings)
     drive_cache = load_drive_cache(compare_root, compare_scan_settings, logger)
@@ -604,13 +731,20 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
     # Built before the preflight rather than after it: the free-space check has
     # to know which sources the journal already completed, or a resume is
     # hard-blocked precisely when the destination is nearly full.
-    journal = None
-    if not settings.dry_run:
-        journal_path = getattr(settings, "journal_path", "").strip() or default_journal_path(
-            output_root, getattr(settings, "adb_serial", "") or "local"
-        )
-        journal = TransferJournal(journal_path)
-        logger.log(f"Resume journal: {journal_path}")
+    # Loaded for a dry run too. Reading the journal writes nothing, and skipping
+    # it made the preview disagree with the live run it exists to predict:
+    # already-completed files were reported as "would transfer" and their bytes
+    # were charged against the free-space estimate. ``write_journal`` is the
+    # handle used for every mutation, so a dry run stays strictly read-only.
+    journal_path = getattr(settings, "journal_path", "").strip() or default_journal_path(
+        output_root, getattr(settings, "adb_serial", "") or "local"
+    )
+    journal = TransferJournal(journal_path)
+    write_journal = None if settings.dry_run else journal
+    logger.log(
+        f"Resume journal: {journal_path}"
+        f"{' (read-only for this dry run)' if settings.dry_run else ''}"
+    )
     verify_resumed_files = bool(getattr(settings, "verify_resumed_files", False))
 
     preflight_errors, preflight_warnings = preflight_transfer(
@@ -682,13 +816,44 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
 
         if progress_callback:
             progress_callback(0, 0, f"Scanning Compare: {len(dest_files)} files found")
-    
+
+        # The output folder is part of the comparison set whenever it is a tree
+        # of its own. Only the compare folder used to be scanned, so files this
+        # app had already copied into a separate "Save to" folder were invisible:
+        # any run whose journal was missing -- a hard kill loses up to 25
+        # completions to the journal's write throttle, and the journal name
+        # itself depends on the device serial -- re-imported every one of them
+        # under a " (1)" suffix. Held apart from ``dest_files`` so the compare
+        # folder's cache bookkeeping stays about the compare folder.
+        output_files = []
+        if _is_separate_output_tree(output_root, compare_root):
+            output_time = time.time()
+            logger.log(f"Scanning Output Folder: {output_root}")
+            output_progress = _transfer_discovery_progress("Output scan", output_time, progress_callback)
+            for count, f in enumerate(
+                iter_files(output_root, compare_scan_settings, stop_event, output_progress, logger), 1
+            ):
+                output_files.append(f)
+                if count % 25 == 0 and progress_callback:
+                    elapsed = int(time.time() - output_time)
+                    progress_callback(0, 0, f"Scanning Output: {count} files found ({elapsed}s)")
+            if progress_callback:
+                progress_callback(0, 0, f"Scanning Output: {len(output_files)} files found")
+            logger.log(
+                f"Output folder differs from the compare folder; {len(output_files)} "
+                "already-imported file(s) join the duplicate comparison set."
+            )
+
         dest_hashes = set()
         # One representative destination per digest. A sampled "fast" digest is
         # only a shortlist, so skipping a source as an existing duplicate has to be
         # confirmed against a real file rather than against the digest alone.
         dest_hash_paths = {}
-        total_dest = len(dest_files)
+        # Each entry carries the root it belongs to so the drive cache records
+        # output-folder files under the output root rather than the compare root.
+        comparison_entries = [(f, compare_root) for f in dest_files]
+        comparison_entries.extend((f, output_root) for f in output_files)
+        total_dest = len(comparison_entries)
         # There is deliberately no count-based shortcut here. Comparing the number
         # of cached entries with the number of files on disk says nothing about
         # whether they are the same files: deleting one file and adding another
@@ -702,7 +867,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
             logger.log(f"Validating {total_dest} compare file(s) against cached size and timestamp.")
         else:
             logger.log("Hashing compare-folder files to build duplicate comparison data.")
-        for i, f in enumerate(dest_files):
+        for i, (f, entry_root) in enumerate(comparison_entries):
             if stop_event.is_set(): break
             cached = None
             if drive_cache:
@@ -734,7 +899,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                     h,
                     compare_scan_settings.hash_algo,
                     compare_scan_settings.hash_mode,
-                    root=compare_root,
+                    root=entry_root,
                 )
             if h:
                 dest_hashes.add(h)
@@ -742,8 +907,10 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
             if progress_callback: progress_callback(i + 1, total_dest, f"Building destination cache... {i + 1}/{total_dest}")
         if drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
             drive_cache.mark_missing_under_root(compare_root, [f.path for f in dest_files])
+            if output_files:
+                drive_cache.mark_missing_under_root(output_root, [f.path for f in output_files])
         if drive_cache:
-            logger.log(f"Drive cache served {cache_hits} of {total_dest} compare hash(es); the rest were read.")
+            logger.log(f"Drive cache served {cache_hits} of {total_dest} comparison hash(es); the rest were read.")
 
         logger.log("Processing Source Files. Please wait...")
         logger.log(f"Copy Target Folder: {output_root}")
@@ -807,6 +974,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
             bytes_before = source_byte_offsets[i]
             staged_path = ""
             partial_path = ""
+            published_unverified = False
             if journal and journal.is_complete(f.path, f.size, verify_resumed_files):
                 resumed += 1
                 if resumed == 1 or resumed % 100 == 0:
@@ -864,8 +1032,8 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                     else:
                         h = compute_hash(f.path, hash_settings, stop_event, hash_cache, f.is_adb, logger)
                 except HashCancelled:
-                    if journal:
-                        journal.fail(
+                    if write_journal:
+                        write_journal.fail(
                             f.path,
                             "Hashing cancelled",
                             partial_path or (f"{staged_path}{APP_PARTIAL_SUFFIX}" if staged_path else ""),
@@ -884,8 +1052,8 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                 except OSError as exc:
                     transfer_errors += 1
                     failures.append({"source": f.path, "error": str(exc)})
-                    if journal:
-                        journal.fail(f.path, exc, partial_path or (f"{staged_path}{APP_PARTIAL_SUFFIX}" if staged_path else ""))
+                    if write_journal:
+                        write_journal.fail(f.path, exc, partial_path or (f"{staged_path}{APP_PARTIAL_SUFFIX}" if staged_path else ""))
                     logger.log(f"WARNING: Single-read import staging failed: {f.path} ({exc})")
                     continue
                 if (
@@ -913,8 +1081,8 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                 transfer_errors += 1
                 logger.log(f"WARNING: Skipping file because a comparison hash could not be read: {f.path}")
                 failures.append({"source": f.path, "error": "Comparison hash could not be read"})
-                if journal:
-                    journal.fail(f.path, "Comparison hash could not be read")
+                if write_journal:
+                    write_journal.fail(f.path, "Comparison hash could not be read")
                 continue
         
             is_duplicate = h in dest_hashes
@@ -938,7 +1106,10 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                 dup_folder_counts[folder] = dup_folder_counts.get(folder, 0) + 1
             
                 if settings.duplicate_policy == "isolate" and settings.isolate_folder:
-                    os.makedirs(settings.isolate_folder, exist_ok=True)
+                    # Creating the isolate folder is a change to the user's disk,
+                    # so a dry run only computes where the duplicate would land.
+                    if not settings.dry_run:
+                        os.makedirs(settings.isolate_folder, exist_ok=True)
                     target_path = ensure_unique_path(os.path.join(settings.isolate_folder, filename))
                     if not settings.dry_run:
                         try:
@@ -965,6 +1136,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                     avoid_collisions=False,
                     destination_template=getattr(settings, "destination_template", "preserve"),
                     source_timestamp=f.created,
+                    create_dirs=not settings.dry_run,
                 )
                 conflict_policy = getattr(settings, "conflict_policy", "rename")
                 target_path = resolve_conflict_path(target_path, conflict_policy)
@@ -983,7 +1155,32 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                     continue
                 if not settings.dry_run:
                     replaced_backup = ""
+                    # Every copy is verified against a complete read of its
+                    # source, whatever the profile. Under "Fast" the comparison
+                    # digest ``h`` covers only the size and the first and last
+                    # megabyte, so a corrupted middle -- the usual shape of a bad
+                    # sector or a flaky USB enclosure -- verified clean and was
+                    # published as a good import. ``h`` is reused only when it is
+                    # already a full digest, so the careful profiles read nothing
+                    # extra. ADB sources are always full (see
+                    # ``build_transfer_hash_settings``), so the extra read here is
+                    # of a local file.
+                    verify_settings = (
+                        hash_settings if hash_settings.hash_mode == "full" else full_verify_settings
+                    )
                     try:
+                        expected_digest = (
+                            h
+                            if verify_settings is hash_settings
+                            else compute_hash(
+                                f.path, full_verify_settings, stop_event, hash_cache, f.is_adb, logger
+                            )
+                        )
+                        if not expected_digest:
+                            raise OSError(
+                                "Could not read the source completely to verify the copy; "
+                                "nothing was written."
+                            )
                         if f.is_adb:
                             if staged_path:
                                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
@@ -1012,19 +1209,6 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                                     pulled_path, target_path, conflict_policy, output_root
                                 )
                                 partial_path = ""
-                            if not target_path:
-                                conflict_skipped += 1
-                                logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")
-                                continue
-                            if not staged_path:
-                                verified_hash = compute_hash(
-                                    target_path, hash_settings, stop_event, hash_cache, False, logger
-                                )
-                                if verified_hash != h:
-                                    failed_path = transfer_staging_path(output_root, target_path, "failed")
-                                    os.replace(target_path, failed_path)
-                                    partial_path = failed_path
-                                    raise OSError(f"Post-transfer hash verification failed; retained as {failed_path}")
                         else:
                             partial_path = transfer_staging_path(output_root, target_path, "local")
                             shutil.copy2(f.path, partial_path)
@@ -1032,30 +1216,97 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                                 partial_path, target_path, conflict_policy, output_root
                             )
                             partial_path = ""
-                            if not target_path:
-                                conflict_skipped += 1
-                                logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")
-                                continue
-                            if os.path.getsize(target_path) != f.size:
-                                failed_path = transfer_staging_path(output_root, target_path, "failed")
-                                os.replace(target_path, failed_path)
-                                partial_path = failed_path
-                                raise OSError(f"Post-transfer size verification failed; retained as {failed_path}")
+                        if not target_path:
+                            conflict_skipped += 1
+                            logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")
+                            continue
+                        # From here until verification passes, the bytes at
+                        # ``target_path`` are this run's unproven work. Saying so
+                        # explicitly is what lets a failure below tell that file
+                        # apart from a restored original or a pre-existing one,
+                        # and quarantine only what it actually owns.
+                        published_unverified = True
+                        # One verification for every route into the destination:
+                        # local copy, staged pull, and direct pull alike. Size
+                        # alone cannot detect corruption -- a bad sector or a
+                        # flaky enclosure preserves the byte count -- so the
+                        # bytes that landed are read back in full and must equal
+                        # the source. The cache is deliberately not consulted:
+                        # promotion preserves the source timestamp, so a cached
+                        # digest keyed on (path, size, mtime) can answer for a
+                        # file that was just overwritten. Verification has to
+                        # read the disk or it is not verification.
+                        copied_size = os.path.getsize(target_path)
+                        verified_hash = (
+                            compute_hash(target_path, verify_settings, stop_event, None, False, logger)
+                            if copied_size == f.size
+                            else ""
+                        )
+                        if copied_size != f.size or verified_hash != expected_digest:
+                            reason = "size" if copied_size != f.size else "content hash"
+                            failed_path = transfer_staging_path(output_root, target_path, "failed")
+                            os.replace(target_path, failed_path)
+                            partial_path = failed_path
+                            published_unverified = False
+                            replaced_backup = restore_replaced_original(
+                                target_path, replaced_backup, logger
+                            )
+                            raise OSError(
+                                f"Post-transfer {reason} verification failed; retained as {failed_path}"
+                            )
+                        # Proven good. The file is the user's now, not this
+                        # iteration's work in progress.
+                        published_unverified = False
                     except HashCancelled:
-                        if target_path and os.path.exists(target_path):
+                        if published_unverified and target_path and os.path.exists(target_path):
                             partial_path = transfer_staging_path(output_root, target_path, "cancelled")
                             os.replace(target_path, partial_path)
-                            if replaced_backup and os.path.exists(replaced_backup):
-                                os.replace(replaced_backup, target_path)
-                        if journal:
-                            journal.fail(f.path, "Verification cancelled", partial_path)
+                            published_unverified = False
+                        replaced_backup = restore_replaced_original(
+                            target_path, replaced_backup, logger
+                        )
+                        if write_journal:
+                            write_journal.fail(
+                                f.path,
+                                "Verification cancelled",
+                                partial_path,
+                                recovery=_recovery_record(target_path, partial_path, replaced_backup),
+                            )
                         break
                     except (OSError, shutil.Error, subprocess.CalledProcessError, ADBOperationError) as exc:
+                        # Cancellation restored the displaced original; an
+                        # ordinary failure did not, so a replace-policy import
+                        # that failed verification left the user's library file
+                        # missing from its own path with nothing recording where
+                        # it had gone. Both paths now roll back the same way.
+                        #
+                        # Unverified bytes are moved aside first. Leaving them in
+                        # place kept the destination name occupied, which then
+                        # blocked the original from coming back and left the user
+                        # with an unproven copy standing in for a file they had.
+                        if published_unverified and target_path and os.path.exists(target_path):
+                            try:
+                                quarantined = transfer_staging_path(output_root, target_path, "failed")
+                                os.replace(target_path, quarantined)
+                                partial_path = quarantined
+                            except OSError as quarantine_exc:
+                                logger.log(
+                                    f"WARNING: Could not move the unverified copy out of "
+                                    f"{target_path} ({quarantine_exc})."
+                                )
+                            else:
+                                published_unverified = False
+                        replaced_backup = restore_replaced_original(
+                            target_path, replaced_backup, logger
+                        )
+                        recovery = _recovery_record(target_path, partial_path, replaced_backup)
                         logger.log(f"WARNING: Failed to copy file: {f.path} -> {target_path} ({exc})")
                         transfer_errors += 1
-                        failures.append({"source": f.path, "target": target_path, "error": str(exc)})
-                        if journal:
-                            journal.fail(f.path, exc, partial_path)
+                        failure_record = {"source": f.path, "target": target_path, "error": str(exc)}
+                        failure_record.update(recovery)
+                        failures.append(failure_record)
+                        if write_journal:
+                            write_journal.fail(f.path, exc, partial_path, recovery=recovery)
                         if isinstance(exc, ADBOperationError) and exc.device_unavailable:
                             adb_device_failed = True
                             logger.log(
@@ -1066,8 +1317,8 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                                 progress_callback(i + 1, total_src, "ADB authorization lost; transfer stopped")
                             break
                         continue
-                    if journal:
-                        journal.complete(
+                    if write_journal:
+                        write_journal.complete(
                             f.path,
                             target_path,
                             f.size,
@@ -1093,7 +1344,12 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                     dest_hashes.add(h)
                     # Newly copied files join the comparison set, so a later source
                     # matching one of them can be confirmed against a real path too.
-                    dest_hash_paths.setdefault(h, target_path)
+                    # A dry run copies nothing, so ``target_path`` does not exist
+                    # and confirming against it always failed -- which reported
+                    # two identical sources as two transfers where the live run
+                    # copies one and skips one. The source file is byte-identical
+                    # to what would have been written, so it stands in for it.
+                    dest_hash_paths.setdefault(h, f.path if settings.dry_run else target_path)
                 transferred += 1
                 bytes_transferred += f.size
                 source_folder = os.path.dirname(f.path)
@@ -1143,9 +1399,9 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         if getattr(settings, "source_is_adb", False) and getattr(settings, "keep_device_awake", True):
             ADBBridge.restore_stay_awake(getattr(settings, "adb_serial", ""), previous_stay_awake)
             logger.log("ADB keep-awake setting restored.")
-        if journal:
+        if write_journal:
             try:
-                journal.save(force=True)
+                write_journal.save(force=True)
                 logger.log("Transfer resume journal checkpoint completed.")
             except OSError as exc:
                 logger.log(f"WARNING: Failed to finalize transfer journal: {exc}")

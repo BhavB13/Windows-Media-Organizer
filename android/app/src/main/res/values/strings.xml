@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Phone to Drive</string>
+
+    <string name="heading_source">1. Folder on this phone</string>
+    <string name="heading_destination">2. Folder on the USB drive</string>
+    <string name="heading_status">3. Review, then copy</string>
+
+    <string name="choose_source">Choose phone folder</string>
+    <string name="choose_destination">Choose drive folder</string>
+    <string name="action_review">Review</string>
+    <string name="action_copy">Copy new files</string>
+    <string name="action_cancel">Cancel</string>
+
+    <string name="none_selected">Not chosen yet</string>
+    <string name="status_idle">Choose both folders, then tap Review.</string>
+    <string name="status_review_first">Tap Review first so you can see what will be copied.</string>
+    <string name="status_busy">Something is already running. Wait for it to finish or cancel it.</string>
+    <string name="status_pick_both">Choose a phone folder and a drive folder first.</string>
+    <string name="status_same_folder">Those are the same folder. Choose two different folders.</string>
+    <string name="status_could_not_start">Android would not let the copy start just now. Open the app and try again.</string>
+    <string name="notification_timeout">Copying was stopped by Android because it ran too long. Nothing on your phone was changed. Open the app and tap Copy again to continue.</string>
+
+    <string name="notification_reviewing">Reviewing files</string>
+    <string name="notification_copying">Copying files to the drive</string>
+    <string name="channel_name">Copy progress</string>
+    <string name="channel_description">Shows progress while files are reviewed or copied.</string>
+
+    <string name="desc_progress">Progress of the current operation</string>
+    <string name="desc_results">Details of the last review or copy</string>
+</resources>

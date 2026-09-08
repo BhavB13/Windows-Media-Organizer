@@ -39,6 +39,12 @@ refresh_adb_cache.ps1
 build_test/
 dist_test/
 
+# Android local tooling and generated packages
+android/.gradle/
+android/local.properties
+*.apk
+*.aab
+
 # Disk Audit reports describe the machine they were produced on. They are the
 # user's own data, not source, and must never be committed to a public repo.
 disk-audit.html

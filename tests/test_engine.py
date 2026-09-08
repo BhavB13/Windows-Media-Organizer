@@ -2286,6 +2286,746 @@ class ImportJourneyTests(unittest.TestCase):
             )
 
 
+def _read_bytes(path):
+    """Read a file and close it. Bare ``open(...).read()`` leaks the handle."""
+
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+class TransferSafetyRegressionTests(unittest.TestCase):
+    """Regressions for the transfer-engine audit findings 1-6."""
+
+    @staticmethod
+    def _settings(source, library, output, journal_path, **over):
+        values = dict(
+            source_root=source, dest_root=library, output_root=output,
+            criteria="hash", hash_algo="sha256", hash_mode="full", only_media=False,
+            extensions=[], min_size_kb=0, exclude_dirs=[], skip_hidden_system=False,
+            dry_run=False, preserve_structure=True, max_hash_workers=1,
+            transfer_mode="copy", duplicate_policy="skip", use_dest_cache=False,
+            source_is_adb=False, update_drive_cache=False, use_adb_cache=False,
+            conflict_policy="rename", journal_path=journal_path,
+        )
+        values.update(over)
+        return TransferSettings(**values)
+
+    @staticmethod
+    def _tree_snapshot(root):
+        """Every path under ``root``, relative and sorted."""
+        entries = []
+        for current, dirs, files in os.walk(root):
+            for name in list(dirs) + list(files):
+                entries.append(os.path.relpath(os.path.join(current, name), root))
+        return sorted(entries)
+
+    def _run(self, settings, root, stop_event=None):
+        return execute_smart_transfer(
+            settings,
+            stop_event or threading.Event(),
+            HashCache(os.path.join(root, "hash_cache.json")),
+            DummyLogger(),
+        )
+
+    # --- Finding 2: a dry run must not touch the destination ---------------
+
+    def test_nested_dry_run_creates_no_destination_folders(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source", "2023", "trip", "day one")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            os.makedirs(source)
+            os.makedirs(library)
+            os.makedirs(output)
+            with open(os.path.join(source, "photo.jpg"), "wb") as handle:
+                handle.write(b"nested dry run " * 200)
+
+            before = self._tree_snapshot(output)
+            result = self._run(
+                self._settings(
+                    os.path.join(root, "source"), library, output,
+                    os.path.join(root, "journal.json"), dry_run=True,
+                ),
+                root,
+            )
+
+            self.assertEqual(result["transferred"], 1)
+            self.assertEqual(self._tree_snapshot(output), before)
+            self.assertEqual(self._tree_snapshot(output), [])
+
+    def test_date_template_dry_run_creates_no_destination_folders(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            with open(os.path.join(source, "dated.jpg"), "wb") as handle:
+                handle.write(b"date template dry run " * 200)
+
+            result = self._run(
+                self._settings(
+                    source, library, output, os.path.join(root, "journal.json"),
+                    dry_run=True, destination_template="date",
+                ),
+                root,
+            )
+
+            self.assertEqual(result["transferred"], 1)
+            self.assertEqual(self._tree_snapshot(output), [])
+
+    def test_dry_run_does_not_create_the_isolate_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            isolate = os.path.join(root, "isolated")
+            for path in (source, library, output):
+                os.makedirs(path)
+            shared = b"already in the library " * 200
+            with open(os.path.join(library, "existing.jpg"), "wb") as handle:
+                handle.write(shared)
+            with open(os.path.join(source, "copy.jpg"), "wb") as handle:
+                handle.write(shared)
+
+            result = self._run(
+                self._settings(
+                    source, library, output, os.path.join(root, "journal.json"),
+                    dry_run=True, duplicate_policy="isolate", isolate_folder=isolate,
+                ),
+                root,
+            )
+
+            self.assertEqual(result["isolated"], 1)
+            self.assertFalse(os.path.exists(isolate))
+
+    # --- Finding 3: a dry run reads the journal but never writes it --------
+
+    def test_dry_run_reports_resumed_files_without_writing_the_journal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            payload = b"already imported " * 300
+            with open(os.path.join(source, "done.jpg"), "wb") as handle:
+                handle.write(payload)
+            with open(os.path.join(source, "todo.jpg"), "wb") as handle:
+                handle.write(b"not yet imported " * 300)
+
+            journal_path = os.path.join(root, "journal.json")
+            settings = self._settings(source, library, output, journal_path)
+
+            live = self._run(settings, root)
+            self.assertEqual(live["transferred"], 2)
+
+            journal_before = _read_bytes(journal_path)
+            mtime_before = os.path.getmtime(journal_path)
+
+            preview = self._run(
+                self._settings(source, library, output, journal_path, dry_run=True),
+                root,
+            )
+
+            # The journal already proved both files complete, so the preview
+            # must agree with the live run instead of offering them again.
+            self.assertEqual(preview["resumed"], 2)
+            self.assertEqual(preview["transferred"], 0)
+            self.assertEqual(_read_bytes(journal_path), journal_before)
+            self.assertEqual(os.path.getmtime(journal_path), mtime_before)
+
+    # --- Finding 4: within-batch dedup must match between dry and live -----
+
+    def test_fast_dry_run_matches_live_for_identical_source_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            # Larger than the 2 MiB sampling threshold so "fast" really samples.
+            payload = os.urandom(1024) * 3072
+            for name in ("first.jpg", "second.jpg"):
+                with open(os.path.join(source, name), "wb") as handle:
+                    handle.write(payload)
+
+            preview = self._run(
+                self._settings(
+                    source, library, output, os.path.join(root, "preview.json"),
+                    dry_run=True, hash_mode="fast",
+                ),
+                root,
+            )
+            live = self._run(
+                self._settings(
+                    source, library, output, os.path.join(root, "live.json"),
+                    hash_mode="fast",
+                ),
+                root,
+            )
+
+            self.assertEqual(live["transferred"], 1)
+            self.assertEqual(live["duplicates"], 1)
+            self.assertEqual(preview["transferred"], live["transferred"])
+            self.assertEqual(preview["duplicates"], live["duplicates"])
+
+    # --- Finding 5: a separate output tree joins the comparison set --------
+
+    def test_separate_output_tree_is_not_reimported_without_a_journal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            with open(os.path.join(source, "photo.jpg"), "wb") as handle:
+                handle.write(b"imported once " * 300)
+
+            first_journal = os.path.join(root, "first.json")
+            first = self._run(self._settings(source, library, output, first_journal), root)
+            self.assertEqual(first["transferred"], 1)
+            self.assertEqual(self._tree_snapshot(output), ["photo.jpg"])
+
+            # The journal is gone -- a hard kill loses recent completions, and
+            # the journal name depends on the device serial. The already-copied
+            # file must still be recognised from the output folder itself.
+            os.remove(first_journal)
+            second = self._run(
+                self._settings(source, library, output, os.path.join(root, "second.json")),
+                root,
+            )
+
+            self.assertEqual(second["transferred"], 0)
+            self.assertEqual(second["duplicates"], 1)
+            self.assertEqual(self._tree_snapshot(output), ["photo.jpg"])
+
+    def test_output_inside_the_compare_folder_is_not_scanned_twice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(library, "incoming")
+            os.makedirs(source)
+            os.makedirs(output)
+            with open(os.path.join(source, "photo.jpg"), "wb") as handle:
+                handle.write(b"single scan " * 300)
+
+            self.assertFalse(engine_module._is_separate_output_tree(output, library))
+            self.assertTrue(engine_module._is_separate_output_tree(
+                os.path.join(root, "elsewhere"), library
+            ))
+
+            result = self._run(
+                self._settings(source, library, output, os.path.join(root, "journal.json")),
+                root,
+            )
+            self.assertEqual(result["transferred"], 1)
+
+    # --- Finding 1: a failed replacement restores the displaced original ----
+
+    def _replace_policy_fixture(self, root):
+        source = os.path.join(root, "source")
+        library = os.path.join(root, "library")
+        output = os.path.join(root, "output")
+        for path in (source, library, output):
+            os.makedirs(path)
+        original = b"the user's original library file " * 200
+        with open(os.path.join(output, "photo.jpg"), "wb") as handle:
+            handle.write(original)
+        with open(os.path.join(source, "photo.jpg"), "wb") as handle:
+            handle.write(b"the incoming replacement " * 200)
+        return source, library, output, original
+
+    def test_failed_size_verification_restores_the_replaced_original(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source, library, output, original = self._replace_policy_fixture(root)
+            target = os.path.join(output, "photo.jpg")
+
+            real_copy = engine_module.shutil.copy2
+
+            def truncating_copy(src, dst, *args, **kwargs):
+                real_copy(src, dst, *args, **kwargs)
+                with open(dst, "wb") as handle:
+                    handle.write(b"short")
+                return dst
+
+            with mock.patch.object(engine_module.shutil, "copy2", truncating_copy):
+                result = self._run(
+                    self._settings(
+                        source, library, output, os.path.join(root, "journal.json"),
+                        conflict_policy="replace",
+                    ),
+                    root,
+                )
+
+            self.assertEqual(result["errors"], 1)
+            self.assertEqual(result["transferred"], 0)
+            self.assertTrue(os.path.exists(target))
+            self.assertEqual(_read_bytes(target), original)
+            backups = os.path.join(output, ".duplicate_transfer_manager_backups")
+            self.assertEqual(
+                [] if not os.path.isdir(backups) else os.listdir(backups), []
+            )
+
+    def test_failed_hash_verification_restores_the_replaced_original(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source, library, output, original = self._replace_policy_fixture(root)
+            target = os.path.join(output, "photo.jpg")
+
+            real_copy = engine_module.shutil.copy2
+
+            def corrupting_copy(src, dst, *args, **kwargs):
+                # Same byte count, different bytes: the size check cannot see
+                # this, which is why the copy is verified by content.
+                data = _read_bytes(src)
+                with open(dst, "wb") as handle:
+                    handle.write(b"X" * len(data))
+                return dst
+
+            with mock.patch.object(engine_module.shutil, "copy2", corrupting_copy):
+                result = self._run(
+                    self._settings(
+                        source, library, output, os.path.join(root, "journal.json"),
+                        conflict_policy="replace",
+                    ),
+                    root,
+                )
+
+            self.assertEqual(result["errors"], 1)
+            self.assertEqual(result["transferred"], 0)
+            self.assertEqual(_read_bytes(target), original)
+            backups = os.path.join(output, ".duplicate_transfer_manager_backups")
+            self.assertEqual(
+                [] if not os.path.isdir(backups) else os.listdir(backups), []
+            )
+
+    def test_local_copy_corruption_is_caught_even_without_a_replacement(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            with open(os.path.join(source, "photo.jpg"), "wb") as handle:
+                handle.write(b"good source bytes " * 200)
+
+            def corrupting_copy(src, dst, *args, **kwargs):
+                data = _read_bytes(src)
+                with open(dst, "wb") as handle:
+                    handle.write(b"X" * len(data))
+                return dst
+
+            with mock.patch.object(engine_module.shutil, "copy2", corrupting_copy):
+                result = self._run(
+                    self._settings(source, library, output, os.path.join(root, "journal.json")),
+                    root,
+                )
+
+            # A same-size corrupt copy must never be published as a good import.
+            self.assertEqual(result["transferred"], 0)
+            self.assertEqual(result["errors"], 1)
+            self.assertFalse(os.path.exists(os.path.join(output, "photo.jpg")))
+
+    def test_restore_replaced_original_leaves_an_occupied_target_alone(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            target = os.path.join(root, "photo.jpg")
+            backup = os.path.join(root, "backup.jpg")
+            with open(target, "wb") as handle:
+                handle.write(b"occupied")
+            with open(backup, "wb") as handle:
+                handle.write(b"backup")
+
+            still_pending = engine_module.restore_replaced_original(target, backup)
+            self.assertEqual(still_pending, backup)
+            self.assertEqual(_read_bytes(target), b"occupied")
+
+            os.remove(target)
+            self.assertEqual(engine_module.restore_replaced_original(target, backup), "")
+            self.assertEqual(_read_bytes(target), b"backup")
+            self.assertFalse(os.path.exists(backup))
+
+    # --- Finding 6: cancellation stops further pull attempts ---------------
+
+    def test_cancellation_stops_further_pull_attempts(self):
+        from transfer_safety import pull_with_retries
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            target = os.path.join(root, "pulled.jpg")
+            stop_event = threading.Event()
+            attempts = []
+
+            def failing_pull(source, destination, **kwargs):
+                attempts.append(source)
+                stop_event.set()
+                raise adb_bridge.ADBOperationError(
+                    "pull", source, "adb: error: device 'serial' not found"
+                )
+
+            waited = []
+
+            def never_reconnects(*args, **kwargs):
+                waited.append(True)
+                return False, "never"
+
+            with mock.patch.object(ADBBridge, "pull", failing_pull), \
+                    mock.patch.object(ADBBridge, "wait_for_device", never_reconnects):
+                with self.assertRaises(OSError):
+                    pull_with_retries(
+                        "/sdcard/DCIM/pulled.jpg", target, serial="serial",
+                        attempts=5, stop_event=stop_event,
+                    )
+
+            # One attempt ran, cancellation was noticed, and neither the four
+            # remaining attempts nor a reconnect wait were started.
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(waited, [])
+
+    def test_cancellation_before_the_first_attempt_pulls_nothing(self):
+        from transfer_safety import pull_with_retries
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            stop_event = threading.Event()
+            stop_event.set()
+            attempts = []
+
+            with mock.patch.object(
+                ADBBridge, "pull", lambda *a, **k: attempts.append(True)
+            ):
+                with self.assertRaises(OSError):
+                    pull_with_retries(
+                        "/sdcard/DCIM/pulled.jpg", os.path.join(root, "pulled.jpg"),
+                        serial="serial", attempts=3, stop_event=stop_event,
+                    )
+
+            self.assertEqual(attempts, [])
+
+
+class TransferVerificationHardeningTests(unittest.TestCase):
+    """Second-round gaps: sampled verification, rollback races, journal shapes."""
+
+    _settings = staticmethod(TransferSafetyRegressionTests._settings)
+    _tree_snapshot = staticmethod(TransferSafetyRegressionTests._tree_snapshot)
+
+    def _run(self, settings, root):
+        return execute_smart_transfer(
+            settings,
+            threading.Event(),
+            HashCache(os.path.join(root, "hash_cache.json")),
+            DummyLogger(),
+        )
+
+    @staticmethod
+    def _reported_failures(result):
+        """The failure records as a recovering user would read them."""
+
+        with open(result["report_path"], encoding="utf-8") as handle:
+            return json.load(handle)["failures"]
+
+    # --- Full verification regardless of profile ---------------------------
+
+    def test_fast_profile_detects_corruption_the_sample_cannot_see(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+
+            # Over the 2 MiB sampling threshold, so "fast" reads only the first
+            # and last megabyte. The corruption is planted between them.
+            head = b"H" * (1024 * 1024)
+            middle = b"M" * (1024 * 1024)
+            tail = b"T" * (1024 * 1024)
+            with open(os.path.join(source, "big.jpg"), "wb") as handle:
+                handle.write(head + middle + tail)
+
+            def corrupt_the_middle(src, dst, *args, **kwargs):
+                data = _read_bytes(src)
+                cut = len(data) // 2
+                with open(dst, "wb") as handle:
+                    handle.write(data[:cut] + b"X" + data[cut + 1:])
+                return dst
+
+            with mock.patch.object(engine_module.shutil, "copy2", corrupt_the_middle):
+                result = self._run(
+                    self._settings(
+                        source, library, output, os.path.join(root, "journal.json"),
+                        hash_mode="fast",
+                    ),
+                    root,
+                )
+
+            # Identical ends and identical size: the sampled digest matches and
+            # the size check passes. Only a full read sees the bad middle.
+            self.assertEqual(result["transferred"], 0)
+            self.assertEqual(result["errors"], 1)
+            self.assertFalse(os.path.exists(os.path.join(output, "big.jpg")))
+            self.assertIn("content hash", self._reported_failures(result)[0]["error"])
+
+    def test_fast_profile_still_imports_an_intact_large_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            payload = os.urandom(1024) * 3072
+            with open(os.path.join(source, "big.jpg"), "wb") as handle:
+                handle.write(payload)
+
+            result = self._run(
+                self._settings(
+                    source, library, output, os.path.join(root, "journal.json"),
+                    hash_mode="fast",
+                ),
+                root,
+            )
+
+            self.assertEqual(result["transferred"], 1)
+            self.assertEqual(result["errors"], 0)
+            self.assertEqual(_read_bytes(os.path.join(output, "big.jpg")), payload)
+
+    def test_verification_ignores_a_stale_cache_entry_for_the_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            source_file = os.path.join(source, "photo.jpg")
+            payload = b"the real source bytes " * 200
+            with open(source_file, "wb") as handle:
+                handle.write(payload)
+
+            target = os.path.join(output, "photo.jpg")
+            cache = HashCache(os.path.join(root, "hash_cache.json"))
+            # Poison the cache with the *correct* digest for the target path,
+            # under the size and timestamp the copy will end up carrying:
+            # promotion preserves the source's stat, so a cached answer keyed on
+            # (path, size, mtime) is exactly what a stale entry looks like.
+            cache.set(
+                target, "sha256", "full",
+                os.path.getsize(source_file), os.path.getmtime(source_file),
+                hashlib.sha256(payload).hexdigest(),
+            )
+
+            def corrupting_copy(src, dst, *args, **kwargs):
+                data = _read_bytes(src)
+                with open(dst, "wb") as handle:
+                    handle.write(b"X" * len(data))
+                real_copystat(src, dst)
+                return dst
+
+            real_copystat = engine_module.shutil.copystat
+
+            with mock.patch.object(engine_module.shutil, "copy2", corrupting_copy):
+                result = execute_smart_transfer(
+                    self._settings(source, library, output, os.path.join(root, "journal.json")),
+                    threading.Event(), cache, DummyLogger(),
+                )
+
+            # If verification had trusted the cache it would have "confirmed"
+            # bytes it never read.
+            self.assertEqual(result["transferred"], 0)
+            self.assertEqual(result["errors"], 1)
+            self.assertFalse(os.path.exists(target))
+
+    # --- Rollback: no clobber, and recovery locations are recorded ----------
+
+    def test_rollback_never_overwrites_a_file_that_reappeared(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            target = os.path.join(root, "photo.jpg")
+            backup = os.path.join(root, "backup.jpg")
+            with open(backup, "wb") as handle:
+                handle.write(b"the original")
+
+            # The name is free when the decision is taken and taken by the time
+            # the move would run -- the window os.replace would destroy.
+            real_link = os.link
+
+            def racing_link(src, dst, *args, **kwargs):
+                with open(dst, "wb") as handle:
+                    handle.write(b"someone else's file")
+                return real_link(src, dst, *args, **kwargs)
+
+            with mock.patch.object(engine_module.os, "link", racing_link):
+                still_pending = engine_module.restore_replaced_original(target, backup)
+
+            self.assertEqual(still_pending, backup)
+            self.assertEqual(_read_bytes(target), b"someone else's file")
+            self.assertEqual(_read_bytes(backup), b"the original")
+
+    def test_unrestorable_original_is_recorded_in_the_report_and_journal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            original = b"the user's only copy " * 200
+            with open(os.path.join(output, "photo.jpg"), "wb") as handle:
+                handle.write(original)
+            with open(os.path.join(source, "photo.jpg"), "wb") as handle:
+                handle.write(b"the incoming replacement " * 200)
+
+            journal_path = os.path.join(root, "journal.json")
+
+            def corrupting_copy(src, dst, *args, **kwargs):
+                data = _read_bytes(src)
+                with open(dst, "wb") as handle:
+                    handle.write(b"X" * len(data))
+                return dst
+
+            def refuse_to_restore(*args, **kwargs):
+                raise OSError("the destination volume went away")
+
+            with mock.patch.object(engine_module.shutil, "copy2", corrupting_copy), \
+                    mock.patch.object(engine_module.os, "link", refuse_to_restore), \
+                    mock.patch.object(engine_module, "_copy_no_clobber", refuse_to_restore):
+                result = self._run(
+                    self._settings(
+                        source, library, output, journal_path, conflict_policy="replace",
+                    ),
+                    root,
+                )
+
+            self.assertEqual(result["errors"], 1)
+            recorded = self._reported_failures(result)[0]
+            self.assertIn("unrestored_original_backup", recorded)
+            self.assertIn("unrestored_original_target", recorded)
+            self.assertTrue(os.path.exists(recorded["unrestored_original_backup"]))
+            self.assertEqual(_read_bytes(recorded["unrestored_original_backup"]), original)
+
+            with open(journal_path, encoding="utf-8") as handle:
+                journal = json.load(handle)
+            entry = journal["failures"][os.path.join(source, "photo.jpg")]
+            self.assertEqual(
+                entry["recovery"]["unrestored_original_backup"],
+                recorded["unrestored_original_backup"],
+            )
+
+    def test_an_error_after_promotion_does_not_leave_unverified_bytes_in_place(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            original = b"the user's only copy " * 200
+            target = os.path.join(output, "photo.jpg")
+            with open(target, "wb") as handle:
+                handle.write(original)
+            with open(os.path.join(source, "photo.jpg"), "wb") as handle:
+                handle.write(b"the incoming replacement " * 200)
+
+            real_getsize = engine_module.os.path.getsize
+
+            def explode_on_the_target(path, *args, **kwargs):
+                if os.path.abspath(path) == os.path.abspath(target):
+                    raise OSError("the volume disappeared mid-verification")
+                return real_getsize(path, *args, **kwargs)
+
+            with mock.patch.object(engine_module.os.path, "getsize", explode_on_the_target):
+                result = self._run(
+                    self._settings(
+                        source, library, output, os.path.join(root, "journal.json"),
+                        conflict_policy="replace",
+                    ),
+                    root,
+                )
+
+            # The replacement was never proven, so it must not be standing in
+            # for the file the user had.
+            self.assertEqual(result["errors"], 1)
+            self.assertEqual(result["transferred"], 0)
+            self.assertEqual(_read_bytes(target), original)
+
+    # --- Journal robustness ------------------------------------------------
+
+    def test_malformed_journals_are_ignored_rather_than_raising(self):
+        from transfer_safety import TransferJournal
+
+        shapes = (
+            "[]",
+            '"a string"',
+            "null",
+            "123",
+            '{"version": 1, "completed": [], "failures": {}}',
+            '{"version": 1, "completed": {}, "failures": []}',
+            '{"version": 2, "completed": {}, "failures": {}}',
+            '{"version": 1, "completed": {"src": "not a dict"}, "failures": {}}',
+            "{not json at all",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for index, payload in enumerate(shapes):
+                path = os.path.join(temp_dir, f"journal_{index}.json")
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                journal = TransferJournal(path)
+                self.assertIsInstance(journal.data, dict)
+                self.assertIsInstance(journal.data.get("completed"), dict)
+                self.assertIsInstance(journal.data.get("failures"), dict)
+                # A journal that cannot be trusted must not claim anything is done.
+                self.assertFalse(journal.is_complete("src", 1))
+                journal.fail("src", "still writable")
+
+    def test_a_journal_with_a_broken_failure_entry_still_records_a_failure(self):
+        from transfer_safety import TransferJournal
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "journal.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {"version": 1, "completed": {},
+                     "failures": {"src": {"attempts": "not a number"}}},
+                    handle,
+                )
+            journal = TransferJournal(path)
+            journal.fail("src", "boom")
+            self.assertEqual(journal.data["failures"]["src"]["attempts"], 1)
+
+    # --- Naming a path is not a change -------------------------------------
+
+    def test_naming_the_default_journal_does_not_create_the_runtime_tree(self):
+        import transfer_safety as transfer_safety_module
+        from transfer_safety import default_journal_path
+
+        real_get = transfer_safety_module.get_runtime_paths
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = os.path.join(temp_dir, "appdata")
+
+            def scoped(root=None, *, create=True):
+                return real_get(data_root if root is None else root, create=create)
+
+            with mock.patch.object(transfer_safety_module, "get_runtime_paths", scoped):
+                path = default_journal_path(os.path.join(temp_dir, "output"), "serial")
+
+            self.assertFalse(
+                os.path.exists(data_root),
+                "asking where the journal lives must not build the data tree",
+            )
+            self.assertTrue(path.endswith(".journal.json"))
+
 
 if __name__ == "__main__":
     unittest.main()

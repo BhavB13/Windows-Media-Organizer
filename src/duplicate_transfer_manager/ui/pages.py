@@ -1488,6 +1488,7 @@ class ImportPage(BasePage):
         self.stall_timeout.setSuffix(" sec stall timeout")
         self.stall_timeout.valueChanged.connect(lambda _value: self._invalidate_review())
         cleanup_partials = QPushButton("Clean partial files in save location")
+        self.cleanup_partials_button = cleanup_partials
         cleanup_partials.clicked.connect(self._cleanup_partials)
         for label, widget in (
             ("Hash mode", self.hash_mode),
@@ -1571,6 +1572,7 @@ class ImportPage(BasePage):
         self.controller.recoverable_error.connect(self._on_failed)
         self.controller.failed.connect(self._on_failed)
         self.controller.technical_log.connect(self._on_log)
+        self.controller.busy_changed.connect(lambda busy: self.cleanup_partials_button.setEnabled(not busy))
         self._source_changed("folder")
         self._apply_android_preferences(self.app_settings)
         self.finish()
@@ -1887,6 +1889,10 @@ class ImportPage(BasePage):
             self.run_button.setEnabled(True)
 
     def _cleanup_partials(self) -> None:
+        if self.controller.busy:
+            self.banner.set_message("Wait for the current operation to finish before cleaning partial files.", "warning")
+            self.banner.show()
+            return
         root = self.output_path.path() or self.library_path.path()
         if not root:
             self.banner.set_message("Choose an existing library or save location before cleaning partial files.", "warning")
@@ -1902,10 +1908,19 @@ class ImportPage(BasePage):
             )
             if response != QMessageBox.StandardButton.Yes:
                 return
-        removed = cleanup_partial_files(root, dry_run=self.dry_run_cleanup.isChecked())
-        action = "Would remove" if self.dry_run_cleanup.isChecked() else "Removed"
-        self.banner.set_message(f"{action} {len(removed)} partial transfer file(s).", "success")
-        self.banner.show()
+        dry_run = self.dry_run_cleanup.isChecked()
+
+        def cleanup(cancellation, _reporter):
+            cancellation.raise_if_cancelled()
+            removed = cleanup_partial_files(root, dry_run=dry_run)
+            return OperationResult(
+                status=OperationState.COMPLETED,
+                data={"partial_cleanup": {"count": len(removed), "dry_run": dry_run}},
+            )
+
+        # Use the same worker boundary as transfers so cleanup cannot overlap
+        # an import or block the UI while walking a large removable drive.
+        self.controller.start_task(cleanup)
 
     def _set_stage(self, active_stage: str) -> None:
         for key, label in self.stage_labels.items():
@@ -1939,6 +1954,13 @@ class ImportPage(BasePage):
         self.review_button.setEnabled(True)
         self.run_button.setEnabled(True)
         self.progress_panel.hide()
+        if "partial_cleanup" in result.data:
+            cleanup = result.data["partial_cleanup"]
+            action = "Would remove" if cleanup["dry_run"] else "Removed"
+            self.banner.set_message(f"{action} {cleanup['count']} partial transfer file(s).", "success")
+            self.banner.show()
+            self.run_button.setEnabled(self.current_settings is not None)
+            return
         self._set_stage("finalization")
         summary = summarize_transfer_result(result)
         self.result_summary.set_metrics(summary.items())
