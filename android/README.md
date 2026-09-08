@@ -115,8 +115,11 @@ build to one worker and a small heap, and prints the APK's size and SHA-256 at t
 .uild-android.ps1 -Offline                   # rebuild from a warm Gradle cache
 ```
 
-`lintDebug` downloads its own tool dependencies on first run and needs network access to
-`dl.google.com`; `testDebugUnitTest` and `assembleDebug` do not, once the cache is warm.
+`lintDebug` downloads its own analysis tools from `dl.google.com` on first run — tens of
+megabytes, and slow enough on some connections that Gradle's stock timeouts give up part-way and
+report a resolution failure that reads like a broken build. The script raises those timeouts and
+retries. `testDebugUnitTest` and `assembleDebug` need no network once the cache is warm; add
+`-Offline` to keep the whole build off the network.
 
 The Gradle wrapper in `gradle/wrapper/` is pinned to 8.11.1. Toolchain expected by
 `app/build.gradle`: AGP 8.9.2, Gradle 8.11.1, JDK 17, `compileSdk`/`targetSdk` 35, `minSdk` 26.
@@ -169,8 +172,13 @@ directly. Covered:
 Verified on 8 September 2026, on Windows with JDK 21 (Android Studio JBR) and SDK build-tools
 37.0.0:
 
-* `testDebugUnitTest` — 49 JVM tests pass.
-* `assembleDebug` — builds `app/build/outputs/apk/debug/app-debug.apk` (49,729 bytes).
+* `testDebugUnitTest` — **49 JVM tests pass** (5 `NamesTest`, 28 `TransferEngineTest`,
+  16 `DocumentIdsTest`).
+* `lintDebug` — **0 errors, 5 warnings**. The warnings are benign: `accessibilityHeading` is
+  ignored below API 28 rather than failing, the activity label duplicates the application label,
+  and `DataExtractionRules` suggests a newer way to express the backup opt-out that
+  `allowBackup="false"` already achieves.
+* `assembleDebug` — builds `app/build/outputs/apk/debug/app-debug.apk` (56,717 bytes).
 * `apksigner verify` — verifies under APK Signature Scheme v2, one signer, the standard
   `CN=Android Debug` certificate. This is a debug-signed build: it installs for testing and is
   not suitable for distribution. A release build needs its own keystore, which does not exist yet.

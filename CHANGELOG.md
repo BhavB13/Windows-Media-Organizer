@@ -16,6 +16,11 @@ release onward.
   folders to mounted USB storage. Content comparison uses SHA-256 and source
   files remain untouched. See its README for build instructions and device
   verification requirements.
+- The Android overlap check no longer crashes on Android 8.0 through 9. It
+  called a storage API introduced in Android 10 without a version guard, which
+  would have thrown inside the check that stops a folder being copied into
+  itself. On those versions the app now falls back to its own reasoning and
+  refuses the run when it cannot prove the two folders are separate.
 - Sort Files uses uniquely owned staging files and refuses to overwrite a file
   that appears after review. Failed replacements preserve displaced originals,
   including when another file prevents automatic restoration.

@@ -109,6 +109,15 @@ $gradleArgs = @(
     '-Dorg.gradle.jvmargs=-Xmx768m -Dfile.encoding=UTF-8',
     '--stacktrace'
 )
+
+# lint fetches its own analysis tools from dl.google.com on first run, and they are large.
+# On a slow or intermittent link Gradle's stock timeouts give up part-way and report a
+# resolution failure that reads like a broken build. Wait longer and retry instead.
+$gradleArgs += @(
+    '-Dorg.gradle.internal.http.connectionTimeout=120000',
+    '-Dorg.gradle.internal.http.socketTimeout=300000',
+    '-Dorg.gradle.internal.repository.max.retries=10'
+)
 if ($Offline) { $gradleArgs += '--offline' }
 $gradleArgs += $Tasks
 

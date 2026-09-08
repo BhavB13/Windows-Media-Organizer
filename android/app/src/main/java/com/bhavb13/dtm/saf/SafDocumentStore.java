@@ -3,6 +3,7 @@ package com.bhavb13.dtm.saf;
 import android.content.ContentResolver;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.DocumentsContract;
 
@@ -315,34 +316,42 @@ public final class SafDocumentStore implements DocumentStore {
 
         // Ask the provider itself. This is authoritative where it is implemented, and it is the
         // only way to resolve providers whose ids this app does not claim to understand.
-        try {
-            if (DocumentsContract.isChildDocument(resolver, ancestor, candidate)) {
-                return true;
+        //
+        // DocumentsContract.isChildDocument arrived in API 29, and minSdk here is 26. On Android
+        // 8.0 through 9 the method does not exist, and calling it throws NoSuchMethodError — an
+        // Error, not an Exception, so the catch below would not have caught it. The app would
+        // have crashed inside the one check that exists to stop a folder being copied into
+        // itself. Below API 29 the provider simply has no opinion to give.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                if (DocumentsContract.isChildDocument(resolver, ancestor, candidate)) {
+                    return true;
+                }
+            } catch (Exception e) {
+                if (known == DocumentIds.Relationship.UNRELATED) {
+                    // The id format is understood and the paths provably diverge; no need for the
+                    // provider's opinion.
+                    return false;
+                }
+                throw new StoreException(
+                        "The storage provider could not say whether these two folders overlap, so "
+                                + "the app will not risk copying a folder into itself.", e);
             }
-            if (known == DocumentIds.Relationship.UNRELATED) {
-                return false;
-            }
-        } catch (Exception e) {
-            if (known == DocumentIds.Relationship.UNRELATED) {
-                // The id format is understood and the paths provably diverge; no need for the
-                // provider's opinion.
-                return false;
-            }
-            throw new StoreException(
-                    "The storage provider could not say whether these two folders overlap, so the "
-                            + "app will not risk copying a folder into itself.", e);
         }
 
-        if (known == DocumentIds.Relationship.UNKNOWN) {
-            // isChildDocument returned false, but for an opaque id format that answer is only
-            // meaningful if the provider really implements it — and a provider that does not is
-            // allowed to return false. Fail closed rather than guess that the ids are path-shaped.
-            throw new StoreException(
-                    "This storage provider does not describe how its folders are nested, so the "
-                            + "app cannot prove the two folders do not overlap. Pick folders on "
-                            + "internal storage, an SD card, or a USB drive.");
+        if (known == DocumentIds.Relationship.UNRELATED) {
+            // The id format is understood and the paths provably diverge.
+            return false;
         }
-        return false;
+
+        // Either the provider said no for an id format this app cannot reason about — and a
+        // provider that does not implement isChildDocument is allowed to answer false — or the
+        // platform is too old to have been asked at all. Fail closed rather than guess that the
+        // ids are path-shaped.
+        throw new StoreException(
+                "This storage provider does not describe how its folders are nested, so the "
+                        + "app cannot prove the two folders do not overlap. Pick folders on "
+                        + "internal storage, an SD card, or a USB drive.");
     }
 
     /**
