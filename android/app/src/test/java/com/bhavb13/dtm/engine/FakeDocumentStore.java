@@ -65,6 +65,10 @@ final class FakeDocumentStore implements DocumentStore {
     boolean driveIsFull;
     /** When set, rename reports success but leaves the name untouched. */
     boolean renameSilentlyDoesNothing;
+    /** When set, every created document gets this appended to its name, whatever its type. */
+    String nameSuffixOnCreate;
+    /** The MIME type of every document the engine asked to have created, in order. */
+    final List<String> createdMimeTypes = new ArrayList<>();
     /**
      * Runs each time a document is opened for reading, after the count below is incremented. Used
      * to change a file's content between the engine's hashing pass and its copying pass.
@@ -97,8 +101,11 @@ final class FakeDocumentStore implements DocumentStore {
     }
 
     String makeFile(String parentId, String name, byte[] content) {
-        Entry entry = new Entry(newId(), name, "application/octet-stream", false, parentId,
-                content);
+        return makeFile(parentId, name, "application/octet-stream", content);
+    }
+
+    String makeFile(String parentId, String name, String mimeType, byte[] content) {
+        Entry entry = new Entry(newId(), name, mimeType, false, parentId, content);
         entries.put(entry.id, entry);
         return entry.id;
     }
@@ -245,11 +252,16 @@ final class FakeDocumentStore implements DocumentStore {
         if (!entries.containsKey(parentId)) {
             throw new StoreException("no such folder: " + parentId);
         }
-        String name = displayName;
+        createdMimeTypes.add(mimeType);
+        String requested = displayName + impliedExtension(mimeType, displayName);
+        if (nameSuffixOnCreate != null) {
+            requested += nameSuffixOnCreate;
+        }
+        String name = requested;
         int suffix = 0;
         while (childByName(parentId, name) != null) {
             suffix++;
-            name = Names.candidate(displayName, suffix);
+            name = Names.candidate(requested, suffix);
         }
         Entry entry = new Entry(newId(), name, mimeType, false, parentId, new byte[0]);
         entries.put(entry.id, entry);
@@ -331,6 +343,29 @@ final class FakeDocumentStore implements DocumentStore {
     private DocumentNode toNode(Entry entry) {
         return new DocumentNode(entry.id, entry.name, entry.mime,
                 entry.directory ? -1L : entry.content.length, entry.lastModified, entry.directory);
+    }
+
+    /**
+     * Mirrors the system external-storage provider, measured on a device: a typed document whose
+     * name lacks the extension its type implies gets that extension appended, so "a.jpg.dtmpart"
+     * created as image/jpeg becomes "a.jpg.dtmpart.jpg". Untyped documents keep their name.
+     */
+    private static String impliedExtension(String mimeType, String displayName) {
+        String extension;
+        switch (mimeType == null ? "" : mimeType) {
+            case "image/jpeg":
+                extension = ".jpg";
+                break;
+            case "video/mp4":
+                extension = ".mp4";
+                break;
+            case "text/plain":
+                extension = ".txt";
+                break;
+            default:
+                return "";
+        }
+        return displayName.toLowerCase(java.util.Locale.ROOT).endsWith(extension) ? "" : extension;
     }
 
     private String newId() {

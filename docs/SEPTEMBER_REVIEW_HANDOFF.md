@@ -125,6 +125,24 @@ whose id format is not documented.
 * One stale test (`reportsUnreadableSourceFileAndStillCopiesTheRest`) asserted the pre-fix failure
   message and was updated; it now also documents that an unreadable source costs no document.
 
+## 15 September — instrumented tests
+
+Priority 2 below is done for the SAF layer. `app/src/androidTest/.../SafDocumentStoreInstrumentedTest`
+(17 tests) runs `SafDocumentStore` and a full engine run against the real external-storage
+provider on the `Pixel_10_Pro` emulator (API 37); see `android/README.md` for scope and the one
+gap (the picker grant is replaced by the shell's `MANAGE_DOCUMENTS`).
+
+They found a real defect: the provider appends the extension a typed MIME implies, so partials
+were stored as `IMG.jpg.dtmpart.jpg`. A crash between verification and rename would then have left
+a complete copy under that name, counted as the user's own content on the next run — suppressing
+the copy — and visible in the gallery. `TransferEngine` now creates partials as
+`application/octet-stream` and refuses to write into a partial whose name lost its suffix.
+`FakeDocumentStore` now models the provider's extension behaviour, with two JVM tests.
+
+Verified that day: 51 JVM tests, 17 instrumented tests, lint 0 errors / 5 warnings, APK builds and
+verifies; desktop suite 343 passed, 1 skipped. Hardware (priority 1) is still unexecuted, and
+nothing has run below API 37.
+
 ## If you pick this up next
 
 In priority order:

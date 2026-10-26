@@ -312,6 +312,40 @@ public class TransferEngineTest {
         assertTrue(result.failures().get(0).message().contains("Could not start writing"));
     }
 
+    // ------------------------------------------------------- partial naming
+
+    @Test
+    public void createsPartialsUntypedSoTheProviderKeepsTheirSuffix() throws Exception {
+        // As image/jpeg, the system provider would store "IMG_1.jpg.dtmpart" as
+        // "IMG_1.jpg.dtmpart.jpg": invisible to leftover detection, visible to the gallery.
+        store.makeFile(source, "IMG_1.jpg", "image/jpeg",
+                "photo".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        store.makeFile(source, "clip.mp4", "video/mp4",
+                "movie".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        TransferResult result = transfer();
+
+        assertEquals(result.failures().toString(), 2, result.copied());
+        assertEquals(List.of("application/octet-stream", "application/octet-stream"),
+                store.createdMimeTypes);
+        assertEquals(List.of("IMG_1.jpg", "clip.mp4"), store.pathsUnder(destination));
+    }
+
+    @Test
+    public void refusesToWriteIntoAPartialWhoseNameLostItsSuffix() throws Exception {
+        store.makeFile(source, "a.txt", "alpha");
+        store.makeFile(source, "b.txt", "beta");
+        store.nameSuffixOnCreate = ".bin";
+
+        TransferResult result = transfer();
+
+        assertEquals(0, result.copied());
+        assertEquals(2, result.failed());
+        assertTrue(result.failures().get(0).message().contains("temporary file's name"));
+        assertEquals("An unrecognisable partial must not be left on the drive",
+                0, store.fileCountUnder(destination));
+    }
+
     // ------------------------------------------------------------ cancellation
 
     @Test

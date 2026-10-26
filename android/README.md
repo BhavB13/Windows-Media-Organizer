@@ -110,9 +110,10 @@ build to one worker and a small heap, and prints the APK's size and SHA-256 at t
 
 ```
 # from android/
-.uild-android.ps1                            # unit tests, lint, debug APK
-.uild-android.ps1 -Tasks testDebugUnitTest   # JVM tests only
-.uild-android.ps1 -Offline                   # rebuild from a warm Gradle cache
+.\build-android.ps1                            # unit tests, lint, debug APK
+.\build-android.ps1 -Tasks testDebugUnitTest   # JVM tests only
+.\build-android.ps1 -Offline                   # rebuild from a warm Gradle cache
+.\build-android.ps1 -Tasks connectedDebugAndroidTest   # instrumented tests; needs a device or emulator
 ```
 
 `lintDebug` downloads its own analysis tools from `dl.google.com` on first run — tens of
@@ -148,7 +149,25 @@ directly. Covered:
 * document-id reasoning: the same folder reached through two grants compares equal, the volume
   root contains everything on its volume, a shared name prefix (`DCIM` vs `DCIM2`) is not
   containment, a separate volume is provably unrelated, and an id from a provider whose format
-  is not documented returns `UNKNOWN` so the caller fails closed rather than guessing.
+  is not documented returns `UNKNOWN` so the caller fails closed rather than guessing;
+* partials are created untyped, and a partial whose name the provider altered is refused before
+  any bytes are written.
+
+### Instrumented tests
+
+`app/src/androidTest/java/` runs `SafDocumentStore` against the real system external-storage
+provider on a device or emulator. Access comes from adopting the shell's `MANAGE_DOCUMENTS`
+permission rather than a tree grant from the picker, so the grant itself is the one thing not
+exercised. Each test works in its own `DtmTest-*` folder on primary storage and deletes it.
+Covered: listing, child ids, directory reuse, truncating writes, deleted documents, collision
+behaviour of create and rename (neither may replace an existing file), partial naming, overlap
+through two grants, volume root, shared name prefixes, the trusted-destination check, and a full
+engine run and re-run.
+
+These found one defect the JVM tests could not: the provider appends the extension a typed MIME
+implies, so a partial created as `image/jpeg` under `IMG.jpg.dtmpart` was stored as
+`IMG.jpg.dtmpart.jpg` — no longer recognisable as a partial, and indexed by the gallery. Partials
+are now created as `application/octet-stream`, and the final rename restores the real type.
 
 ### Manual test steps (on a device)
 
@@ -183,8 +202,19 @@ Verified on 8 September 2026, on Windows with JDK 21 (Android Studio JBR) and SD
   `CN=Android Debug` certificate. This is a debug-signed build: it installs for testing and is
   not suitable for distribution. A release build needs its own keystore, which does not exist yet.
 
-**Steps 1-12 above have not been run on hardware.** No phone was attached (`adb devices` is empty)
-and no USB drive was tested. The device behaviour described in this README is the intended
+Re-verified on 15 September 2026 after the partial-naming fix:
+
+* `testDebugUnitTest` — **51 JVM tests pass** (5 `NamesTest`, 30 `TransferEngineTest`,
+  16 `DocumentIdsTest`).
+* `connectedDebugAndroidTest` — **17 instrumented tests pass** on the `Pixel_10_Pro` emulator
+  (Android API 37, x86_64).
+* `lintDebug` — 0 errors, the same 5 warnings. `assembleDebug` and `apksigner verify` pass.
+
+Nothing has run below API 37, so the `isChildDocument` version guard for Android 8.0-9 is still
+covered only by reasoning.
+
+**Steps 1-12 above have not been run on hardware.** No phone was attached and no USB drive was
+tested. The device behaviour described in this README is the intended
 behaviour, not a measured one. Nothing here should be described to anyone as verified against a
 real Samsung drive until someone runs that list.
 

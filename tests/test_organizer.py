@@ -2,7 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path
 import struct
+import json
+from unittest import mock
 
+import duplicate_transfer_manager.services.organizer_service as organizer_module
 from duplicate_transfer_manager.core import OrganizerSettings, OperationState
 from duplicate_transfer_manager.runtime_paths import get_runtime_paths
 from duplicate_transfer_manager.services import FileOrganizerService
@@ -127,6 +130,136 @@ class FileOrganizerServiceTests(unittest.TestCase):
 
             self.assertEqual(removed, 1)
             self.assertFalse(operation.exists())
+
+    def test_prune_retains_an_expired_operation_that_holds_a_replaced_original(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = get_runtime_paths(root / "data")
+            operation = paths.organization / "old-with-original"
+            replaced = operation / "replaced_destinations"
+            replaced.mkdir(parents=True)
+            original = replaced / "000000_photo.jpg"
+            original.write_bytes(b"the user's only original")
+            manifest = operation / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            import os
+            os.utime(manifest, (1, 1))
+
+            removed = FileOrganizerService(paths).prune_manifests(90)
+
+            self.assertEqual(removed, 0)
+            self.assertTrue(operation.exists())
+            self.assertEqual(original.read_bytes(), b"the user's only original")
+
+    def test_live_move_does_not_trust_an_unverified_cross_volume_move(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            destination = root / "destination"
+            (source / "nested").mkdir(parents=True)
+            destination.mkdir()
+            incoming = source / "nested" / "photo.jpg"
+            incoming.write_bytes(b"the complete original image")
+            service = FileOrganizerService(get_runtime_paths(root / "data"))
+            settings = OrganizerSettings(str(source), str(destination))
+            reviewed = service.build_plan(settings)
+
+            def corrupting_move(src, dst, *args, **kwargs):
+                Path(dst).write_bytes(b"corrupt")
+                Path(src).unlink()
+                return str(dst)
+
+            with mock.patch.object(
+                organizer_module.shutil, "move", side_effect=corrupting_move
+            ):
+                result = service.organize(settings, reviewed_plan=reviewed)
+
+            self.assertEqual(result.counts["errors"], 0)
+            self.assertEqual((destination / "photo.jpg").read_bytes(), b"the complete original image")
+            self.assertFalse(incoming.exists())
+
+    def test_manifest_write_failure_rolls_back_an_unrecorded_move(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            destination = root / "destination"
+            (source / "nested").mkdir(parents=True)
+            destination.mkdir()
+            incoming = source / "nested" / "photo.jpg"
+            incoming.write_bytes(b"original image")
+            service = FileOrganizerService(get_runtime_paths(root / "data"))
+            settings = OrganizerSettings(str(source), str(destination))
+            reviewed = service.build_plan(settings)
+            real_write = service._write_manifest
+            calls = 0
+
+            def fail_first_manifest(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError("runtime data volume unavailable")
+                return real_write(*args, **kwargs)
+
+            with mock.patch.object(service, "_write_manifest", side_effect=fail_first_manifest):
+                result = service.organize(settings, reviewed_plan=reviewed)
+
+            self.assertEqual(result.counts["errors"], 1)
+            self.assertEqual(incoming.read_bytes(), b"original image")
+            self.assertFalse((destination / "photo.jpg").exists())
+
+    def test_rollback_does_not_trust_an_unverified_cross_volume_move(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            destination = root / "destination"
+            (source / "nested").mkdir(parents=True)
+            destination.mkdir()
+            incoming = source / "nested" / "photo.jpg"
+            incoming.write_bytes(b"original image")
+            service = FileOrganizerService(get_runtime_paths(root / "data"))
+            result = service.organize(OrganizerSettings(str(source), str(destination)))
+
+            def corrupting_move(src, dst, *args, **kwargs):
+                Path(dst).write_bytes(b"corrupt")
+                Path(src).unlink()
+                return str(dst)
+
+            with mock.patch.object(
+                organizer_module.shutil, "move", side_effect=corrupting_move
+            ):
+                rollback = service.rollback(result.data["organization"].operation_id)
+
+            self.assertEqual(rollback.failures, ())
+            self.assertEqual(incoming.read_bytes(), b"original image")
+            self.assertFalse((destination / "photo.jpg").exists())
+
+    def test_replace_rollback_preserves_the_file_that_occupied_the_source_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            destination = root / "destination"
+            (source / "nested").mkdir(parents=True)
+            destination.mkdir()
+            incoming = source / "nested" / "photo.jpg"
+            incoming.write_bytes(b"organized image")
+            service = FileOrganizerService(get_runtime_paths(root / "data"))
+            result = service.organize(OrganizerSettings(str(source), str(destination)))
+            incoming.parent.mkdir(parents=True, exist_ok=True)
+            incoming.write_bytes(b"new file at the old path")
+
+            rollback = service.rollback(
+                result.data["organization"].operation_id, conflict_policy="replace"
+            )
+
+            self.assertEqual(rollback.failures, ())
+            self.assertEqual(incoming.read_bytes(), b"organized image")
+            payload = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+            backup = Path(payload["records"][0]["rollback_replaced_backup"])
+            self.assertEqual(backup.read_bytes(), b"new file at the old path")
+            import os
+            os.utime(result.report_path, (1, 1))
+            self.assertEqual(service.prune_manifests(90), 0)
+            self.assertEqual(backup.read_bytes(), b"new file at the old path")
 
     def test_live_run_uses_the_reviewed_mapping_and_rejects_stale_sources(self):
         with tempfile.TemporaryDirectory() as temp_dir:

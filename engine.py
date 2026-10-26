@@ -225,6 +225,25 @@ def _copy_no_clobber(source, target):
         raise
 
 
+def _move_no_clobber(source, target):
+    """Move a file to a free name without replacing anything already there."""
+
+    if os.name == "nt":
+        # This app targets Windows, where rename fails when the destination
+        # exists. Unlike os.replace, it therefore closes the check/move race.
+        os.rename(source, target)
+        return
+    # Keep the non-Windows compatibility path fail-closed and atomic to other
+    # writers. If links are unavailable, the caller reports the failure rather
+    # than risking a replace after an existence check.
+    os.link(source, target)
+    try:
+        os.remove(source)
+    except OSError:
+        os.remove(target)
+        raise
+
+
 def promote_transfer_file(staged_path, target_path, policy, output_root):
     """Promote staged content while preserving the reviewed conflict policy."""
 
@@ -236,13 +255,30 @@ def promote_transfer_file(staged_path, target_path, policy, output_root):
         if os.path.exists(target_path):
             backup_root = os.path.join(output_root, ".duplicate_transfer_manager_backups")
             os.makedirs(backup_root, exist_ok=True)
-            backup = ensure_unique_path(os.path.join(backup_root, os.path.basename(target_path)))
-            os.replace(target_path, backup)
+            backup_base = os.path.join(backup_root, os.path.basename(target_path))
+            while True:
+                backup = ensure_unique_path(backup_base)
+                try:
+                    _move_no_clobber(target_path, backup)
+                    break
+                except FileExistsError:
+                    # The name became occupied after ensure_unique_path looked.
+                    # Keep that file and choose another backup name.
+                    continue
         try:
-            os.replace(staged_path, target_path)
+            candidate = target_path
+            while True:
+                try:
+                    _move_no_clobber(staged_path, candidate)
+                    target_path = candidate
+                    break
+                except FileExistsError:
+                    # Something arrived after the reviewed incumbent was moved.
+                    # It is not the file the user approved replacing, so retain
+                    # it and publish the incoming file under a unique name.
+                    candidate = ensure_unique_path(candidate)
         except Exception:
-            if backup and os.path.exists(backup) and not os.path.exists(target_path):
-                os.replace(backup, target_path)
+            restore_replaced_original(target_path, backup)
             raise
         return target_path, backup
 
@@ -511,6 +547,10 @@ def build_compare_scan_settings(settings):
 def build_transfer_hash_settings(settings):
     hash_settings = copy(settings)
     if getattr(settings, "source_is_adb", False):
+        # The phone-side digest is the only identity available before writing.
+        # Do not allow legacy MD5/SHA-1 choices to turn a collision into a
+        # silently skipped source file.
+        hash_settings.hash_algo = "sha256"
         hash_settings.hash_mode = "full"
     return hash_settings
 
@@ -604,7 +644,11 @@ def group_duplicates(infos, settings, stop_event, hash_cache, logger, progress_c
                 continue
 
     candidates = [group for group in hash_groups.values() if len(group) > 1]
-    if getattr(settings, "hash_mode", "full") != "fast" or not candidates or stop_event.is_set():
+    needs_sha256_confirmation = (
+        getattr(settings, "hash_mode", "full") == "fast"
+        or str(getattr(settings, "hash_algo", "sha256")).lower() != "sha256"
+    )
+    if not needs_sha256_confirmation or not candidates or stop_event.is_set():
         return candidates
 
     # A sampled digest is only a candidate filter. Destructive duplicate review
@@ -1086,9 +1130,16 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                 continue
         
             is_duplicate = h in dest_hashes
-            if is_duplicate and hash_settings.hash_mode == "fast" and not f.is_adb:
-                # A sampled match is a shortlist entry, not proof. Confirm against
-                # the real destination file before skipping the import.
+            if (
+                is_duplicate
+                and not f.is_adb
+                and (
+                    hash_settings.hash_mode == "fast"
+                    or str(hash_settings.hash_algo).lower() != "sha256"
+                )
+            ):
+                # A sampled or legacy-digest match is a shortlist entry, not
+                # proof. Confirm with full SHA-256 before skipping the import.
                 if not confirm_duplicate_by_content(
                     f.path, dest_hash_paths.get(h, ""), hash_settings, stop_event, hash_cache, logger
                 ):
@@ -1166,7 +1217,10 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                     # ``build_transfer_hash_settings``), so the extra read here is
                     # of a local file.
                     verify_settings = (
-                        hash_settings if hash_settings.hash_mode == "full" else full_verify_settings
+                        hash_settings
+                        if hash_settings.hash_mode == "full"
+                        and str(hash_settings.hash_algo).lower() == "sha256"
+                        else full_verify_settings
                     )
                     try:
                         expected_digest = (
@@ -1184,12 +1238,10 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                         if f.is_adb:
                             if staged_path:
                                 os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                                target_path, replaced_backup = promote_transfer_file(
-                                    staged_path, target_path, conflict_policy, output_root
-                                )
+                                candidate_path = staged_path
                             else:
                                 partial_path = transfer_staging_path(output_root, target_path, "adb")
-                                pulled_path = pull_with_retries(
+                                candidate_path = pull_with_retries(
                                     f.path,
                                     target_path,
                                     serial=getattr(settings, "adb_serial", ""),
@@ -1205,17 +1257,38 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                                     partial_path=partial_path,
                                     promote=False,
                                 )
-                                target_path, replaced_backup = promote_transfer_file(
-                                    pulled_path, target_path, conflict_policy, output_root
-                                )
-                                partial_path = ""
                         else:
                             partial_path = transfer_staging_path(output_root, target_path, "local")
                             shutil.copy2(f.path, partial_path)
-                            target_path, replaced_backup = promote_transfer_file(
-                                partial_path, target_path, conflict_policy, output_root
+                            candidate_path = partial_path
+
+                        # Verify while the bytes still carry an app-owned staging
+                        # name. Publishing first left a crash window in which an
+                        # unverified or corrupt copy was visible at its final
+                        # name and a replace-policy original had already been
+                        # displaced. The staging file is on the destination
+                        # volume, so this is a read-back of the bytes the drive
+                        # actually accepted.
+                        partial_path = candidate_path
+                        staged_size = os.path.getsize(candidate_path)
+                        staged_hash = (
+                            compute_hash(candidate_path, verify_settings, stop_event, None, False, logger)
+                            if staged_size == f.size
+                            else ""
+                        )
+                        if staged_size != f.size or staged_hash != expected_digest:
+                            reason = "size" if staged_size != f.size else "content hash"
+                            failed_path = transfer_staging_path(output_root, target_path, "failed")
+                            os.replace(candidate_path, failed_path)
+                            partial_path = failed_path
+                            raise OSError(
+                                f"Pre-publication {reason} verification failed; retained as {failed_path}"
                             )
-                            partial_path = ""
+
+                        target_path, replaced_backup = promote_transfer_file(
+                            candidate_path, target_path, conflict_policy, output_root
+                        )
+                        partial_path = ""
                         if not target_path:
                             conflict_skipped += 1
                             logger.log(f"SKIPPED target created during transfer due to conflict policy: {f.path}")

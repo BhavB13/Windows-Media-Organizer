@@ -44,6 +44,14 @@ public final class TransferEngine {
     private static final int BUFFER = 128 * 1024;
     /** Upper bound on collision-rename attempts before a file is reported as failed. */
     private static final int MAX_RENAME_ATTEMPTS = 500;
+    /**
+     * MIME type every partial is created with, whatever the source file is. The system storage
+     * provider appends the extension a typed MIME implies when the name lacks it, so a partial
+     * created as image/jpeg under "IMG.jpg.dtmpart" lands as "IMG.jpg.dtmpart.jpg": no longer
+     * recognisable as a partial, and indexed by the gallery as a photo. An untyped partial keeps
+     * its name, and the final rename restores the real extension and with it the real type.
+     */
+    private static final String PARTIAL_MIME = "application/octet-stream";
 
     private final DocumentStore store;
 
@@ -278,12 +286,29 @@ public final class TransferEngine {
 
         String partialId;
         try {
-            partialId = store.createUniqueDocument(parentId, file.mimeType(),
+            partialId = store.createUniqueDocument(parentId, PARTIAL_MIME,
                     file.name() + Names.PARTIAL_SUFFIX);
         } catch (StoreException e) {
             return failure(path, "Could not start writing to the drive: " + describe(e));
         }
         ownedPartials.add(partialId);
+
+        // A later run finds an interrupted copy only by its suffix. If the drive stored the partial
+        // under a name that lost it, an interruption would leave a file the app would then count as
+        // the user's own content, so refuse to write into it at all.
+        String partialName;
+        try {
+            partialName = store.node(partialId).name();
+        } catch (StoreException e) {
+            return discardAndFail(path, partialId, ownedPartials,
+                    "Could not start writing to the drive: " + describe(e));
+        }
+        if (partialName == null || !partialName.endsWith(Names.PARTIAL_SUFFIX)) {
+            return discardAndFail(path, partialId, ownedPartials,
+                    "The drive changed the temporary file's name to \"" + partialName
+                            + "\", so an interrupted copy could not be recognised later; nothing"
+                            + " was written");
+        }
 
         // Read two: the bytes actually handed to the drive, digested on the way past.
         String streamedHash;

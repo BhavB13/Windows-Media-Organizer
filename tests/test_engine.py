@@ -443,6 +443,41 @@ class EngineTests(unittest.TestCase):
             with open(promoted, "rb") as handle:
                 self.assertEqual(handle.read(), b"incoming")
 
+    def test_replace_promotion_does_not_clobber_backup_created_after_resolution(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            staged = os.path.join(root, "staged.dtm-partial")
+            target = os.path.join(root, "photo.jpg")
+            backup_root = os.path.join(root, ".duplicate_transfer_manager_backups")
+            first_backup = os.path.join(backup_root, "photo.jpg")
+            with open(staged, "wb") as handle:
+                handle.write(b"incoming")
+            with open(target, "wb") as handle:
+                handle.write(b"original")
+
+            real_unique = engine_module.ensure_unique_path
+            calls = 0
+
+            def race_for_first_backup(path):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    with open(path, "wb") as handle:
+                        handle.write(b"other run's backup")
+                    return path
+                return real_unique(path)
+
+            with mock.patch.object(
+                engine_module, "ensure_unique_path", side_effect=race_for_first_backup
+            ):
+                promoted, backup = promote_transfer_file(staged, target, "replace", root)
+
+            self.assertEqual(promoted, target)
+            self.assertNotEqual(backup, first_backup)
+            self.assertEqual(_read_bytes(first_backup), b"other run's backup")
+            self.assertEqual(_read_bytes(backup), b"original")
+            self.assertEqual(_read_bytes(target), b"incoming")
+
     def test_fast_duplicate_candidates_are_confirmed_with_full_content(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = os.path.abspath(temp_dir)
@@ -479,6 +514,50 @@ class EngineTests(unittest.TestCase):
             )
             self.assertEqual(len(groups), 1)
             self.assertEqual({item.path for item in groups[0]}, {first, second})
+
+    def test_full_legacy_digest_collision_is_confirmed_with_sha256(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            first = os.path.join(root, "first.bin")
+            second = os.path.join(root, "second.bin")
+            with open(first, "wb") as handle:
+                handle.write(b"AAAA")
+            with open(second, "wb") as handle:
+                handle.write(b"BBBB")
+            settings = Settings(
+                scan_root=root, output_root="", criteria="hash", hash_algo="md5",
+                hash_mode="full", only_media=False, extensions=[], min_size_kb=0,
+                exclude_dirs=[], skip_hidden_system=True, dry_run=True,
+                preserve_structure=True, max_hash_workers=2,
+            )
+            infos = [
+                FileInfo(first, os.path.getsize(first), os.path.getmtime(first)),
+                FileInfo(second, os.path.getsize(second), os.path.getmtime(second)),
+            ]
+            real_compute = engine_module.compute_hash
+
+            def colliding_legacy_digest(path, active_settings, *args, **kwargs):
+                if active_settings.hash_algo == "md5":
+                    return "0" * 32
+                return real_compute(path, active_settings, *args, **kwargs)
+
+            with mock.patch.object(
+                engine_module, "compute_hash", side_effect=colliding_legacy_digest
+            ):
+                groups = group_duplicates(
+                    infos, settings, threading.Event(),
+                    HashCache(os.path.join(root, "cache.json")), DummyLogger(),
+                )
+
+            self.assertEqual(groups, [])
+
+    def test_adb_transfer_hash_settings_always_use_full_sha256(self):
+        settings = mock.Mock(source_is_adb=True, hash_mode="fast", hash_algo="md5")
+
+        hardened = build_transfer_hash_settings(settings)
+
+        self.assertEqual(hardened.hash_mode, "full")
+        self.assertEqual(hardened.hash_algo, "sha256")
 
     def test_cancelled_hash_is_not_cached_and_later_run_hashes_complete_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2319,6 +2398,42 @@ class TransferSafetyRegressionTests(unittest.TestCase):
                 entries.append(os.path.relpath(os.path.join(current, name), root))
         return sorted(entries)
 
+    def test_full_legacy_digest_collision_does_not_skip_a_unique_import(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            incoming = os.path.join(source, "photo.jpg")
+            existing = os.path.join(library, "different.jpg")
+            with open(incoming, "wb") as handle:
+                handle.write(b"AAAA")
+            with open(existing, "wb") as handle:
+                handle.write(b"BBBB")
+            real_compute = engine_module.compute_hash
+
+            def colliding_legacy_digest(path, active_settings, *args, **kwargs):
+                if active_settings.hash_algo == "md5":
+                    return "0" * 32
+                return real_compute(path, active_settings, *args, **kwargs)
+
+            with mock.patch.object(
+                engine_module, "compute_hash", side_effect=colliding_legacy_digest
+            ):
+                result = execute_smart_transfer(
+                    self._settings(
+                        source, library, output, os.path.join(root, "journal.json"),
+                        hash_algo="md5", hash_mode="full",
+                    ),
+                    threading.Event(), HashCache(os.path.join(root, "cache.json")), DummyLogger(),
+                )
+
+            self.assertEqual(result["duplicates"], 0)
+            self.assertEqual(result["transferred"], 1)
+            self.assertEqual(_read_bytes(os.path.join(output, "photo.jpg")), b"AAAA")
+
     def _run(self, settings, root, stop_event=None):
         return execute_smart_transfer(
             settings,
@@ -2776,6 +2891,38 @@ class TransferVerificationHardeningTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(output, "big.jpg")))
             self.assertIn("content hash", self._reported_failures(result)[0]["error"])
 
+    def test_corrupt_staging_file_is_rejected_before_publication(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = os.path.abspath(temp_dir)
+            source = os.path.join(root, "source")
+            library = os.path.join(root, "library")
+            output = os.path.join(root, "output")
+            for path in (source, library, output):
+                os.makedirs(path)
+            with open(os.path.join(source, "photo.jpg"), "wb") as handle:
+                handle.write(b"the complete source image" * 200)
+
+            def corrupting_copy(src, dst, *args, **kwargs):
+                data = _read_bytes(src)
+                with open(dst, "wb") as handle:
+                    handle.write(b"X" * len(data))
+                return dst
+
+            real_promote = engine_module.promote_transfer_file
+            with mock.patch.object(engine_module.shutil, "copy2", corrupting_copy), \
+                    mock.patch.object(
+                        engine_module, "promote_transfer_file", wraps=real_promote
+                    ) as promote:
+                result = self._run(
+                    self._settings(source, library, output, os.path.join(root, "journal.json")),
+                    root,
+                )
+
+            self.assertEqual(result["transferred"], 0)
+            self.assertEqual(result["errors"], 1)
+            promote.assert_not_called()
+            self.assertFalse(os.path.exists(os.path.join(output, "photo.jpg")))
+
     def test_fast_profile_still_imports_an_intact_large_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = os.path.abspath(temp_dir)
@@ -2888,16 +3035,18 @@ class TransferVerificationHardeningTests(unittest.TestCase):
 
             journal_path = os.path.join(root, "journal.json")
 
-            def corrupting_copy(src, dst, *args, **kwargs):
-                data = _read_bytes(src)
-                with open(dst, "wb") as handle:
-                    handle.write(b"X" * len(data))
-                return dst
-
             def refuse_to_restore(*args, **kwargs):
                 raise OSError("the destination volume went away")
 
-            with mock.patch.object(engine_module.shutil, "copy2", corrupting_copy), \
+            target = os.path.join(output, "photo.jpg")
+            real_getsize = engine_module.os.path.getsize
+
+            def fail_after_publication(path, *args, **kwargs):
+                if os.path.abspath(path) == os.path.abspath(target):
+                    raise OSError("the destination volume went away")
+                return real_getsize(path, *args, **kwargs)
+
+            with mock.patch.object(engine_module.os.path, "getsize", fail_after_publication), \
                     mock.patch.object(engine_module.os, "link", refuse_to_restore), \
                     mock.patch.object(engine_module, "_copy_no_clobber", refuse_to_restore):
                 result = self._run(
