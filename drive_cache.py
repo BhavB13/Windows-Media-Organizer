@@ -1,9 +1,12 @@
 import argparse
+from collections.abc import Mapping
 import hashlib
 import json
 import os
+from pathlib import Path
 import posixpath
 import re
+import shutil
 import threading
 import time
 from dataclasses import dataclass
@@ -12,6 +15,20 @@ from discovery import discover_files
 from models import Settings
 from runtime_paths import get_runtime_paths
 from utils import DEFAULT_EXCLUDES, DEFAULT_MEDIA_EXTS, normalize_extensions
+
+import volume_identity
+from volume_identity import (
+    VolumeIdentity,
+    clear_probe_cache,
+    clear_volume_probe_cache,
+    has_fat_4gib_limit,
+    is_volume_online,
+    preserves_subsecond_mtime,
+    probe_volume,
+    relative_path_from_mount,
+    resolve_mount_point,
+    sanitize_path_fallback,
+)
 
 
 CACHE_VERSION = 1
@@ -137,7 +154,32 @@ class DriveHashCache:
             self.data["hash_index"][digest].append(normalized)
         self.data["updated_at"] = time.time()
 
+    def _is_root_online(self, root):
+        if not root or not volume_identity.is_volume_online(root):
+            return False
+        mount_point = resolve_mount_point(root)
+        if mount_point and os.path.exists(mount_point) and not os.path.exists(root):
+            return False
+        stored_identity = self.data.get("volume_identity")
+        if isinstance(stored_identity, Mapping):
+            identity = VolumeIdentity.from_dict(stored_identity)
+            if identity.is_strong and mount_point == resolve_mount_point(identity.mount_point):
+                if not volume_identity.is_volume_online(identity):
+                    return False
+        return True
+
     def mark_missing_under_root(self, root, seen_paths):
+        """Mark cached entries under ``root`` not present in ``seen_paths`` as stale.
+
+        Data-safety guarantee (offline vs. deleted):
+        If the volume backing ``root`` is currently offline or unmounted, this
+        method refuses to mark any cached entry stale and returns ``0``. A
+        disconnected external drive must never be interpreted as deleted media,
+        otherwise an unplugged drive would invalidate every cached hash under
+        ``root`` and cause callers to treat absent files as removed.
+        """
+        if not self._is_root_online(root):
+            return 0
         normalized_root = self.normalize_path(root)
         seen = {self.normalize_path(path) for path in seen_paths}
         stale_count = 0
@@ -236,16 +278,67 @@ class DriveHashCache:
         self.data["hash_index"] = repaired
 
 
-def default_cache_path(root):
+def _legacy_cache_stem(root):
     safe = os.path.abspath(root).replace("\\", "_").replace("/", "_").replace(":", "")
-    safe = safe.strip("_") or "root"
-    return str(get_runtime_paths().drive_caches / f"{safe}.json")
+    return safe.strip("_") or "root"
+
+
+def _migrate_legacy_cache_file(legacy_path: Path, new_path: Path, root: str, identity: VolumeIdentity) -> None:
+    if new_path.exists() or not legacy_path.is_file():
+        return
+    try:
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_text = legacy_path.read_text(encoding="utf-8")
+        try:
+            payload = json.loads(raw_text)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            migration_record = {
+                "migrated_from": str(legacy_path),
+                "legacy_path": str(legacy_path),
+                "migrated_to": str(new_path),
+                "migrated_at": time.time(),
+                "root": str(root),
+                "stable_key": identity.stable_key,
+                "tier": identity.tier,
+                "volume_identity": identity.to_dict(),
+            }
+            payload["migrated_from"] = str(legacy_path)
+            payload["migration"] = migration_record
+            payload["volume_identity"] = identity.to_dict()
+            tmp_path = new_path.with_suffix(new_path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp_path, new_path)
+        else:
+            shutil.copy2(legacy_path, new_path)
+    except OSError:
+        pass
+
+
+def default_cache_path(root):
+    caches_dir = get_runtime_paths().drive_caches
+    legacy_path = caches_dir / f"{_legacy_cache_stem(root)}.json"
+    identity = volume_identity.probe_volume(root)
+    if identity.is_fallback:
+        return str(legacy_path)
+
+    rel = relative_path_from_mount(root, identity.mount_point)
+    rel_safe = rel.replace("\\", "_").replace("/", "_").replace(":", "").strip("_")
+    stem = f"{identity.stable_key}_{rel_safe}" if rel_safe else identity.stable_key
+    new_path = caches_dir / f"{stem}.json"
+    if new_path != legacy_path and not new_path.exists() and legacy_path.is_file():
+        _migrate_legacy_cache_file(legacy_path, new_path, str(root), identity)
+    return str(new_path)
 
 
 class ADBHashCache(DriveHashCache):
     def __init__(self, path, serial):
         self.serial = serial.strip()
         super().__init__(path)
+
+    def _is_root_online(self, root):
+        return bool(root)
 
     def normalize_path(self, path):
         normalized = posixpath.normpath("/" + str(path).replace("\\", "/").lstrip("/"))
