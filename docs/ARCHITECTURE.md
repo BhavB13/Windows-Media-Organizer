@@ -25,6 +25,54 @@ the sole frontend. A Tkinter compatibility frontend was retained through earlier
 phases and has been removed: it moved duplicate originals with no manifest and
 no restore path, which contradicted the product's recovery guarantee.
 
+Note the direction of the bottom arrow: the packaged tree imports the top-level
+engine modules, and never the reverse. `services/duplicate_service.py` imports
+`engine`; `engine` imports nothing from `duplicate_transfer_manager`. A new
+engine internal therefore belongs at the top level beside `engine.py`, not under
+`src/`. `volume_identity.py` was placed there for exactly this reason — an
+earlier draft put it under `core/` and had to mutate `sys.path` at import time
+to make `drive_cache.py` reach it, which is the symptom this rule prevents.
+`runtime_paths.py` is the one deliberate exception: it is a shim that re-exports
+the packaged implementation so legacy callers keep a stable import path.
+
+## Analysis layers added after Phase 7
+
+These are framework-neutral and each is independently usable. None of them
+writes, moves or deletes user media; they return findings, and acting on a
+finding stays with the existing reversible workflows.
+
+```text
+volume_identity            stable volume identity (GUID, serial, path fallback),
+  (top level)              filesystem constraints, online/offline truth
+drive_cache                keys its caches by that identity, not by drive letter
+
+duplicate_transfer_manager/
+  core/storage_class       reads Win32 attributes to answer "would reading this
+                           file download it?" without opening the file
+  media/perceptual         aHash, dHash and a pure-Python DCT pHash; transitive
+                           grouping within a Hamming threshold; keep
+                           recommendations that return an opinion and a reason
+  index/catalog, schema    SQLite catalog: versioned schema with a forward-only
+                           migration runner, incremental upsert keyed on
+                           (volume, path relative to the volume root), search
+                           and storage analytics
+  previews/thumbnails      persistent sharded thumbnail cache with an LRU byte
+                           budget and EXIF-correct, draft-mode decoding
+```
+
+Two properties hold across all of them and are enforced by tests:
+
+- **Offline is not deleted.** An absent volume keeps its catalog rows and its
+  cached hashes, and is reported as offline. Nothing may conclude that an
+  unplugged external drive means the media was removed.
+- **Analysis does not mutate.** `storage_class` in particular must not open a
+  file for reading, because doing so would trigger the very cloud download it
+  exists to warn about; a test fails if any walk reaches an open hook.
+
+The SQLite catalog is **additive**. The JSON drive and ADB caches remain the
+transfer engine's source of truth for v1 and nothing was migrated away from
+them, so existing caches and journals keep loading unchanged.
+
 ## Design system
 
 `duplicate_transfer_manager.ui` owns semantic color tokens, spacing, radius,
