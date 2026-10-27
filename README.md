@@ -63,6 +63,49 @@ is tracked in [OVERHAUL_PLAN.md](OVERHAUL_PLAN.md).
   happen to end in `.partial` are never deleted.
 - Run copy-only dry runs before making changes.
 
+## Analysis engines (not yet surfaced in the interface)
+
+These ship in the package and are covered by tests, but no screen reaches them
+yet. They are listed separately so the list above stays an accurate description
+of what the application currently *does*.
+
+- **Near-duplicate photo detection.** Average, difference and perceptual
+  hashing, the last over a DCT implemented in pure Python, so a resized or
+  recompressed copy of a photo is recognised even though it shares no bytes with
+  the original. Rotations are matched by comparing against the image's three
+  rotations, and the EXIF orientation tag is honoured. Grouping is transitive
+  and independent of input order.
+- **Keep recommendations.** Highest pixel count first, then larger byte size at
+  equal pixels as a proxy for less recompression, then present capture
+  metadata, then the earliest timestamp, with the path as a final tie-break so
+  the answer never depends on iteration order. It returns an opinion and a
+  reason for every candidate it passes over; it never acts, and acting stays
+  with the existing reversible quarantine.
+- **Cloud-placeholder detection.** Reads the Win32 offline and recall
+  attributes, and cloud reparse tags, to answer whether reading a file would
+  download it, and reports how many bytes a scan would pull in total. OneDrive,
+  Dropbox, Google Drive and iCloud present files at full size with the bytes
+  held remotely, so scanning such a folder would otherwise fetch it silently.
+  The classifier never opens a file, because that would cause the download it
+  exists to warn about.
+- **Stable volume identity.** Hash caches are keyed to a volume's GUID or
+  serial and the path relative to its mount point, rather than to a drive
+  letter, so an external drive reassigned from `E:` to `F:` keeps its cache
+  instead of re-hashing the whole library — and a cache left behind by one drive
+  is no longer matched against a different drive given the same letter. Existing
+  letter-keyed caches are copied forward, not moved. An offline volume is
+  reported as offline and never read as deleted media.
+- **SQLite media catalog.** Incremental indexing keyed on the volume and the
+  path relative to its root, re-reading a file only when its size or
+  nanosecond mtime changed; search by kind, name, size, date, camera or shared
+  content hash; and storage analytics by kind, volume, capture year and
+  extension, including the bytes recoverable by resolving exact duplicates. It
+  is additive: the existing JSON caches remain the transfer engine's source of
+  truth, so current caches and journals keep loading.
+- **Thumbnail cache.** Persistent and sharded, with an LRU byte budget, correct
+  EXIF orientation, and JPEG draft-mode decoding so a large photo is scaled
+  while decoding rather than decoded in full and then shrunk.
+
 ## Android USB companion
 
 The native Android project in [`android/`](android/README.md) copies files from
