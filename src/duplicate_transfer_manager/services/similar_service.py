@@ -24,6 +24,7 @@ from utils import DEFAULT_EXCLUDES
 
 from ..core import ErrorCode, ServiceError
 from ..media import perceptual
+from ..media.hash_store import PerceptualHashStore
 from ..runtime_paths import RuntimePaths, get_runtime_paths
 from .duplicate_workflow import (
     IMAGE_EXTENSIONS,
@@ -146,14 +147,23 @@ class SimilarPhotoService:
         if _is_cancelled(stop_event):
             return SimilarPhotoReview(cancelled=True, max_distance=max_distance)
 
-        report(0, len(images), f"Comparing {len(images):,} photos…")
-        batch = perceptual.hash_images(images, rotation_invariant=True, stop_event=stop_event)
+        # Photos unchanged since an earlier scan reuse their stored hash, so a
+        # repeat scan decodes only what is new or edited.
+        with PerceptualHashStore(self.paths.cache / "perceptual_hashes.sqlite3") as store:
+            cached, to_hash = store.lookup(images)
+            report(len(cached), len(images), f"Comparing {len(images):,} photos ({len(cached):,} already known)…")
+            batch = perceptual.hash_images(to_hash, rotation_invariant=True, stop_event=stop_event)
+            if not batch.cancelled:
+                store.store(batch.entries)
         errors = tuple(str(error) for error in (batch.errors or ()))
         if batch.cancelled or _is_cancelled(stop_event):
             return SimilarPhotoReview(scanned_images=len(images), errors=errors, cancelled=True, max_distance=max_distance)
+        fresh = {entry.path: entry for entry in batch.entries}
+        entries = [cached.get(path) or fresh.get(path) for path in images]
+        entries = [entry for entry in entries if entry is not None]
 
         grouped = perceptual.find_similar_groups(
-            batch.entries, max_distance=max_distance, rotation_invariant=True, stop_event=stop_event
+            entries, max_distance=max_distance, rotation_invariant=True, stop_event=stop_event
         )
         if getattr(grouped, "cancelled", False) or _is_cancelled(stop_event):
             return SimilarPhotoReview(scanned_images=len(images), errors=errors, cancelled=True, max_distance=max_distance)

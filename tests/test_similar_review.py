@@ -8,6 +8,7 @@ correct hash look broken; see tests/test_analysis_integration.py.
 from __future__ import annotations
 
 import math
+import os
 import shutil
 import tempfile
 import threading
@@ -244,3 +245,72 @@ class SimilarReviewPageTests(unittest.TestCase):
             self.page.quarantine_selected()
         self.application.processEvents()
         self.assertTrue(Path(victim.path).exists())
+
+
+@unittest.skipIf(Image is None, "Pillow is required to generate fixtures")
+class PerceptualHashStoreTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.photos = self.root / "photos"
+        self.photos.mkdir()
+        self.original = self.photos / "a.jpg"
+        _photo(self.original)
+        with Image.open(self.original) as handle:
+            handle.resize((240, 180)).save(self.photos / "b.jpg", "JPEG", quality=80)
+        self.service = SimilarPhotoService(get_runtime_paths(self.root / "data"))
+
+    def _scan_counting(self):
+        from duplicate_transfer_manager.media import perceptual
+
+        hashed = []
+        real = perceptual.hash_images
+
+        def counting(paths, *args, **kwargs):
+            paths = list(paths)
+            hashed.extend(paths)
+            return real(paths, *args, **kwargs)
+
+        with patch.object(perceptual, "hash_images", counting):
+            review = self.service.scan([str(self.photos)], thumbnail_root=self.root / "thumbs")
+        return review, hashed
+
+    def test_a_repeat_scan_decodes_nothing_and_finds_the_same_groups(self):
+        first, hashed_first = self._scan_counting()
+        second, hashed_second = self._scan_counting()
+        self.assertEqual(len(hashed_first), 2)
+        self.assertEqual(hashed_second, [], "unchanged photos must come from the store")
+        self.assertEqual(
+            [sorted(i.path for i in g.items) for g in first.groups],
+            [sorted(i.path for i in g.items) for g in second.groups],
+        )
+
+    def test_an_edited_photo_is_hashed_again(self):
+        self._scan_counting()
+        _photo(self.original, phase=1.0)
+        os.utime(self.original, ns=(self.original.stat().st_atime_ns, self.original.stat().st_mtime_ns + 10**9))
+        _review, hashed = self._scan_counting()
+        self.assertEqual([Path(p).name for p in hashed], ["a.jpg"])
+
+    def test_hashes_with_the_top_bit_set_round_trip(self):
+        from duplicate_transfer_manager.media.hash_store import PerceptualHashStore
+        from duplicate_transfer_manager.media.perceptual import HashedImageEntry, ImageHash
+
+        top = (1 << 63) | 0x1234
+        entry = HashedImageEntry(str(self.original), ImageHash("phash", top), (ImageHash("phash", top), ImageHash("phash", 7)))
+        with PerceptualHashStore(self.root / "h.sqlite3") as store:
+            store.store([entry])
+            hits, misses = store.lookup([str(self.original)])
+        self.assertEqual(misses, [])
+        got = hits[str(self.original)]
+        self.assertEqual(got.image_hash.bits, top)
+        self.assertEqual([h.bits for h in got.rotation_hashes], [top, 7])
+
+    def test_a_corrupt_store_does_not_stop_the_scan(self):
+        store_path = self.service.paths.cache / "perceptual_hashes.sqlite3"
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_bytes(b"this is not a database")
+        review, hashed = self._scan_counting()
+        self.assertEqual(len(review.groups), 1)
+        self.assertEqual(len(hashed), 2)
