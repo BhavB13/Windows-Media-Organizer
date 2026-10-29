@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "DtmAndroid"
 include ':app'
+include ':organizer'
