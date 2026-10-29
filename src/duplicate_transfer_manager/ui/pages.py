@@ -42,6 +42,7 @@ from utils import DEFAULT_EXCLUDES, DEFAULT_MEDIA_EXTS, HashCache
 from ..controllers import DeviceController, DuplicateScanController, TransferController
 from ..controllers.base import OperationWorker
 from ..core import AppSettings, CancellationToken, OperationResult, OperationState
+from ..services.cloud_guard import assess_cloud_downloads
 from ..runtime_paths import get_runtime_paths
 from ..sorting import SortExecutor
 from ..services import (
@@ -87,6 +88,22 @@ from .widgets import (
     ToastBanner,
     format_eta,
 )
+
+
+def confirm_cloud_downloads(parent: QWidget, assessment) -> bool:
+    """Ask before reading files that would be downloaded from cloud storage.
+
+    Cancel is the default button: the safe answer to a surprise download is no.
+    """
+
+    answer = QMessageBox.question(
+        parent,
+        "Files will be downloaded",
+        f"{assessment.message}\n\nContinue anyway?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+    )
+    return answer == QMessageBox.StandardButton.Yes
 
 
 class BasePage(QScrollArea):
@@ -153,6 +170,31 @@ class BasePage(QScrollArea):
             lambda: self._background_workers.remove(worker) if worker in self._background_workers else None
         )
         QThreadPool.globalInstance().start(worker)
+
+    def start_after_cloud_check(self, roots, is_adb: bool, proceed, abandon) -> None:
+        """Check ``roots`` for cloud-only files off the main thread, then start.
+
+        ``proceed`` runs when nothing would download, when the user accepts the
+        warning, or when the check itself fails - a broken advisory check must
+        never block a scan. ``abandon`` runs when the user declines.
+        """
+
+        if is_adb:
+            proceed()
+            return
+
+        def decide(assessment) -> None:
+            if assessment is not None and assessment.would_download:
+                if not confirm_cloud_downloads(self, assessment):
+                    abandon()
+                    return
+            proceed()
+
+        self.run_in_background(
+            lambda: assess_cloud_downloads(list(roots)),
+            decide,
+            lambda _failure: proceed(),
+        )
 
     def finish(self) -> None:
         self.content.addStretch(1)
@@ -896,11 +938,30 @@ class DuplicatesPage(BasePage):
         self.review_button.setEnabled(False)
         self.results_card.hide()
         self.progress_panel.show()
+        settings = self._build_settings()
+        self.progress_panel.update_progress(
+            0, "Checking for cloud-only files…", "Reading file attributes only", "0% • 0 items • ETA —"
+        )
+        self.start_after_cloud_check(
+            [settings.scan_root],
+            bool(getattr(settings, "use_adb", False)),
+            lambda: self._begin_scan(settings),
+            self._abandon_scan,
+        )
+
+    def _begin_scan(self, settings) -> None:
         self.progress_panel.update_progress(0, "Starting scan…", "Validating source and options", "0% • 0 items • ETA —")
-        started = self.controller.start(self._build_settings())
+        started = self.controller.start(settings)
         if not started:
             self.review_button.setEnabled(True)
             self.scan_button.setEnabled(True)
+
+    def _abandon_scan(self) -> None:
+        self.progress_panel.hide()
+        self.review_button.setEnabled(True)
+        self.scan_button.setEnabled(True)
+        self.banner.set_message("Scan not started. Nothing was read or downloaded.", "info")
+        self.banner.show()
 
     def _on_progress(self, event) -> None:
         value = int((event.progress or 0) * 100)
@@ -1883,10 +1944,30 @@ class ImportPage(BasePage):
         self.review_button.setEnabled(False)
         self.run_button.setEnabled(False)
         self._set_stage("validation")
+        settings = self.current_settings
+        self.progress_panel.update_progress(
+            0, "Checking for cloud-only files…", "Reading file attributes only", "0% • 0 items • ETA —"
+        )
+        self.start_after_cloud_check(
+            [settings.source_root],
+            bool(getattr(settings, "source_is_adb", False)),
+            lambda: self._begin_import(settings),
+            self._abandon_import,
+        )
+
+    def _begin_import(self, settings) -> None:
         self.progress_panel.update_progress(0, "Validating transfer settings…", "Preparing import", "0% • 0 items • ETA —")
-        if not self.controller.start(self.current_settings):
+        if not self.controller.start(settings):
             self.review_button.setEnabled(True)
             self.run_button.setEnabled(True)
+
+    def _abandon_import(self) -> None:
+        self.progress_panel.hide()
+        self.stage_card.hide()
+        self.review_button.setEnabled(True)
+        self.run_button.setEnabled(True)
+        self.banner.set_message("Import not started. Nothing was read, downloaded or copied.", "info")
+        self.banner.show()
 
     def _cleanup_partials(self) -> None:
         if self.controller.busy:
