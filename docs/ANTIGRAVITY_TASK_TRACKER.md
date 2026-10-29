@@ -204,9 +204,13 @@ wave 3 was refused with the same response:
     RESOURCE_EXHAUSTED (code 429): Individual quota reached.
     Please upgrade your subscription to increase your limits. Resets in 116h35m.
 
-That puts the reset at roughly **2026-11-02 22:30 UTC**. This is an individual,
-multi-day quota rather than a five-hour window, so there was no second window
-to move into. A trivial probe (`PONG`) succeeded minutes before the wave and
+That puts the reset at roughly **2026-11-02 22:30 UTC**, and it held: a wave-4
+dispatch at 03:10 UTC was refused with the same reset instant. A trivial prompt
+("reply PONG") still succeeds while real tasks are refused, so a probe is not a
+reliable availability check. A small read-only task on `gemini-3.8-flash-high`
+did succeed at 03:12 UTC, so Flash may have separate allowance; wave 4 (W17b,
+W18-W22, briefs in the scratchpad) was not re-run on it. The coordinator concluded at the time that this was a multi-day quota with no
+second window; the probe above showed that conclusion was premature. A trivial probe (`PONG`) succeeded minutes before the wave and
 appears to have used the last of the allowance. Upgrading the subscription is a
 paid change and was not made.
 
