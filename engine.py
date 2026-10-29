@@ -16,10 +16,12 @@ from transfer_safety import (
     APP_STAGING_DIRECTORY,
     TransferJournal,
     default_journal_path,
+    files_too_large_for_destination,
     preflight_transfer,
     prevent_windows_sleep,
     pull_with_retries,
     restore_windows_sleep,
+    too_large_message,
     write_transfer_report,
 )
 from utils import ensure_unique_path, is_hidden_or_system, normalize_excludes, normalize_extensions
@@ -113,6 +115,27 @@ def normalize_settings(settings):
     settings.extensions = normalize_extensions(getattr(settings, "extensions", []))
     settings.exclude_dirs = normalize_excludes(getattr(settings, "exclude_dirs", []))
     return settings
+
+
+DESTINATION_DISCONNECTED_MESSAGE = (
+    "ERROR: The destination drive is no longer available. Transfer stopped. "
+    "Nothing on the source was changed and completed files are recorded; "
+    "reconnect the drive and run the transfer again to resume."
+)
+
+
+def _destination_gone(output_root):
+    """True when the destination root itself has disappeared.
+
+    A failed copy normally means one file. When the root is gone too, the drive
+    was unplugged or dropped off the bus, and carrying on would fail every
+    remaining file one by one and report each as an error.
+    """
+
+    try:
+        return not os.path.isdir(output_root)
+    except OSError:
+        return True
 
 
 def _safe_commonpath(paths):
@@ -467,6 +490,34 @@ def validate_transfer_paths(settings):
             return "Compare folder cannot be inside the source folder."
         if common_copy == source_abs:
             return "Output folder cannot be inside the source folder."
+
+        # The checks above compare the paths as typed. A junction, symlink or
+        # subst drive can make two different-looking paths one folder, so the
+        # same rules are applied again to where each path actually leads.
+        source_real = os.path.realpath(source_abs)
+        compare_real = os.path.realpath(compare_abs)
+        copy_real = os.path.realpath(copy_abs)
+        if source_real in (compare_real, copy_real):
+            return "Source and destination resolve to the same folder through a link or mapped drive."
+        if _safe_commonpath([source_real, compare_real]) == source_real:
+            return "Compare folder cannot be inside the source folder."
+        if _safe_commonpath([source_real, copy_real]) == source_real:
+            return "Output folder cannot be inside the source folder."
+        # The reverse nesting was allowed and gave a false answer: the
+        # comparison scan of the library also reads the source inside it, every
+        # source file matches itself, and new photos were reported as already in
+        # the library while nothing was imported.
+        if _safe_commonpath([source_real, compare_real]) == compare_real:
+            return (
+                "Source folder cannot be inside the compare folder: its files would be "
+                "compared against themselves and reported as already in the library. "
+                "Move the source folder out, or compare against a folder that does not contain it."
+            )
+        if _safe_commonpath([source_real, copy_real]) == copy_real:
+            return (
+                "Source folder cannot be inside the output folder: imported files would land "
+                "beside the originals and be picked up again by the next import."
+            )
     return ""
 
 def validate_scan_paths(settings):
@@ -822,9 +873,10 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
     # Every counter the summary and the teardown need, initialised before the
     # try so an early failure still produces a result instead of a traceback.
     transferred = isolated = skipped = transfer_errors = 0
-    conflict_skipped = bytes_transferred = resumed = 0
+    conflict_skipped = bytes_transferred = resumed = too_large_skipped = 0
     failures = []
     adb_device_failed = False
+    destination_disconnected = False
     dest_files = []
     previous_stay_awake = None
     dup_folder_counts = {}
@@ -1011,6 +1063,8 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
     
         dup_folder_counts = {}
         transferred_folder_counts = {}
+        too_large, destination_filesystem = files_too_large_for_destination(output_root, source_files)
+        too_large_paths = {info.path for info in too_large}
 
         for i, f in enumerate(source_files):
             if stop_event.is_set(): break
@@ -1026,6 +1080,15 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                         f"RESUME: {resumed} previously completed file(s) verified by "
                         f"{'full content' if verify_resumed_files else 'size and timestamp'}."
                     )
+                continue
+            if f.path in too_large_paths:
+                # Checked before anything is staged or hashed: an Android import
+                # stages each file on the destination first, so even staging a
+                # 4 GB video onto FAT32 fails after writing most of it.
+                message = too_large_message(destination_filesystem)
+                too_large_skipped += 1
+                failures.append({"source": f.path, "error": message, "reason": "too_large_for_filesystem"})
+                logger.log(f"SKIPPED {f.path}: {message}")
                 continue
             if progress_callback:
                 progress_callback(i, total_src, f"Checking {i}/{total_src}: {filename[:20]} | Copied {transferred}")
@@ -1389,6 +1452,12 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                             if progress_callback:
                                 progress_callback(i + 1, total_src, "ADB authorization lost; transfer stopped")
                             break
+                        if _destination_gone(output_root):
+                            destination_disconnected = True
+                            logger.log(DESTINATION_DISCONNECTED_MESSAGE)
+                            if progress_callback:
+                                progress_callback(i + 1, total_src, "Destination disconnected; transfer stopped")
+                            break
                         continue
                     if write_journal:
                         write_journal.complete(
@@ -1437,7 +1506,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                     f"{(bytes_before + f.size) / (1024**3):.2f}/{total_bytes / (1024**3):.2f} GB",
                 )
 
-            if adb_device_failed:
+            if adb_device_failed or destination_disconnected:
                 break
     except OSError as exc:
         # Destination directory creation, the isolate folder, and the staging
@@ -1447,6 +1516,9 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         transfer_errors += 1
         failures.append({"path": "", "error": f"Transfer stopped: {exc}"})
         logger.log(f"ERROR: Transfer stopped before all files were processed: {exc}")
+        if not settings.dry_run and _destination_gone(output_root):
+            destination_disconnected = True
+            logger.log(DESTINATION_DISCONNECTED_MESSAGE)
     finally:
         if drive_cache and getattr(settings, "update_drive_cache", True) and not settings.dry_run:
             drive_cache.note_root(compare_root, compare_scan_settings, len(dest_files), 0)
@@ -1517,6 +1589,10 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
     logger.log(f"{isolated_label}: {isolated}")
     logger.log(f"Transfer Errors: {transfer_errors}")
     logger.log(f"Resumed From Journal: {resumed}")
+    if too_large_skipped:
+        logger.log(f"Too Large For Destination Filesystem: {too_large_skipped}")
+    if destination_disconnected:
+        logger.log("Destination Disconnected: yes - reconnect the drive and run again to resume")
     
     if dup_folder_counts:
         logger.log("\nDuplicate Breakdown by Source Folder:")
@@ -1539,6 +1615,13 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         "errors": transfer_errors,
         "bytes_transferred": bytes_transferred,
         "adb_device_failed": adb_device_failed,
+        # Files the destination filesystem cannot hold (FAT32's 4 GiB limit).
+        # They are listed in the report's failures with their reason.
+        "too_large_skipped": too_large_skipped,
+        # The destination vanished mid-run. Distinct from file errors: nothing
+        # failed on the user's side, the journal is intact, and running the
+        # transfer again after reconnecting resumes it.
+        "destination_disconnected": destination_disconnected,
         "dry_run": settings.dry_run,
         # Carried into the report so a completed import that was working from a
         # truncated source listing is not mistaken for a complete one.

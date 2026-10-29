@@ -9,6 +9,7 @@ from datetime import datetime
 
 from adb_bridge import ADBBridge, ADBOperationError
 from runtime_paths import get_runtime_paths
+from volume_identity import FAT_MAX_FILE_BYTES, has_fat_4gib_limit, probe_volume
 
 
 ES_CONTINUOUS = 0x80000000
@@ -237,6 +238,35 @@ def default_journal_path(output_root, serial="local"):
     return str(journals / f"{safe_serial}_{root_tag}.journal.json")
 
 
+def files_too_large_for_destination(output_root, source_files):
+    """Return the files the destination filesystem cannot store at all.
+
+    FAT32 keeps a file's size in 32 bits, so nothing of 4 GiB or more fits on
+    it, and many USB sticks and camera cards still ship formatted that way.
+    Without this the limit was discovered by the copy itself, after gigabytes of
+    a long video had already been written. An unidentified filesystem limits
+    nothing: refusing files on a guess would be worse than the late failure.
+
+    Returns ``(files, filesystem)``.
+    """
+
+    identity = probe_volume(output_root)
+    if not has_fat_4gib_limit(identity):
+        return [], identity.filesystem
+    return (
+        [info for info in source_files if (getattr(info, "size", 0) or 0) > FAT_MAX_FILE_BYTES],
+        identity.filesystem,
+    )
+
+
+def too_large_message(filesystem):
+    label = (filesystem or "FAT").upper()
+    return (
+        f"Too large for this {label} drive: {label} cannot store files of 4 GB or more. "
+        "Copy it to an exFAT or NTFS drive, or back up and reformat this one as exFAT."
+    )
+
+
 def preflight_transfer(
     output_root,
     source_files,
@@ -260,6 +290,19 @@ def preflight_transfer(
             os.remove(probe)
         except OSError as exc:
             errors.append(f"Output folder is not writable: {exc}")
+    skipped_as_too_large = set()
+    try:
+        too_large, filesystem = files_too_large_for_destination(output_root, source_files)
+        skipped_as_too_large = {info.path for info in too_large}
+        if too_large:
+            label = (filesystem or "FAT").upper()
+            warnings.append(
+                f"{len(too_large)} file(s) are 4 GB or larger and cannot be stored on this "
+                f"{label} drive. They will be skipped and listed in the report; everything "
+                "else will copy. Use an exFAT or NTFS destination to include them."
+            )
+    except Exception as exc:  # noqa: BLE001 - an advisory check must not block a transfer
+        warnings.append(f"Could not check the destination's file-size limit: {exc}")
     try:
         # Files the journal already proved complete will not be written again,
         # so charging their bytes against free space made resuming impossible
@@ -268,6 +311,9 @@ def preflight_transfer(
         outstanding = []
         already_complete = 0
         for info in source_files:
+            # Nor will a file the destination cannot hold at all.
+            if info.path in skipped_as_too_large:
+                continue
             if journal is not None:
                 try:
                     if journal.is_complete(info.path, info.size, verify_resumed):
