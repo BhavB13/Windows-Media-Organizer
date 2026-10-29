@@ -62,57 +62,79 @@ is tracked in [OVERHAUL_PLAN.md](OVERHAUL_PLAN.md).
   directory or paths recorded in a transfer journal — so unrelated files that
   happen to end in `.partial` are never deleted.
 - Run copy-only dry runs before making changes.
+- **Find similar photos** (sidebar: *Similar Photos*). Groups photos that look
+  alike even when they share no bytes — a resized, recompressed or re-exported
+  copy, including a rotated one — using perceptual hashes computed in pure
+  Python. Strict, balanced and loose sensitivity. Each group shows the photos
+  side by side with the recommended keep marked and the reasons written out:
+  highest pixel count first, then larger file at equal pixels, then capture
+  metadata, then the earliest timestamp. Byte-identical copies are labelled as
+  such. Nothing is selected by default; chosen photos go to the same reversible
+  quarantine, and a selection that would remove every copy of a photo is
+  refused.
+- **Browse and search a library catalog** (sidebar: *Library*, Alt+0). An
+  incremental SQLite index keyed on the volume and the path relative to its
+  root, re-reading a file only when its size or nanosecond mtime changed;
+  search by kind, name, size and capture date; storage analytics by kind,
+  volume, capture year and extension. An unplugged drive's entries stay and are
+  shown as offline. The catalog is additive: the existing JSON caches remain the
+  transfer engine's source of truth.
+- **Warnings before downloading cloud-only files.** Before a duplicate scan,
+  similar-photo comparison or import reads a folder, the app checks file
+  attributes for OneDrive, Dropbox, Google Drive and iCloud placeholders, whose
+  bytes are fetched the moment a file is read. If any would download, it says
+  how many, how large and from where, and asks; Cancel is the default. The check
+  never opens a file.
+- **Sort by camera or phone.** Destination templates accept `{camera}`,
+  `{camera_make}` and `{camera_model}` from EXIF alongside the existing date and
+  type tokens, made safe as Windows folder names.
+- **Upright, cached previews.** Duplicate and similar-photo previews come from a
+  persistent thumbnail cache that honours EXIF orientation, decodes JPEGs at
+  reduced size, keys entries on path, size and mtime so edited photos refresh,
+  and is held to a byte budget.
 
-## Analysis engines (not yet surfaced in the interface)
+### External drives
 
-These ship in the package and are covered by tests, but no screen reaches them
-yet. They are listed separately so the list above stays an accurate description
-of what the application currently *does*.
+- Hash caches are keyed to the volume's GUID or serial and the path relative to
+  its mount point, not to the drive letter, so a drive that comes back as `F:`
+  instead of `E:` keeps its cache, and a cache is never matched against a
+  different drive that was given the same letter. An offline volume's cache is
+  never marked stale.
+- Copying to a FAT32 drive skips files of 4 GB or more up front, with a reason
+  in the report, instead of failing after writing most of a long video; they are
+  also left out of the free-space estimate.
+- If the destination drive is unplugged mid-transfer, the run stops and reports
+  the disconnect instead of failing every remaining file. Running again after
+  reconnecting resumes from the journal.
+- A source folder inside the compare or output folder is refused, as are
+  overlaps hidden by a junction, symlink or `subst` drive. Previously a source
+  inside the library made every new photo match itself and report as already
+  imported.
 
-- **Near-duplicate photo detection.** Average, difference and perceptual
-  hashing, the last over a DCT implemented in pure Python, so a resized or
-  recompressed copy of a photo is recognised even though it shares no bytes with
-  the original. Rotations are matched by comparing against the image's three
-  rotations, and the EXIF orientation tag is honoured. Grouping is transitive
-  and independent of input order.
-- **Keep recommendations.** Highest pixel count first, then larger byte size at
-  equal pixels as a proxy for less recompression, then present capture
-  metadata, then the earliest timestamp, with the path as a final tie-break so
-  the answer never depends on iteration order. It returns an opinion and a
-  reason for every candidate it passes over; it never acts, and acting stays
-  with the existing reversible quarantine.
-- **Cloud-placeholder detection.** Reads the Win32 offline and recall
-  attributes, and cloud reparse tags, to answer whether reading a file would
-  download it, and reports how many bytes a scan would pull in total. OneDrive,
-  Dropbox, Google Drive and iCloud present files at full size with the bytes
-  held remotely, so scanning such a folder would otherwise fetch it silently.
-  The classifier never opens a file, because that would cause the download it
-  exists to warn about.
-- **Stable volume identity.** Hash caches are keyed to a volume's GUID or
-  serial and the path relative to its mount point, rather than to a drive
-  letter, so an external drive reassigned from `E:` to `F:` keeps its cache
-  instead of re-hashing the whole library — and a cache left behind by one drive
-  is no longer matched against a different drive given the same letter. Existing
-  letter-keyed caches are copied forward, not moved. An offline volume is
-  reported as offline and never read as deleted media.
-- **SQLite media catalog.** Incremental indexing keyed on the volume and the
-  path relative to its root, re-reading a file only when its size or
-  nanosecond mtime changed; search by kind, name, size, date, camera or shared
-  content hash; and storage analytics by kind, volume, capture year and
-  extension, including the bytes recoverable by resolving exact duplicates. It
-  is additive: the existing JSON caches remain the transfer engine's source of
-  truth, so current caches and journals keep loading.
-- **Thumbnail cache.** Persistent and sharded, with an LRU byte budget, correct
-  EXIF orientation, and JPEG draft-mode decoding so a large photo is scaled
-  while decoding rather than decoded in full and then shrunk.
+## Android apps
 
-## Android USB companion
+The native Android project in [`android/`](android/README.md) has two modules,
+both independent of the Windows app.
 
-The native Android project in [`android/`](android/README.md) copies files from
-a selected phone folder to a USB drive mounted by Android, skipping identical
-content and retaining phone originals. It is separate from the Windows app's
-ADB workflow. See the Android README for APK build instructions, supported
-storage providers, and the physical-device verification checklist.
+- `:app` — the USB companion. Copies files from a selected phone folder to a
+  USB drive mounted by Android, skipping identical content and retaining phone
+  originals.
+- `:organizer` — a Kotlin and Jetpack Compose organizer. Browses photos and
+  videos through MediaStore, filters by kind, name, size and date, finds exact
+  duplicates (size first, then SHA-256), recommends which copy to keep, and
+  summarises storage. It is read-only with respect to your media: it never
+  deletes, moves or writes a file. It handles Android 14 partial photo access
+  as its own state.
+
+Build both debug APKs and run the organizer's JVM unit tests:
+
+```powershell
+cd android
+.\gradlew.bat :organizer:testDebugUnitTest :organizer:assembleDebug :app:assembleDebug
+```
+
+See the Android README for supported storage providers and the physical-device
+verification checklist. The organizer has not yet been run on a device.
 
 ## Requirements
 

@@ -82,13 +82,13 @@ re-run is what is recorded.
 | W1 | Perceptual image similarity (aHash/dHash/pHash, orientation-invariant, union-find grouping) and deterministic keep recommendations | `src/duplicate_transfer_manager/media/**`, `tests/test_perceptual.py` | **integrated** | 14 OK | `66353ba` |
 | W2 | Stable volume identity so a drive-letter change does not orphan a hash cache; offline-vs-deleted safety | `volume_identity.py`, `drive_cache.py`, `tests/test_volume_identity.py` | **integrated** (after coordinator restructure) | 11 OK | `b9d43fb` |
 | W3 | SQLite media catalog: incremental indexing, search/filter, storage analytics | `src/duplicate_transfer_manager/index/**`, `tests/test_catalog.py` | **integrated** | 12 OK | `9781f1f` |
-| W4 | Kotlin + Jetpack Compose Android module (MediaStore browsing, duplicate review, metadata, search, storage summary), read-only w.r.t. user media | `android/organizer/**`, `android/settings.gradle`, `android/build.gradle` | still running | — | — |
-| W5 | Real EXIF/HEIC/RAW/video metadata extraction with stdlib container parsing | `sorting/metadata.py`, `sorting/raw_metadata.py`, `tests/test_metadata_enrichment.py` | **rejected**, re-dispatched | broke an existing test; wrote none | — |
+| W4 | Kotlin + Jetpack Compose Android module (MediaStore browsing, duplicate review, metadata, search, storage summary), read-only w.r.t. user media | `android/organizer/**`, `android/settings.gradle`, `android/build.gradle` | **integrated** (after coordinator fix) | Gradle BUILD SUCCESSFUL; 22 JVM unit tests OK; debug APK built | `fbc9b71` |
+| W5 | Real EXIF/HEIC/RAW/video metadata extraction with stdlib container parsing | `sorting/metadata.py`, `sorting/raw_metadata.py`, `tests/test_metadata_enrichment.py` | **not integrated** — two retries ended without a test file; partial work left in its worktree | — | — |
 | W6 | Classify storage before reading it: cloud placeholders (OneDrive/Dropbox/GDrive/iCloud Files On-Demand), removable vs network vs fixed, directory junctions | `core/storage_class.py`, `tests/test_storage_class.py` | **integrated** | 15 OK | `68c3f25` |
 | W7 | ADB device states, per-state actionable diagnosis, multi-device refusal, server lifecycle, same-serial reconnect | `adb_bridge.py`, `tests/test_adb_bridge.py` | **rejected** | 0 — rewrote 1554 lines of a load-bearing module and left the test file empty | — |
 | W8 | Persistent sharded thumbnail cache with LRU budget, EXIF orientation, draft-mode decode | `src/duplicate_transfer_manager/previews/**`, `tests/test_thumbnails.py` | **integrated** | 17 OK | `6934b09` |
-| W9 | Similar-photo review service and page on top of W1 | `services/similar_service.py`, `ui/similar_review_page.py`, `tests/test_similar_review.py` | still running | — | — |
-| W10 | Catalog-backed library indexing, search and storage-analytics page on top of W3 | `services/catalog_service.py`, `ui/library_page.py`, `tests/test_catalog_service.py` | **failed** — produced no files | — | — |
+| W9 | Similar-photo review service and page on top of W1 | `services/similar_service.py`, `ui/similar_review_page.py`, `tests/test_similar_review.py` | **not integrated** — first run exited 4 with no output; retry refused by quota | — | — |
+| W10 | Catalog-backed library indexing, search and storage-analytics page on top of W3 | `services/catalog_service.py`, `ui/library_page.py`, `tests/test_catalog_service.py` | **integrated** on retry (first run produced nothing) | 13 OK | `b5da73e` |
 
 ### Coordinator corrections applied during integration
 
@@ -192,3 +192,68 @@ resolves intermittently on this machine at roughly 165 KB/s, which previously
 made Gradle dependency resolution fail in a way that read like a broken build.
 Compose pulls a large dependency set, so W4 was briefed to distinguish a network
 failure from a code failure and never to report a build it did not get.
+
+## Wave 3 and the Antigravity quota (2026-10-29)
+
+### Quota: observed, not assumed
+
+`agy` exposes no command that reports usage or remaining quota, so the only
+reliable signal is a refused call. At 01:55 UTC on 2026-10-29 every worker in
+wave 3 was refused with the same response:
+
+    RESOURCE_EXHAUSTED (code 429): Individual quota reached.
+    Please upgrade your subscription to increase your limits. Resets in 116h35m.
+
+That puts the reset at roughly **2026-11-02 22:30 UTC**. This is an individual,
+multi-day quota rather than a five-hour window, so there was no second window
+to move into. A trivial probe (`PONG`) succeeded minutes before the wave and
+appears to have used the last of the allowance. Upgrading the subscription is a
+paid change and was not made.
+
+Seven Antigravity tasks produced work that was verified and integrated: W1, W2,
+W3, W4, W6, W8 and W10 (on its retry). All seven wave-3 dispatches were refused
+by the quota before doing any work.
+
+### Wave 3 — dispatched, refused, then done by the coordinator
+
+Each brief is kept as an executable handoff; `common.md` plus the task file is
+the full prompt, and `dispatch.sh <key> <worktree> <brief>` runs it.
+
+| ID | Objective | Outcome | Tests (re-run) | Commit |
+| --- | --- | --- | --- | --- |
+| W11 | External-drive preflight: FAT32 4 GiB limit, unplugged destination, overlap through links | **done by Claude** | 11 OK (`test_drive_preflight`) | `7cc9a32` |
+| W14 | Warn before a scan or import downloads cloud-only files | **done by Claude** | 14 OK (`test_cloud_warning`) | `6a5c651` |
+| W15 | Duplicate review previews through the persistent thumbnail cache | **done by Claude** | 7 OK (`test_duplicate_thumbnails`) | `191c45b` |
+| W17 | Perceptual hashes stored in the catalog; similar-photo queries | **not started** — brief ready | — | — |
+| W5b | Metadata extraction, second retry | **not started** — brief ready | — | — |
+| W7b | ADB device states, retry | **not started** — brief ready | — | — |
+| W9b | Similar-photo review service and page | **done by Claude** | 16 OK (`test_similar_review`) | `a6b74d5`, `8b89c34` |
+
+Also done by Claude outside the briefs: `{camera}` sort tokens from EXIF
+Make/Model (`714862e`, 7 tests), the Library page's route (`27babfa`), and W4's
+AndroidX fix and build verification.
+
+### Defects found and fixed during integration
+
+- **Source inside the compare folder gave a false result.** Importing
+  `library/inbox` with `library` as the compare folder passed validation and
+  reported three new photos as three duplicates with nothing imported: the
+  library scan read the source too and every file matched itself. Now refused
+  with an explanation, as is a source inside the output folder.
+- **The Library page was unreachable.** W10 merged with no route. It now sits
+  after Disk Audit on Alt+0, with the nine existing shortcuts unchanged.
+- **The Library page froze start-up.** Its constructor waited up to two seconds
+  on its own background refresh while the main window was being built.
+- **W4 silenced an AGP check through an internal class property.** Replaced by
+  `android.useAndroidX=true`, which `:app` builds unchanged with.
+- **Free-space preflight charged files that would never be written** once
+  FAT32-oversize skipping existed; they are now excluded like journal-complete
+  files already were.
+
+### Disk
+
+Free space went from 9.2 GB at the start of this session to about 2.7 GB. The
+Android build downloaded Compose and its toolchain into the Gradle cache,
+which is the most likely consumer; it was not cleared, because it is a shared
+user cache and clearing it would force the download again. The 6.4 GB Android
+emulator image under `.android/avd` predates this work.
