@@ -36,6 +36,12 @@ class MetadataExtractor:
                     width, height = image.size
                     attributes["format"] = image.format or ""
                     exif = image.getexif()
+                    # Make (271) and Model (272) identify the camera or phone,
+                    # which the planner offers as the {camera} folder token.
+                    for tag, key in ((271, "camera_make"), (272, "camera_model")):
+                        value = str(exif.get(tag) or "").replace("\x00", "").strip()
+                        if value:
+                            attributes[key] = value
                     raw_date = exif.get(36867) or exif.get(306)
                     if raw_date:
                         # An EXIF capture time is a zoneless wall clock. It is

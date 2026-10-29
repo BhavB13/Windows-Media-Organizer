@@ -159,6 +159,11 @@ class AssociationDialog(QDialog):
             self.action.addItem(value.value.replace("_", " ").title(), value)
         self.destination = QLineEdit(association.destination if association else "")
         self.destination.setPlaceholderText(r"D:\Sorted\{media_type}\{year}")
+        self.destination.setToolTip(
+            "Folder tokens: {media_type}, {extension}, {year}, {month}, {day} (from the photo's capture "
+            "date when it has one), {camera}, {camera_make}, {camera_model}. "
+            r"Example: D:\Sorted\{camera}\{year}\{month}"
+        )
         self.rename_template = QLineEdit(association.rename_template if association else "{stem}{suffix}")
         self.conflict = QComboBox()
         for value in ConflictPolicy:

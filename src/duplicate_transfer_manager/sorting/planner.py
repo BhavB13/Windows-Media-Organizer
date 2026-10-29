@@ -24,6 +24,52 @@ from .models import (
 from .rules import RuleEvaluator
 
 
+
+UNKNOWN_CAMERA = "Unknown camera"
+_WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
+_FORBIDDEN = set('<>:"/\\|?*')
+
+
+def folder_component(text: str, fallback: str = UNKNOWN_CAMERA, limit: int = 80) -> str:
+    """Make camera-supplied text safe to use as one Windows folder name.
+
+    EXIF Make and Model are written by the device, not the user, and nothing
+    stops them containing a slash, a colon, trailing dots or a reserved device
+    name. Used unchecked in a template, "{camera}" could create a nested path or
+    a folder Explorer cannot open.
+    """
+
+    cleaned = "".join(" " if ch in _FORBIDDEN or ord(ch) < 32 else ch for ch in str(text or ""))
+    cleaned = " ".join(cleaned.split())[:limit].rstrip(" .")
+    if not cleaned:
+        return fallback
+    if cleaned.split(".")[0].upper() in _WINDOWS_RESERVED:
+        cleaned = f"{cleaned}_"
+    return cleaned
+
+
+def camera_tokens(metadata) -> dict[str, str]:
+    """{camera}, {camera_make} and {camera_model} for destination templates.
+
+    {camera} avoids repeating the maker when the model already names it, so a
+    Canon reads "Canon EOS R5" rather than "Canon Canon EOS R5"; an iPhone reads
+    "Apple iPhone 15 Pro". Files without EXIF - most videos, screenshots,
+    documents - share one "Unknown camera" folder rather than failing the plan.
+    """
+
+    attributes = getattr(metadata, "attributes", None) or {}
+    make = str(attributes.get("camera_make", "") or "").strip()
+    model = str(attributes.get("camera_model", "") or "").strip()
+    if model and make and model.casefold().startswith(make.split()[0].casefold()):
+        combined = model
+    else:
+        combined = " ".join(part for part in (make, model) if part)
+    return {
+        "camera": folder_component(combined),
+        "camera_make": folder_component(make),
+        "camera_model": folder_component(model),
+    }
+
 class SortPlanner:
     def __init__(
         self,
@@ -156,6 +202,7 @@ class SortPlanner:
             "extension": metadata.extension.lstrip(".") or "extensionless",
             "media_type": metadata.media_type.title() or "Other",
             "year": f"{stamp.year:04d}", "month": f"{stamp.month:02d}", "day": f"{stamp.day:02d}",
+            **camera_tokens(metadata),
         }
         try:
             folder = str(root).format_map(values)
