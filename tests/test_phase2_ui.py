@@ -251,6 +251,7 @@ class Phase2UiTests(unittest.TestCase):
                 "audit",
                 "library",
                 "duplicates",
+                "similar",
                 "import",
                 "sort",
                 "activity",
@@ -838,10 +839,16 @@ class Phase2UiTests(unittest.TestCase):
             control.deleteLater()
 
     def test_navigation_controls_have_keyboard_shortcuts_and_focus_policy(self):
-        self.assertEqual(len(self.window.sidebar.shortcuts), len(ROUTES))
+        self.assertEqual(
+            len(self.window.sidebar.shortcuts), len([route for route in ROUTES if route.shortcut])
+        )
+        # Similar Photos has no shortcut: every Alt+digit is taken.
+        self.assertEqual(next(r for r in ROUTES if r.key == "similar").shortcut, "")
         bound = {
             route.key: shortcut.key().toString()
-            for route, shortcut in zip(ROUTES, self.window.sidebar.shortcuts)
+            for route, shortcut in zip(
+                [route for route in ROUTES if route.shortcut], self.window.sidebar.shortcuts
+            )
         }
         # The original nine keep the shortcuts people already know; Library,
         # added later beside Disk Audit, takes the free Alt+0.

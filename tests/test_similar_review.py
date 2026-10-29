@@ -13,6 +13,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from duplicate_transfer_manager.core import ServiceError
 from duplicate_transfer_manager.runtime_paths import get_runtime_paths
@@ -155,3 +156,91 @@ class SimilarPhotoServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+try:
+    import os as _os
+
+    _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QDialog
+
+    from duplicate_transfer_manager.ui.similar_review_page import SimilarReviewPage
+    from duplicate_transfer_manager.ui.widgets import ConfirmationDialog
+except Exception:  # pragma: no cover - page tests skip without PySide6
+    QApplication = None
+
+
+@unittest.skipIf(Image is None or QApplication is None, "Pillow and PySide6 are required")
+class SimilarReviewPageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.photos = root / "photos"
+        self.photos.mkdir()
+        self.original = self.photos / "IMG_0001.jpg"
+        self.resized = self.photos / "small.jpg"
+        _photo(self.original)
+        with Image.open(self.original) as handle:
+            handle.resize((240, 180)).save(self.resized, "JPEG", quality=80)
+        self.page = SimilarReviewPage(get_runtime_paths(root / "data"))
+        self.page.path.set_path(str(self.photos))
+
+    def tearDown(self):
+        self.page.controller.cancel()
+        self.page.controller.wait_for_done(5000)
+        self._drain(lambda: not getattr(self.page, "_background_workers", []), 5)
+        self.page.deleteLater()
+        self.application.processEvents()
+
+    def _drain(self, until, timeout=30.0):
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not until():
+            self.application.processEvents()
+            time.sleep(0.02)
+        return until()
+
+    def _scan(self):
+        self.assertTrue(self.page.start_scan())
+        self.assertTrue(self._drain(lambda: self.page.review is not None), "scan did not finish")
+
+    def test_scan_shows_groups_with_nothing_selected(self):
+        self._scan()
+        self.assertEqual(len(self.page.review.groups), 1)
+        self.assertEqual(len(self.page.checks), 2)
+        self.assertEqual(self.page.selected_ids(), [])
+        self.assertFalse(self.page.quarantine_button.isEnabled())
+
+    def test_a_missing_folder_is_reported_without_scanning(self):
+        self.page.path.set_path(str(self.photos / "missing"))
+        self.assertFalse(self.page.start_scan())
+        self.assertIsNone(self.page.review)
+
+    def test_quarantining_a_chosen_copy_after_confirmation(self):
+        self._scan()
+        group = self.page.review.groups[0]
+        victim = next(item for item in group.items if item.id != group.keeper_id)
+        self.page.checks[victim.id].setChecked(True)
+        self.assertTrue(self.page.quarantine_button.isEnabled())
+        with patch.object(ConfirmationDialog, "exec", return_value=QDialog.DialogCode.Accepted):
+            self.page.quarantine_selected()
+            self.assertTrue(self._drain(lambda: "Moved" in self.page.banner.label.text()))
+        self.assertFalse(Path(victim.path).exists())
+        self.assertTrue(self.original.exists())
+        self.assertFalse(self.page.checks[victim.id].isEnabled())
+
+    def test_declining_the_confirmation_moves_nothing(self):
+        self._scan()
+        group = self.page.review.groups[0]
+        victim = next(item for item in group.items if item.id != group.keeper_id)
+        self.page.checks[victim.id].setChecked(True)
+        with patch.object(ConfirmationDialog, "exec", return_value=QDialog.DialogCode.Rejected):
+            self.page.quarantine_selected()
+        self.application.processEvents()
+        self.assertTrue(Path(victim.path).exists())

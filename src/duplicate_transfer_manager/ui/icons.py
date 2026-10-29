@@ -21,6 +21,7 @@ PATHS = {
     "drive": '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 14h18"/><circle cx="17" cy="16.5" r=".5"/>',
     "phone": '<rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/>',
     "search": '<circle cx="10.5" cy="10.5" r="7.5"/><path d="m16 16 5 5"/>',
+    "similar": '<rect x="2" y="6" width="12" height="12" rx="2"/><rect x="10" y="3" width="12" height="12" rx="2"/><path d="m4 16 3-3 3 3"/>',
     "library": '<rect x="3" y="4" width="4" height="16" rx="1"/><rect x="9" y="4" width="4" height="16" rx="1"/><path d="m15.2 5.3 3.8-1 3 14.6-3.8 1Z"/>',
     "check": '<path d="m5 12 4 4L19 6"/>',
     "arrow": '<path d="M5 12h14m-5-5 5 5-5 5"/>',

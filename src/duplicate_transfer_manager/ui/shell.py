@@ -45,6 +45,7 @@ from .pages import (
 )
 from .disk_audit_page import DiskAuditPage
 from .library_page import LibraryPage
+from .similar_review_page import SimilarReviewPage
 from .sort_workspace import SortWorkspace
 from .theme import Spacing, ThemeManager
 from .widgets import add_shortcut, set_accessible
@@ -65,6 +66,9 @@ ROUTES = (
     # takes Alt+0 so the nine shortcuts people already know do not move.
     Route("library", "Library", "library", "Alt+0"),
     Route("duplicates", "Find Duplicates", "duplicates", "Alt+3"),
+    # No shortcut: every Alt+digit is taken, and a chord such as Ctrl+Alt+3
+    # types a character on keyboard layouts that use AltGr.
+    Route("similar", "Similar Photos", "similar", ""),
     Route("import", "Import Files", "import", "Alt+4"),
     Route("sort", "Sort Files", "folder", "Alt+5"),
     Route("activity", "Activity", "activity", "Alt+6"),
@@ -126,19 +130,24 @@ class Sidebar(QFrame):
             button.setProperty("nav", True)
             button.setIcon(icon(route.icon_name, self._icon_color))
             button.setIconSize(icon_size())
-            button.setToolTip(f"{route.label}  ({route.shortcut})")
-            set_accessible(
-                button,
-                route.label,
-                f"Open {route.label}. Keyboard shortcut {route.shortcut}.",
-            )
+            if route.shortcut:
+                button.setToolTip(f"{route.label}  ({route.shortcut})")
+                set_accessible(
+                    button,
+                    route.label,
+                    f"Open {route.label}. Keyboard shortcut {route.shortcut}.",
+                )
+            else:
+                button.setToolTip(route.label)
+                set_accessible(button, route.label, f"Open {route.label}.")
             button.clicked.connect(
                 lambda checked=False, key=route.key: checked
                 and self.route_requested.emit(key)
             )
             self.group.addButton(button, index)
             self.buttons[route.key] = button
-            self.shortcuts.append(add_shortcut(button, route.shortcut))
+            if route.shortcut:
+                self.shortcuts.append(add_shortcut(button, route.shortcut))
             layout.addWidget(button)
         self.buttons["overview"].setChecked(True)
 
@@ -281,6 +290,7 @@ class MainWindow(QMainWindow):
                 operation_service=self.operation_records,
                 settings=settings,
             ),
+            "similar": SimilarReviewPage(self.runtime_paths),
             "import": ImportPage(
                 hash_cache=hash_cache,
                 operation_service=self.operation_records,
@@ -382,7 +392,7 @@ class MainWindow(QMainWindow):
 
     def _busy_controllers(self) -> list:
         controllers = []
-        for key in ("audit", "library", "duplicates", "import", "sort"):
+        for key in ("audit", "library", "duplicates", "similar", "import", "sort"):
             for attribute in ("controller", "search_controller", "device_controller"):
                 controller = getattr(self.pages.get(key), attribute, None)
                 if controller is not None and controller.busy:
