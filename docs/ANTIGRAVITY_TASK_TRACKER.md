@@ -224,9 +224,9 @@ the full prompt, and `dispatch.sh <key> <worktree> <brief>` runs it.
 | W11 | External-drive preflight: FAT32 4 GiB limit, unplugged destination, overlap through links | **done by Claude** | 11 OK (`test_drive_preflight`) | `7cc9a32` |
 | W14 | Warn before a scan or import downloads cloud-only files | **done by Claude** | 14 OK (`test_cloud_warning`) | `6a5c651` |
 | W15 | Duplicate review previews through the persistent thumbnail cache | **done by Claude** | 7 OK (`test_duplicate_thumbnails`) | `191c45b` |
-| W17 | Perceptual hashes stored in the catalog; similar-photo queries | **not started** — brief ready | — | — |
-| W5b | Metadata extraction, second retry | **not started** — brief ready | — | — |
-| W7b | ADB device states, retry | **not started** — brief ready | — | — |
+| W17 | Perceptual hashes stored in the catalog; similar-photo queries | **partly superseded**: hashes now persist in a dedicated store used by Similar Photos (`8fc216d`); folding them into the catalog remains open | 20 OK (`test_similar_review`) | — |
+| W5b | Metadata extraction (HEIC/RAW) | **done by Claude**, narrower than the brief: stdlib EXIF for HEIF/AVIF, TIFF-based RAW and RAF; CR3 and video metadata not touched | 12 OK (`test_container_exif`) | `0945866` |
+| W7b | ADB device states and per-state diagnosis | **done by Claude** as a targeted fix, not the rejected rewrite: parser, help table moved below the engine | 12 OK (`test_adb_states`) | `23b1459` |
 | W9b | Similar-photo review service and page | **done by Claude** | 16 OK (`test_similar_review`) | `a6b74d5`, `8b89c34` |
 
 Also done by Claude outside the briefs: `{camera}` sort tokens from EXIF
@@ -257,3 +257,10 @@ Android build downloaded Compose and its toolchain into the Gradle cache,
 which is the most likely consumer; it was not cleared, because it is a shared
 user cache and clearing it would force the download again. The 6.4 GB Android
 emulator image under `.android/avd` predates this work.
+
+### State at the end of wave 3
+
+`.venv\Scripts\python.exe -m unittest discover -s tests` on the merged tree:
+**525 tests, OK (1 skipped)**, run once on its own by the coordinator. The skip
+is the pre-existing elevated-symlink case. Android: `:organizer` unit tests
+(22) and both debug APKs built; nothing has been run on a device or emulator.

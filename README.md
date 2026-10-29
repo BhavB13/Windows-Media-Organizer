@@ -88,6 +88,16 @@ is tracked in [OVERHAUL_PLAN.md](OVERHAUL_PLAN.md).
 - **Sort by camera or phone.** Destination templates accept `{camera}`,
   `{camera_make}` and `{camera_model}` from EXIF alongside the existing date and
   type tokens, made safe as Windows folder names.
+- **Capture dates for HEIC and RAW.** iPhone HEIC/HEIF, AVIF, TIFF-based RAW
+  (DNG, CR2, NEF, ARW, ORF, RW2, PEF and others) and Fujifilm RAF are dated and
+  attributed from their own EXIF, read without extra libraries, instead of by
+  the day they were copied. Canon CR3 is not yet read.
+- **Faster repeat comparisons.** Similar Photos remembers each photo's
+  perceptual hash until the file changes, so scanning the same library again
+  decodes only new or edited photos.
+- **Clearer phone connection messages.** Each `adb` device state (unauthorized,
+  offline, recovery, bootloader, no permissions and others) gets its own
+  instruction instead of one generic "authorize USB debugging".
 - **Upright, cached previews.** Duplicate and similar-photo previews come from a
   persistent thumbnail cache that honours EXIF orientation, decodes JPEGs at
   reduced size, keys entries on path, size and mtime so edited photos refresh,
