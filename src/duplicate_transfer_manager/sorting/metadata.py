@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ..core import CancellationToken, ErrorCode, OperationReporter, ServiceError
+from ..media.container_exif import SUPPORTED_EXTENSIONS as CONTAINER_EXTENSIONS, read_container_metadata
 from .models import FileMetadata
 
 try:
@@ -27,6 +28,11 @@ class MetadataExtractor:
         stat = candidate.stat()
         mime_type, _encoding = mimetypes.guess_type(candidate.name)
         media_type = (mime_type or "application/octet-stream").split("/", 1)[0]
+        if candidate.suffix.lower() in CONTAINER_EXTENSIONS:
+            # Windows only maps RAW extensions to image types when camera codecs
+            # are installed; without them an iPhone HEIC or a CR2 was filed
+            # under "Application".
+            media_type = "image"
         width = height = 0
         captured = 0.0
         attributes: dict[str, object] = {}
@@ -52,6 +58,16 @@ class MetadataExtractor:
                         captured = datetime.strptime(str(raw_date), "%Y:%m:%d %H:%M:%S").timestamp()
             except (OSError, TypeError, ValueError):
                 pass
+        if media_type == "image" and candidate.suffix.lower() in CONTAINER_EXTENSIONS and not captured:
+            # Pillow cannot open HEIC or most RAW files; read their EXIF directly.
+            container = read_container_metadata(candidate)
+            captured = container.captured or captured
+            if not (width and height) and container.width and container.height:
+                width, height = container.width, container.height
+            if container.make:
+                attributes.setdefault("camera_make", container.make)
+            if container.model:
+                attributes.setdefault("camera_model", container.model)
         elif media_type == "video":
             video = self._video_metadata(candidate)
             width = int(video.get("width", 0) or 0)
