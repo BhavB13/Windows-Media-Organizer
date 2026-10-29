@@ -7,7 +7,7 @@ import subprocess
 from datetime import UTC, datetime
 from copy import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from adb_bridge import ADBBridge, ADBOperationError
+from adb_bridge import ADBBridge, ADBOperationError, describe_device_state
 from discovery import discover_files
 from drive_cache import ADBHashCache, DriveHashCache, default_adb_cache_path, default_cache_path
 from models import FileInfo
@@ -464,7 +464,7 @@ def validate_transfer_paths(settings):
         source_root = normalized_source
         device_state = ADBBridge.get_device_state(getattr(settings, "adb_serial", "").strip())
         if device_state and device_state != "device":
-            return f"Selected ADB device is {device_state}. Authorize USB debugging on the phone before starting a transfer."
+            return f"The selected phone is not ready ({device_state}). {describe_device_state(device_state)}"
         path_status = ADBBridge.remote_path_status(source_root, serial=getattr(settings, "adb_serial", "").strip())
         if path_status != "dir":
             return f"ADB source folder is not accessible: {source_root} ({path_status}). Try /sdcard/DCIM or /storage/emulated/0/DCIM."
@@ -532,7 +532,7 @@ def validate_scan_paths(settings):
         scan_root = normalized_scan_root
         device_state = ADBBridge.get_device_state(getattr(settings, "adb_serial", "").strip())
         if device_state and device_state != "device":
-            return f"Selected ADB device is {device_state}. Authorize USB debugging on the phone before starting an ADB scan."
+            return f"The selected phone is not ready ({device_state}). {describe_device_state(device_state)}"
         path_status = ADBBridge.remote_path_status(scan_root, serial=getattr(settings, "adb_serial", "").strip())
         if path_status != "dir":
             return f"ADB scan folder is not accessible: {scan_root} ({path_status}). Try /sdcard/DCIM or /storage/emulated/0/DCIM."
