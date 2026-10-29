@@ -324,13 +324,16 @@ class LibraryPage(BasePage):
         self._apply_analytics(self.analytics_data)
         self._apply_search_page(self.search_page_data)
 
-        # If the catalog database already exists with data on disk, load its state.
+        # If the catalog database already exists with data on disk, load its
+        # state in the background. The page is built while the main window is
+        # being constructed, so waiting here would freeze application start-up
+        # for as long as the catalog takes to summarise; callers that need the
+        # loaded state call wait_for_done themselves.
         if (
             str(self.service.db_path) == ":memory:"
             or (self.service.db_path.exists() and self.service.db_path.stat().st_size > 0)
         ):
             self.refresh()
-            self.wait_for_done(2000)
 
         self.finish()
 

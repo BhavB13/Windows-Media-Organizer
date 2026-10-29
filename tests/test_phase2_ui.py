@@ -249,6 +249,7 @@ class Phase2UiTests(unittest.TestCase):
             {
                 "overview",
                 "audit",
+                "library",
                 "duplicates",
                 "import",
                 "sort",
@@ -838,10 +839,43 @@ class Phase2UiTests(unittest.TestCase):
 
     def test_navigation_controls_have_keyboard_shortcuts_and_focus_policy(self):
         self.assertEqual(len(self.window.sidebar.shortcuts), len(ROUTES))
+        bound = {
+            route.key: shortcut.key().toString()
+            for route, shortcut in zip(ROUTES, self.window.sidebar.shortcuts)
+        }
+        # The original nine keep the shortcuts people already know; Library,
+        # added later beside Disk Audit, takes the free Alt+0.
         self.assertEqual(
-            [shortcut.key().toString() for shortcut in self.window.sidebar.shortcuts],
-            [f"Alt+{index}" for index in range(1, 10)],
+            bound,
+            {
+                "overview": "Alt+1",
+                "audit": "Alt+2",
+                "library": "Alt+0",
+                "duplicates": "Alt+3",
+                "import": "Alt+4",
+                "sort": "Alt+5",
+                "activity": "Alt+6",
+                "quarantine": "Alt+7",
+                "settings": "Alt+8",
+                "help": "Alt+9",
+            },
         )
+        self.assertEqual(len(set(bound.values())), len(bound))
+
+    def test_library_page_is_reachable_and_guarded_at_shutdown(self):
+        from duplicate_transfer_manager.ui.library_page import LibraryPage
+
+        # The page existed for a while with no route to it.
+        self.window.navigate("library")
+        self.assertIsInstance(self.window.stack.currentWidget(), LibraryPage)
+        library = self.window.pages["library"]
+        # Opening the page loads the catalog in the background; let it finish
+        # so tearDown does not close the window on running work.
+        self.assertTrue(library.wait_for_done(5000))
+
+        # An index in progress must hold the window open like any other job.
+        with patch.object(type(library.controller), "busy", new_callable=PropertyMock, return_value=True):
+            self.assertIn(library.controller, self.window._busy_controllers())
         for route in ROUTES:
             button = self.window.sidebar.buttons[route.key]
             self.assertTrue(button.accessibleName())

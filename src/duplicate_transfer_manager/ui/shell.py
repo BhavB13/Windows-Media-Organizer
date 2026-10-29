@@ -44,6 +44,7 @@ from .pages import (
     SettingsPage,
 )
 from .disk_audit_page import DiskAuditPage
+from .library_page import LibraryPage
 from .sort_workspace import SortWorkspace
 from .theme import Spacing, ThemeManager
 from .widgets import add_shortcut, set_accessible
@@ -60,6 +61,9 @@ class Route:
 ROUTES = (
     Route("overview", "Overview", "overview", "Alt+1"),
     Route("audit", "Disk Audit", "drive", "Alt+2"),
+    # Sits beside Disk Audit because both answer "what is on my storage", but
+    # takes Alt+0 so the nine shortcuts people already know do not move.
+    Route("library", "Library", "library", "Alt+0"),
     Route("duplicates", "Find Duplicates", "duplicates", "Alt+3"),
     Route("import", "Import Files", "import", "Alt+4"),
     Route("sort", "Sort Files", "folder", "Alt+5"),
@@ -270,6 +274,7 @@ class MainWindow(QMainWindow):
                 settings_service,
                 self.operation_records,
             ),
+            "library": LibraryPage(self.runtime_paths, settings),
             "duplicates": DuplicatesPage(
                 hash_cache=hash_cache,
                 quarantine_service=DuplicateQuarantineService(self.runtime_paths),
@@ -377,8 +382,8 @@ class MainWindow(QMainWindow):
 
     def _busy_controllers(self) -> list:
         controllers = []
-        for key in ("audit", "duplicates", "import", "sort"):
-            for attribute in ("controller", "device_controller"):
+        for key in ("audit", "library", "duplicates", "import", "sort"):
+            for attribute in ("controller", "search_controller", "device_controller"):
                 controller = getattr(self.pages.get(key), attribute, None)
                 if controller is not None and controller.busy:
                     controllers.append(controller)
@@ -448,6 +453,8 @@ class MainWindow(QMainWindow):
 
         controllers = (
             self.pages["audit"].controller,
+            self.pages["library"].controller,
+            self.pages["library"].search_controller,
             self.pages["duplicates"].controller,
             self.pages["import"].controller,
             self.pages["sort"].controller,
