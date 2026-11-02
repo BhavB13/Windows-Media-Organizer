@@ -2682,16 +2682,16 @@ class QuarantinePage(BasePage):
         toolbar.addLayout(action_row)
         self.content.addWidget(toolbar_card)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
-            ["Restore", "Operation", "Original path", "Quarantined copy", "Size", "Device", "Status"]
+            ["Restore", "Operation", "Reason", "Original path", "Quarantined copy", "Size", "Device", "Status"]
         )
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setColumnWidth(0, 72)
         self.table.setMinimumHeight(340)
@@ -2729,6 +2729,15 @@ class QuarantinePage(BasePage):
         self.refresh()
         self.finish()
 
+    @staticmethod
+    def _format_reason(reason: str | None) -> str:
+        raw = str(reason or "").strip()
+        if not raw or raw.lower() == "duplicate":
+            return "Duplicate"
+        if raw.lower() == "similar":
+            return "Similar photo"
+        return raw.title()
+
     def refresh(self) -> None:
         self.records = self.service.list_records()
         query = self.search.text().lower().strip()
@@ -2756,10 +2765,11 @@ class QuarantinePage(BasePage):
             check.toggled.connect(lambda checked, target_row=row: self._quarantine_selection_changed(target_row, checked))
             self.table.setCellWidget(row, 0, check)
             self.table.setItem(row, 1, QTableWidgetItem(record.operation_id))
-            self.table.setItem(row, 2, QTableWidgetItem(record.original_path))
-            self.table.setItem(row, 3, QTableWidgetItem(record.stored_path))
-            self.table.setItem(row, 4, QTableWidgetItem(format_duplicate_size(record.size)))
-            self.table.setItem(row, 5, QTableWidgetItem("Android" if record.source_is_adb else "This PC"))
+            self.table.setItem(row, 2, QTableWidgetItem(self._format_reason(record.reason)))
+            self.table.setItem(row, 3, QTableWidgetItem(record.original_path))
+            self.table.setItem(row, 4, QTableWidgetItem(record.stored_path))
+            self.table.setItem(row, 5, QTableWidgetItem(format_duplicate_size(record.size)))
+            self.table.setItem(row, 6, QTableWidgetItem("Android" if record.source_is_adb else "This PC"))
             status = (
                 f"Restored to {record.restored_path}"
                 if record.restored_at
@@ -2767,7 +2777,7 @@ class QuarantinePage(BasePage):
                 if record.source_is_adb
                 else "Ready to restore"
             )
-            self.table.setItem(row, 6, QTableWidgetItem(status))
+            self.table.setItem(row, 7, QTableWidgetItem(status))
         total = sum(record.size for record in active)
         operations = len({record.operation_id for record in active})
         self.empty.setVisible(not active)
@@ -2810,6 +2820,7 @@ class QuarantinePage(BasePage):
         detail = [
             f"Original: {record.original_path}",
             f"Quarantined: {record.stored_path}",
+            f"Reason: {self._format_reason(record.reason)}",
             f"Size: {format_duplicate_size(record.size)}",
             "Source: Android copy" if record.source_is_adb else "Source: This PC",
         ]
