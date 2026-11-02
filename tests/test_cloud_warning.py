@@ -210,7 +210,7 @@ class PageWarningTests(unittest.TestCase):
     def _run(self, assessment, answer):
         starts = []
         with patch("duplicate_transfer_manager.ui.pages.assess_cloud_downloads", return_value=assessment), \
-                patch.object(QMessageBox, "question", return_value=answer) as asked, \
+                patch("duplicate_transfer_manager.ui.pages.ask_cloud_choice", return_value=answer) as asked, \
                 patch.object(self.page.controller, "start", side_effect=lambda s: starts.append(s) or True):
             self.page._start_scan()
             self._drain(lambda: starts or self.page.scan_button.isEnabled())
@@ -218,25 +218,25 @@ class PageWarningTests(unittest.TestCase):
         return starts, asked
 
     def test_declining_the_warning_starts_nothing(self):
-        starts, asked = self._run(self._assessment(True), QMessageBox.StandardButton.No)
+        starts, asked = self._run(self._assessment(True), "cancel")
         self.assertEqual(asked.call_count, 1)
         self.assertEqual(starts, [])
         self.assertTrue(self.page.scan_button.isEnabled())
 
     def test_accepting_the_warning_starts_the_scan_once(self):
-        starts, asked = self._run(self._assessment(True), QMessageBox.StandardButton.Yes)
+        starts, asked = self._run(self._assessment(True), "download")
         self.assertEqual(asked.call_count, 1)
         self.assertEqual(len(starts), 1)
 
     def test_nothing_to_download_starts_without_asking(self):
-        starts, asked = self._run(self._assessment(False), QMessageBox.StandardButton.No)
+        starts, asked = self._run(self._assessment(False), "cancel")
         self.assertEqual(asked.call_count, 0)
         self.assertEqual(len(starts), 1)
 
     def test_a_broken_check_does_not_block_the_scan(self):
         starts = []
         with patch("duplicate_transfer_manager.ui.pages.assess_cloud_downloads", side_effect=RuntimeError("boom")), \
-                patch.object(QMessageBox, "question") as asked, \
+                patch("duplicate_transfer_manager.ui.pages.ask_cloud_choice") as asked, \
                 patch.object(self.page.controller, "start", side_effect=lambda s: starts.append(s) or True):
             self.page._start_scan()
             self._drain(lambda: starts)

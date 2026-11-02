@@ -25,6 +25,10 @@ from ..core import storage_class
 
 DEFAULT_TIME_BUDGET_SECONDS = 10.0
 
+CHOICE_SKIP = "skip"
+CHOICE_DOWNLOAD = "download"
+CHOICE_CANCEL = "cancel"
+
 
 @dataclass(frozen=True)
 class CloudDownloadAssessment:
