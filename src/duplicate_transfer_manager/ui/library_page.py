@@ -225,6 +225,7 @@ class LibraryController(BaseOperationController):
         label: str = "",
         filesystem: str = "",
         compute_hashes: bool = False,
+        compute_perceptual: bool = False,
         search_params: dict[str, Any] | None = None,
     ) -> bool:
         folder_str = str(folder_path)
@@ -245,6 +246,7 @@ class LibraryController(BaseOperationController):
                 label=label,
                 filesystem=filesystem,
                 compute_hashes=compute_hashes,
+                compute_perceptual=compute_perceptual,
                 cancellation=cancellation,
                 reporter=reporter,
             )
@@ -374,6 +376,51 @@ class LibraryController(BaseOperationController):
             return OperationResult(
                 status=OperationState.COMPLETED,
                 data={"operation": "cameras", "cameras": cameras},
+            )
+
+        return self.start_task(_task)
+
+    def start_find_similar(
+        self,
+        record_or_path: Any,
+        *,
+        sensitivity: str = "balanced",
+    ) -> bool:
+        def _task(
+            cancellation: CancellationToken,
+            reporter: OperationReporter,
+        ) -> OperationResult:
+            reporter.set_state(
+                OperationState.SCANNING,
+                phase=OperationPhase.DISCOVERY,
+                message="Finding similar photos…",
+            )
+            try:
+                matches = self.service.find_similar(
+                    record_or_path,
+                    sensitivity=sensitivity,
+                    stop_event=cancellation,
+                )
+            except Exception as exc:
+                return OperationResult(
+                    status=OperationState.FAILED,
+                    error=exc,
+                    data={"operation": "similar", "target": record_or_path},
+                )
+
+            if cancellation.is_cancelled():
+                return OperationResult(
+                    status=OperationState.CANCELLED,
+                    data={"operation": "similar", "target": record_or_path},
+                )
+            return OperationResult(
+                status=OperationState.COMPLETED,
+                counts={"matches": len(matches)},
+                data={
+                    "operation": "similar",
+                    "target": record_or_path,
+                    "matches": matches,
+                },
             )
 
         return self.start_task(_task)
@@ -523,6 +570,20 @@ class LibraryPage(BasePage):
         )
         self.hash_checkbox = self.compute_hashes_check
 
+        self.compute_perceptual_check = QCheckBox("Compare photos for similarity")
+        self.compute_perceptual_check.setChecked(False)
+        set_accessible(
+            self.compute_perceptual_check,
+            "Compare photos for similarity",
+            "Optional. Off by default because perceptual hashing decodes every new image. Enable to find similar photos in the catalog.",
+        )
+        self.similarity_checkbox = self.compute_perceptual_check
+
+        options_box = QVBoxLayout()
+        options_box.setSpacing(Spacing.XS)
+        options_box.addWidget(self.compute_hashes_check)
+        options_box.addWidget(self.compute_perceptual_check)
+
         self.refresh_button = QPushButton("Refresh summary")
         set_accessible(
             self.refresh_button,
@@ -537,7 +598,7 @@ class LibraryPage(BasePage):
             "Start incremental catalog indexing in the background.",
         )
 
-        controls_row.addWidget(self.compute_hashes_check, 1)
+        controls_row.addLayout(options_box, 1)
         controls_row.addWidget(self.refresh_button)
         controls_row.addWidget(self.index_button)
         layout.addLayout(controls_row)
@@ -701,12 +762,20 @@ class LibraryPage(BasePage):
         layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
         layout.setSpacing(Spacing.MD)
 
-        layout.addWidget(
-            SectionHeader(
-                "Search Catalog",
-                "Filter indexed files by media kind, filename, size range, and capture date range with paged results.",
-            )
+        self.search_header = SectionHeader(
+            "Search Catalog",
+            "Filter indexed files by media kind, filename, size range, and capture date range with paged results.",
         )
+        layout.addWidget(self.search_header)
+
+        self.heading_label = None
+        for lbl in self.search_header.findChildren(QLabel):
+            if lbl.property("role") == "section":
+                self.heading_label = lbl
+                break
+        if self.heading_label is None:
+            self.heading_label = QLabel("Search Catalog")
+        self.search_heading_label = self.heading_label
 
         filter_grid = QGridLayout()
         filter_grid.setSpacing(Spacing.SM)
@@ -840,6 +909,23 @@ class LibraryPage(BasePage):
             "Reset all search filter fields and reload the first page.",
         )
 
+        self.back_button = QPushButton("Back to search")
+        self.back_button.hide()
+        set_accessible(
+            self.back_button,
+            "Back to search results",
+            "Return to the previous catalog search results.",
+        )
+        self.back_to_search_button = self.back_button
+
+        self.find_similar_button = QPushButton("Find similar")
+        set_accessible(
+            self.find_similar_button,
+            "Find similar photos",
+            "Find catalog photos visually similar to the selected item.",
+        )
+        self.find_similar_btn = self.find_similar_button
+
         self.search_button = PrimaryButton("Search")
         set_accessible(
             self.search_button,
@@ -854,6 +940,8 @@ class LibraryPage(BasePage):
         action_row.addWidget(self.table_button)
         action_row.addWidget(self.gallery_button)
         action_row.addStretch(1)
+        action_row.addWidget(self.back_button)
+        action_row.addWidget(self.find_similar_button)
         action_row.addWidget(self.clear_filters_button)
         action_row.addWidget(self.search_button)
         layout.addLayout(action_row)
@@ -940,6 +1028,7 @@ class LibraryPage(BasePage):
             self.folder_selector.entry,
             self.folder_selector.browse_button,
             self.compute_hashes_check,
+            self.compute_perceptual_check,
             self.refresh_button,
             self.index_button,
             self.media_kind_filter,
@@ -952,6 +1041,8 @@ class LibraryPage(BasePage):
             self.page_size_combo,
             self.table_button,
             self.gallery_button,
+            self.back_button,
+            self.find_similar_button,
             self.clear_filters_button,
             self.search_button,
             self.results_table,
@@ -969,6 +1060,8 @@ class LibraryPage(BasePage):
 
         self.table_button.clicked.connect(lambda: self.set_view_mode("table"))
         self.gallery_button.clicked.connect(lambda: self.set_view_mode("gallery"))
+        self.back_button.clicked.connect(self.back_to_search)
+        self.find_similar_button.clicked.connect(lambda: self.find_similar())
         self.search_button.clicked.connect(lambda: self.start_search(page=1))
         self.clear_filters_button.clicked.connect(self.clear_filters)
         self.filename_filter.returnPressed.connect(lambda: self.start_search(page=1))
@@ -1044,12 +1137,15 @@ class LibraryPage(BasePage):
         label: str = "",
         filesystem: str = "",
         compute_hashes: bool | None = None,
+        compute_perceptual: bool | None = None,
     ) -> bool:
         """Start indexing ``folder_path`` on a Qt worker thread."""
         if folder_path is not None:
             self.folder_selector.set_path(str(folder_path))
         if compute_hashes is not None:
             self.compute_hashes_check.setChecked(bool(compute_hashes))
+        if compute_perceptual is not None:
+            self.compute_perceptual_check.setChecked(bool(compute_perceptual))
 
         target = self.folder_selector.path()
         if not target:
@@ -1059,6 +1155,7 @@ class LibraryPage(BasePage):
 
         self.folder_selector.set_error("")
         eff_hashes = self.compute_hashes_check.isChecked()
+        eff_perceptual = self.compute_perceptual_check.isChecked()
         self._current_page = 1
         search_params = self._collect_search_kwargs(page=1)
 
@@ -1083,6 +1180,7 @@ class LibraryPage(BasePage):
             label=label,
             filesystem=filesystem,
             compute_hashes=eff_hashes,
+            compute_perceptual=eff_perceptual,
             search_params=search_params,
         )
         if not started:
@@ -1103,6 +1201,18 @@ class LibraryPage(BasePage):
     def start_search(self, *, page: int | None = None, **extra_kwargs: Any) -> bool:
         """Run a paged catalog search on a Qt worker thread."""
         self._cancel_thumbnail_generation()
+        self._is_similar_mode = False
+        if hasattr(self, "back_button"):
+            self.back_button.hide()
+        if hasattr(self, "heading_label") and self.heading_label is not None:
+            self.heading_label.setText("Search Catalog")
+        if hasattr(self, "search_header") and self.search_header is not None:
+            for lbl in self.search_header.findChildren(QLabel):
+                if lbl.property("muted"):
+                    lbl.setText(
+                        "Filter indexed files by media kind, filename, size range, and capture date range with paged results."
+                    )
+                    break
         if page is not None:
             self._current_page = max(1, int(page))
         try:
@@ -1131,6 +1241,18 @@ class LibraryPage(BasePage):
         return self.search_controller.start_refresh(**kwargs)
 
     def clear_filters(self) -> None:
+        self._is_similar_mode = False
+        if hasattr(self, "back_button"):
+            self.back_button.hide()
+        if hasattr(self, "heading_label") and self.heading_label is not None:
+            self.heading_label.setText("Search Catalog")
+        if hasattr(self, "search_header") and self.search_header is not None:
+            for lbl in self.search_header.findChildren(QLabel):
+                if lbl.property("muted"):
+                    lbl.setText(
+                        "Filter indexed files by media kind, filename, size range, and capture date range with paged results."
+                    )
+                    break
         self.media_kind_filter.setCurrentIndex(0)
         self.camera_filter.blockSignals(True)
         self.camera_filter.setCurrentIndex(0)
@@ -1197,6 +1319,8 @@ class LibraryPage(BasePage):
         self.folder_selector.entry.setEnabled(not busy)
         self.folder_selector.browse_button.setEnabled(not busy)
         self.compute_hashes_check.setEnabled(not busy)
+        if hasattr(self, "compute_perceptual_check"):
+            self.compute_perceptual_check.setEnabled(not busy)
 
     def _on_progress(self, event: OperationEvent) -> None:
         if not self.controller.busy:
@@ -1261,6 +1385,10 @@ class LibraryPage(BasePage):
             if search_page is not None:
                 self._apply_search_page(search_page)
                 self.search_completed.emit(search_page)
+        elif op == "similar":
+            target = data.get("target")
+            matches = data.get("matches", [])
+            self._apply_similar_results(target, matches)
 
     def _on_cancelled(self, result: OperationResult) -> None:
         data = result.data or {}
@@ -1367,6 +1495,8 @@ class LibraryPage(BasePage):
         self.results_table.setRowCount(len(items))
         for row_idx, rec in enumerate(items):
             status_text = "Online" if rec.volume_online else "Offline (not mounted)"
+            if rec.distance is not None:
+                status_text = f"{status_text} (dist: {rec.distance})"
             vol_text = (
                 rec.volume_label or rec.volume_key
                 if rec.volume_online
@@ -1400,17 +1530,28 @@ class LibraryPage(BasePage):
             item.setData(Qt.ItemDataRole.UserRole, rec.id)
             item.setData(Qt.ItemDataRole.UserRole + 1, rec)
             item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-            item.setToolTip(f"{rec.filename}\n{rec.relative_path}")
+            dist_tooltip = f"\nDistance: {rec.distance}" if rec.distance is not None else ""
+            item.setToolTip(f"{rec.filename}{dist_tooltip}\n{rec.relative_path}")
 
             if rec.is_offline:
-                item.setText(f"{rec.filename}\nOffline\n{cap_text}")
+                offline_label = (
+                    f"{rec.filename}\nOffline (dist: {rec.distance})\n{cap_text}"
+                    if rec.distance is not None
+                    else f"{rec.filename}\nOffline\n{cap_text}"
+                )
+                item.setText(offline_label)
                 item.setIcon(_create_placeholder_icon("Offline"))
             elif rec.media_kind != "image":
                 item.setText(f"{rec.filename}\n{cap_text}")
                 label = rec.media_kind.upper()[:5] if rec.media_kind else "FILE"
                 item.setIcon(_create_placeholder_icon(label))
             else:
-                item.setText(f"{rec.filename}\n{cap_text}")
+                img_label = (
+                    f"{rec.filename}\nDist: {rec.distance}\n{cap_text}"
+                    if rec.distance is not None
+                    else f"{rec.filename}\n{cap_text}"
+                )
+                item.setText(img_label)
                 item.setIcon(_create_placeholder_icon("Loading…"))
                 if rec.volume_root:
                     full_path = Path(rec.volume_root) / rec.relative_path
@@ -1538,6 +1679,117 @@ class LibraryPage(BasePage):
     def _on_thumbnail_worker_finished(self, gen_id: int) -> None:
         if gen_id == self._thumbnail_generation_id:
             self._thumbnail_cancellation = None
+
+    def get_selected_item(self) -> CatalogSearchItem | None:
+        """Return the currently selected CatalogSearchItem in table or gallery view."""
+        if self.view_mode == "gallery":
+            item = self.gallery_widget.currentItem()
+            if item is not None:
+                rec = item.data(Qt.ItemDataRole.UserRole + 1)
+                if isinstance(rec, CatalogSearchItem):
+                    return rec
+        row = self.results_table.currentRow()
+        if 0 <= row < len(self.search_page_data.items):
+            return self.search_page_data.items[row]
+        item = self.gallery_widget.currentItem()
+        if item is not None:
+            rec = item.data(Qt.ItemDataRole.UserRole + 1)
+            if isinstance(rec, CatalogSearchItem):
+                return rec
+        return None
+
+    def find_similar(
+        self,
+        item: Any = None,
+        *,
+        sensitivity: str = "balanced",
+    ) -> bool:
+        """Find photos in the catalog similar to the selected item (runs off main thread)."""
+        target = item if item is not None else self.get_selected_item()
+        if target is None:
+            self._show_message("Select a photo first to find similar photos.", "warning")
+            return False
+
+        if isinstance(target, CatalogSearchItem):
+            if not target.perceptual_hash:
+                self._show_message(
+                    "Photo has no stored similarity hash. Re-index with 'Compare photos for similarity' enabled.",
+                    "warning",
+                )
+                return False
+
+        self._previous_search_page = self.search_page_data
+        self._previous_heading = (
+            self.heading_label.text()
+            if hasattr(self, "heading_label") and self.heading_label is not None
+            else "Search Catalog"
+        )
+        self._previous_current_page = self._current_page
+        self._is_similar_mode = True
+
+        if self.search_controller.busy:
+            self.search_controller.cancel()
+            self.search_controller.wait_for_done(1000)
+
+        return self.search_controller.start_find_similar(target, sensitivity=sensitivity)
+
+    start_find_similar = find_similar
+
+    def back_to_search(self) -> None:
+        """Restore the previous search results and heading."""
+        self._is_similar_mode = False
+        if hasattr(self, "back_button"):
+            self.back_button.hide()
+        if hasattr(self, "heading_label") and self.heading_label is not None:
+            self.heading_label.setText(getattr(self, "_previous_heading", "Search Catalog"))
+        if hasattr(self, "search_header") and self.search_header is not None:
+            for lbl in self.search_header.findChildren(QLabel):
+                if lbl.property("muted"):
+                    lbl.setText(
+                        "Filter indexed files by media kind, filename, size range, and capture date range with paged results."
+                    )
+                    break
+        prev_page = getattr(self, "_previous_search_page", None)
+        if prev_page is not None:
+            self._apply_search_page(prev_page)
+
+    def _apply_similar_results(
+        self,
+        target: Any,
+        matches: list[CatalogSearchItem],
+    ) -> None:
+        """Display similarity search results in the existing table/gallery views."""
+        target_name = (
+            target.filename
+            if hasattr(target, "filename")
+            else Path(str(target)).name
+        )
+        heading_text = f"Photos similar to {target_name}"
+        if hasattr(self, "heading_label") and self.heading_label is not None:
+            self.heading_label.setText(heading_text)
+        if hasattr(self, "search_header") and self.search_header is not None:
+            for lbl in self.search_header.findChildren(QLabel):
+                if lbl.property("muted"):
+                    lbl.setText(
+                        f"Found {len(matches)} similar photo(s) in catalog, nearest first."
+                    )
+                    break
+        if hasattr(self, "back_button"):
+            self.back_button.show()
+
+        similar_page = CatalogSearchPage(
+            items=tuple(matches),
+            total_count=len(matches),
+            limit=len(matches),
+            offset=0,
+            page=1 if matches else 0,
+            total_pages=1 if matches else 0,
+            has_next=False,
+            has_previous=False,
+        )
+        self._apply_search_page(similar_page)
+        if not matches:
+            self._show_message(f"No similar photos found for {target_name}.", "info")
 
     def open_item(self, item: CatalogSearchItem | Path | str) -> bool:
         """Open the containing folder with the file selected via the configured opener."""
