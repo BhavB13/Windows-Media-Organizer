@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ..core import CancellationToken, ErrorCode, OperationReporter, ServiceError
+from ..media.video_meta import read_video_metadata
 from ..media.container_exif import SUPPORTED_EXTENSIONS as CONTAINER_EXTENSIONS, read_container_metadata
 from .models import FileMetadata
 
@@ -72,6 +73,7 @@ class MetadataExtractor:
             video = self._video_metadata(candidate)
             width = int(video.get("width", 0) or 0)
             height = int(video.get("height", 0) or 0)
+            captured = float(video.get("captured", 0) or 0) or captured
             attributes.update(video)
         return FileMetadata(
             path=str(candidate.resolve()), name=candidate.name, extension=candidate.suffix.lower(),
@@ -83,21 +85,31 @@ class MetadataExtractor:
     @staticmethod
     def _video_metadata(path: Path) -> dict[str, object]:
         executable = shutil.which("ffprobe")
-        if not executable:
-            return {}
-        try:
-            completed = subprocess.run(
-                [executable, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration:format=duration", "-of", "json", str(path)],
-                capture_output=True, text=True, timeout=15, check=False,
-            )
-            if completed.returncode != 0:
-                return {}
-            payload = json.loads(completed.stdout or "{}")
-            stream = (payload.get("streams") or [{}])[0]
-            duration = stream.get("duration") or payload.get("format", {}).get("duration") or 0
-            return {"width": int(stream.get("width", 0) or 0), "height": int(stream.get("height", 0) or 0), "duration": float(duration)}
-        except (OSError, subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError):
-            return {}
+        # ffprobe, when installed, measures the stream; it does not report when
+        # the clip was shot or on what. Those always come from the container.
+        meta = read_video_metadata(path)
+        extra: dict[str, object] = {"captured": meta.captured}
+        if meta.make:
+            extra["camera_make"] = meta.make
+        if meta.model:
+            extra["camera_model"] = meta.model
+        if executable:
+            try:
+                completed = subprocess.run(
+                    [executable, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration:format=duration", "-of", "json", str(path)],
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+                if completed.returncode == 0:
+                    payload = json.loads(completed.stdout or "{}")
+                    stream = (payload.get("streams") or [{}])[0]
+                    duration = stream.get("duration") or payload.get("format", {}).get("duration") or 0
+                    width = int(stream.get("width", 0) or 0)
+                    height = int(stream.get("height", 0) or 0)
+                    if width or height or duration:
+                        return {"width": width, "height": height, "duration": float(duration), **extra}
+            except (OSError, subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+        return {"width": meta.width, "height": meta.height, "duration": meta.duration, **extra}
 
 
 class SortScanner:
