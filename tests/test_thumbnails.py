@@ -577,3 +577,46 @@ class ThumbnailCacheTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IncrementalEvictionTests(unittest.TestCase):
+    """Eviction used to walk the whole cache after every new thumbnail."""
+
+    def _photos(self, folder: Path, count: int) -> list[Path]:
+        from PIL import Image as _Image
+
+        paths = []
+        for index in range(count):
+            path = folder / f"p{index:03}.jpg"
+            _Image.new("RGB", (64, 48), (index * 3 % 256, 90, 160)).save(path, "JPEG")
+            paths.append(path)
+        return paths
+
+    def test_writes_under_budget_do_not_walk_the_cache_each_time(self):
+        from unittest import mock
+
+        from duplicate_transfer_manager.previews.thumbnails import ThumbnailCache
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            photos = self._photos(root, 60)
+            cache = ThumbnailCache(cache_dir=str(root / "cache"), max_bytes=64 * 1024 * 1024)
+            walks = []
+            real = cache._collect_cache_entries
+            with mock.patch.object(cache, "_collect_cache_entries", side_effect=lambda: walks.append(1) or real()):
+                for photo in photos:
+                    self.assertIsNotNone(cache.get_or_create(str(photo), 32).thumbnail_path)
+            self.assertLessEqual(len(walks), 2, f"{len(walks)} full cache walks for 60 writes")
+
+    def test_the_budget_is_still_enforced(self):
+        from duplicate_transfer_manager.previews.thumbnails import ThumbnailCache
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            photos = self._photos(root, 40)
+            budget = 8 * 1024
+            cache = ThumbnailCache(cache_dir=str(root / "cache"), max_bytes=budget)
+            for photo in photos:
+                cache.get_or_create(str(photo), 32)
+            on_disk = sum(p.stat().st_size for p in (root / "cache").rglob("*") if p.is_file())
+            self.assertLessEqual(on_disk, budget)

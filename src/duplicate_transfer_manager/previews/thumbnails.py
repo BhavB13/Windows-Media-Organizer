@@ -371,6 +371,11 @@ class ThumbnailCache:
 
         self._lock = threading.RLock()
         self._evict_lock = threading.Lock()
+        # Running total of the cache's size, seeded by one full scan and grown
+        # by each write, so a full eviction walk runs only when the budget may
+        # actually be exceeded rather than after every thumbnail.
+        self._estimated_bytes: int | None = None
+        self._writes_since_recount: int = 0
         self._last_touch_ns: int = time.time_ns()
         self._orientation_memo: dict[tuple[str, int, int], int] = {}
         self._hits: int = 0
@@ -840,7 +845,7 @@ class ThumbnailCache:
             self._misses += 1
 
         if self.auto_evict:
-            self.evict()
+            self._note_write(target_path)
 
         return ThumbnailResult(
             source_path=source_str,
@@ -935,6 +940,33 @@ class ThumbnailCache:
                 continue
         return entries
 
+    # A full recount after this many writes corrects drift when another cache
+    # instance shares the same folder and writes to it too.
+    RECOUNT_EVERY_WRITES = 256
+
+    def _note_write(self, path: Path) -> None:
+        """Account for a new entry and evict only if the budget may be exceeded.
+
+        Walking and stat-ing every entry after each write made a cold review of
+        N photos cost O(N^2) directory visits even when everything fit.
+        """
+
+        try:
+            size = int(Path(path).stat().st_size)
+        except OSError:
+            size = 0
+        with self._lock:
+            needs_recount = (
+                self._estimated_bytes is None
+                or self._writes_since_recount >= self.RECOUNT_EVERY_WRITES
+            )
+            if not needs_recount:
+                self._estimated_bytes += size
+                self._writes_since_recount += 1
+                over_budget = self._estimated_bytes > self.max_bytes
+        if needs_recount or over_budget:
+            self.evict()
+
     def evict(self, max_bytes: int | None = None) -> EvictionResult:
         """Run a thread-safe least-recently-used (LRU) eviction pass to enforce the byte budget.
 
@@ -952,6 +984,7 @@ class ThumbnailCache:
             entries = self._collect_cache_entries()
             total_bytes = sum(size for _mtime, size, _path in entries)
             if total_bytes <= budget:
+                self._record_size(total_bytes)
                 return EvictionResult(
                     evicted_count=0,
                     evicted_bytes=0,
@@ -982,6 +1015,7 @@ class ThumbnailCache:
             with self._lock:
                 self._evicted_entries += len(evicted_paths)
                 self._evicted_bytes += evicted_bytes
+            self._record_size(total_bytes)
 
             return EvictionResult(
                 evicted_count=len(evicted_paths),
@@ -990,6 +1024,11 @@ class ThumbnailCache:
                 remaining_bytes=total_bytes,
                 evicted_paths=tuple(evicted_paths),
             )
+
+    def _record_size(self, total_bytes: int) -> None:
+        with self._lock:
+            self._estimated_bytes = int(total_bytes)
+            self._writes_since_recount = 0
 
     def clear(self) -> EvictionResult:
         """Evict all cached thumbnails inside the cache directory."""
