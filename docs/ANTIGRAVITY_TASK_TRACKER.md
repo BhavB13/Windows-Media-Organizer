@@ -307,3 +307,29 @@ thumbnails), W29 (live sort-template example), W30 (quarantine reason), W22
 - The Quarantine page does not yet show the new duplicate/similar reason.
 - `tests.test_similar_review` page tests can time out when run alongside a
   Gradle build; they pass alone.
+
+## Wave 6 on Gemini Flash (2026-11-02)
+
+Merged: W31 (Quarantine page Reason column), W32 (Android tree walk limits
+and destination grants), W33 (Similar Photos thumbnail isolation and cancel
+during the cloud check), W34 (README updates), W35 (thumbnail size ledger).
+
+### Coordinator corrections
+
+- **W32** removed library items by folder display name when a folder was
+  removed or chosen as destination, which also dropped any other granted folder
+  with the same name; now matched by tree URI.
+- **W33** was a real find: Similar Photos wrote thumbnails into the default
+  AppData cache regardless of its runtime paths, and each scan's first write
+  stat'ed every cached file. Two-photo scan 7.08 s -> 0.27 s;
+  `tests.test_similar_review` 272 s -> 18 s.
+- **W35** wrote the size ledger only at recounts, so instances that each wrote
+  fewer than 256 thumbnails would never recount and would trust a stale size
+  past the budget. The ledger now carries the writes-since-recount counter and
+  is refreshed every 16 writes.
+
+Full suite after wave 6: **654 tests, OK (1 skipped)**. Android `:organizer`:
+52 JVM tests and a debug APK build; still not run on a device.
+
+The Known limits above for the SAF browser and the Quarantine reason are
+resolved; the `test_similar_review` load flake is resolved by W33.
