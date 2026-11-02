@@ -20,6 +20,14 @@ from ..core import (
 from ..core.errors import ServiceError
 
 
+# Shown wherever a transfer stopped because its destination vanished; the
+# import page imports it so the wording cannot drift between the two.
+DESTINATION_DISCONNECTED_TEXT = (
+    "The destination drive was disconnected. Nothing on the source was changed. "
+    "Reconnect the drive and run the import again to continue where it stopped."
+)
+
+
 class TransferService:
     """Validate and execute a copy-only smart transfer."""
 
@@ -91,9 +99,10 @@ class TransferService:
         if hasattr(self.hash_cache, "save"):
             self.hash_cache.save()
 
+        destination_disconnected = bool(raw.get("destination_disconnected"))
         if cancellation.is_cancelled():
             status = OperationState.CANCELLED
-        elif raw.get("preflight_failed") or raw.get("adb_device_failed"):
+        elif raw.get("preflight_failed") or raw.get("adb_device_failed") or destination_disconnected:
             status = OperationState.FAILED
         else:
             status = OperationState.COMPLETED
@@ -101,7 +110,17 @@ class TransferService:
         error_count = int(raw.get("errors", 0))
         preflight_failed = bool(raw.get("preflight_failed"))
         failures = ()
-        if error_count:
+        if destination_disconnected:
+            disconnect_message = DESTINATION_DISCONNECTED_TEXT
+            failures = (
+                OperationFailure(
+                    code="destination_disconnected",
+                    message=disconnect_message,
+                    technical_detail=disconnect_message,
+                    recoverable=True,
+                ),
+            )
+        elif error_count:
             preflight_details = "; ".join(str(value) for value in raw.get("preflight_errors", []))
             message = (
                 f"Transfer did not start: {preflight_details or 'its safety checks found an issue.'}"
@@ -125,6 +144,8 @@ class TransferService:
 
         if status == OperationState.CANCELLED:
             closing_message = "Transfer cancelled safely."
+        elif destination_disconnected:
+            closing_message = DESTINATION_DISCONNECTED_TEXT
         elif status == OperationState.COMPLETED and error_count:
             # Reaching the end is not the same as succeeding. Saying "completed"
             # here contradicted the error count in the very same summary.
