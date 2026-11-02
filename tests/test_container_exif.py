@@ -14,7 +14,11 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
-from duplicate_transfer_manager.media.container_exif import parse_tiff, read_container_metadata
+from duplicate_transfer_manager.media.container_exif import (
+    CANON_CR3_UUID,
+    parse_tiff,
+    read_container_metadata,
+)
 from duplicate_transfer_manager.sorting.metadata import MetadataExtractor
 from duplicate_transfer_manager.sorting.planner import camera_tokens
 
@@ -99,6 +103,51 @@ def raf_file(exif_tiff: bytes) -> bytes:
     return header.ljust(jpeg_at, b"\x00") + jpeg
 
 
+def cr3_cmt_block(tags: dict[int, str], *, endian: str = "<", magic: int = 42) -> bytes:
+    """A minimal TIFF block where tags sit directly in IFD0."""
+    e = endian
+    order = b"II" if e == "<" else b"MM"
+    ifd0_offset = 8
+    data_offset = ifd0_offset + 2 + len(tags) * 12 + 4
+    entries = []
+    payload = b""
+    for tag in sorted(tags):
+        text = tags[tag]
+        raw = text.encode("latin-1") + b"\x00"
+        entries.append(struct.pack(e + "HHII", tag, 2, len(raw), data_offset + len(payload)))
+        payload += raw
+    out = order + struct.pack(e + "HI", magic, ifd0_offset)
+    out += struct.pack(e + "H", len(tags)) + b"".join(entries) + struct.pack(e + "I", 0)
+    return out + payload
+
+
+def cr3_file(
+    cmt1: bytes | None = None,
+    cmt2: bytes | None = None,
+    *,
+    canon_uuid: bytes | None = CANON_CR3_UUID,
+    include_mdat: bool = True,
+) -> bytes:
+    """Build a CR3 byte by byte: ftyp, moov -> uuid -> CMT1 + CMT2, mdat."""
+    cmt1_bytes = cr3_cmt_block({271: "Canon", 272: "Canon EOS R6m2"}) if cmt1 is None else cmt1
+    cmt2_bytes = cr3_cmt_block({36867: WHEN}) if cmt2 is None else cmt2
+    ftyp = box("ftyp", b"crx " + struct.pack(">I", 1) + b"crx " + b"isom")
+    if canon_uuid is not None:
+        uuid_payload = canon_uuid
+        if cmt1_bytes:
+            uuid_payload += box("CMT1", cmt1_bytes)
+        if cmt2_bytes:
+            uuid_payload += box("CMT2", cmt2_bytes)
+        moov_children = box("uuid", uuid_payload)
+    else:
+        moov_children = b""
+    moov = box("moov", moov_children)
+    out = ftyp + moov
+    if include_mdat:
+        out += box("mdat", b"\x00" * 32)
+    return out
+
+
 class ContainerExifTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -148,11 +197,71 @@ class ContainerExifTests(unittest.TestCase):
         self.assertEqual((meta.make, meta.model), ("FUJIFILM", "X-T5"))
         self.assertEqual(meta.captured, WHEN_TS)
 
+    def test_cr3_gives_date_and_camera_but_not_size(self):
+        path = self._write("IMG_0001.cr3", cr3_file())
+        meta = read_container_metadata(path)
+        self.assertEqual(meta.captured, WHEN_TS)
+        self.assertEqual((meta.make, meta.model), ("Canon", "Canon EOS R6m2"))
+        self.assertEqual((meta.width, meta.height), (0, 0), "CR3 IFDs do not describe sensor image")
+
+    def test_cr3_big_and_little_endian_cmt_blocks(self):
+        for endian, label in (("<", "le"), (">", "be")):
+            with self.subTest(endian=endian):
+                data = cr3_file(
+                    cmt1=cr3_cmt_block({271: "Canon", 272: "Canon EOS R6m2"}, endian=endian),
+                    cmt2=cr3_cmt_block({36867: WHEN}, endian=endian),
+                )
+                meta = read_container_metadata(self._write(f"sample_{label}.cr3", data))
+                self.assertEqual(meta.captured, WHEN_TS)
+                self.assertEqual((meta.make, meta.model), ("Canon", "Canon EOS R6m2"))
+
+    def test_cr3_with_no_canon_uuid_returns_empty(self):
+        for name, data in (
+            ("no_uuid.cr3", cr3_file(canon_uuid=None)),
+            ("other_uuid.cr3", cr3_file(canon_uuid=b"\x00" * 16)),
+        ):
+            with self.subTest(name=name):
+                meta = read_container_metadata(self._write(name, data))
+                self.assertTrue(meta.empty)
+                self.assertEqual(meta.captured, 0.0)
+
+    def test_cr3_truncated_cmt1(self):
+        # CMT1 with corrupted/truncated TIFF payload
+        truncated_cmt1 = cr3_file(cmt1=b"II*\x00\x08\x00\x00\x00\x05\x00" + b"\x00" * 10)
+        meta = read_container_metadata(self._write("corrupt_cmt1.cr3", truncated_cmt1))
+        self.assertEqual((meta.make, meta.model), ("", ""))
+        self.assertEqual(meta.captured, WHEN_TS)
+
+        # File truncated in the middle of CMT1 box
+        full = cr3_file()
+        cmt1_pos = full.find(b"CMT1")
+        meta_truncated = read_container_metadata(self._write("cut_cmt1.cr3", full[:cmt1_pos + 6]))
+        self.assertTrue(meta_truncated.empty)
+        self.assertEqual(meta_truncated.captured, 0.0)
+
+    def test_cr3_date_fallback(self):
+        # DateTimeDigitized (36868) in CMT2 when DateTimeOriginal (36867) is missing
+        data_digitized = cr3_file(cmt2=cr3_cmt_block({36868: WHEN}))
+        meta = read_container_metadata(self._write("digitized.cr3", data_digitized))
+        self.assertEqual(meta.captured, WHEN_TS)
+
+        # Fallback to CMT1 DateTime (306) when CMT2 has no date
+        data_cmt1_date = cr3_file(
+            cmt1=cr3_cmt_block({271: "Canon", 272: "Canon EOS R6m2", 306: WHEN}),
+            cmt2=cr3_cmt_block({}),
+        )
+        meta = read_container_metadata(self._write("cmt1_date.cr3", data_cmt1_date))
+        self.assertEqual(meta.captured, WHEN_TS)
+        self.assertEqual(meta.model, "Canon EOS R6m2")
+
     def test_malformed_input_yields_nothing_and_never_raises(self):
         cases = {
             "empty.heic": b"",
+            "empty.cr3": b"",
             "garbage.dng": os.urandom(4096),
+            "bad-cr3.cr3": os.urandom(4096),
             "truncated.heic": heic_file(tiff_block())[:60],
+            "truncated.cr3": cr3_file()[:50],
             "bad-raf.raf": b"FUJIFILMCCD-RAW".ljust(100, b"\xff"),
             "huge-count.dng": b"II*\x00\x08\x00\x00\x00" + b"\xff\xff" + b"\x00" * 20,
             "loop.cr2": b"II*\x00\x08\x00\x00\x00" + struct.pack("<H", 1) + struct.pack("<HHII", 34665, 4, 1, 8),
@@ -193,6 +302,18 @@ class ExtractorIntegrationTests(unittest.TestCase):
             metadata = MetadataExtractor().extract(path)
         self.assertEqual(metadata.captured, WHEN_TS)
         self.assertEqual(metadata.attributes.get("camera_model"), "Canon EOS R5")
+
+    def test_cr3_is_dated_and_classified_as_an_image(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "IMG_0001.CR3"
+            path.write_bytes(cr3_file())
+            metadata = MetadataExtractor().extract(path)
+        self.assertEqual(metadata.media_type, "image")
+        self.assertEqual(metadata.captured, WHEN_TS)
+        self.assertEqual((metadata.width, metadata.height), (0, 0))
+        self.assertEqual(metadata.attributes.get("camera_make"), "Canon")
+        self.assertEqual(metadata.attributes.get("camera_model"), "Canon EOS R6m2")
+        self.assertEqual(camera_tokens(metadata)["camera"], "Canon EOS R6m2")
 
 
 if __name__ == "__main__":
