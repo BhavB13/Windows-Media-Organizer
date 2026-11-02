@@ -1313,6 +1313,41 @@ class CatalogService:
             height=record.height,
         )
 
+    def distinct_cameras(self, *, stop_event: Any = None) -> list[tuple[str | None, str | None]]:
+        """Distinct (make, model) pairs in the catalog, ordered case-insensitively."""
+
+        if stop_event is not None and stop_event.is_set():
+            return []
+        try:
+            cat, should_close = self._open_catalog()
+            try:
+                if stop_event is not None and stop_event.is_set():
+                    return []
+                cursor = cat.connection.execute(
+                    """
+                    SELECT DISTINCT camera_make, camera_model
+                    FROM metadata
+                    WHERE (camera_make IS NOT NULL AND TRIM(camera_make) != '')
+                       OR (camera_model IS NOT NULL AND TRIM(camera_model) != '')
+                    ORDER BY camera_make COLLATE NOCASE, camera_model COLLATE NOCASE
+                    """
+                )
+                rows = cursor.fetchall()
+                cameras: list[tuple[str | None, str | None]] = []
+                for r in rows:
+                    if stop_event is not None and stop_event.is_set():
+                        return []
+                    make = str(r["camera_make"]).strip() if r["camera_make"] else None
+                    model = str(r["camera_model"]).strip() if r["camera_model"] else None
+                    if make or model:
+                        cameras.append((make, model))
+                return cameras
+            finally:
+                if should_close:
+                    cat.close()
+        except Exception:
+            return []
+
     def search(
         self,
         filter_spec: SearchFilter | None = None,
