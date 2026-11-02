@@ -103,6 +103,40 @@ Scans and copies run in a foreground service with an ongoing notification, a pro
 observes shared state while it is started, so rotation attaches a new Activity to the same run
 rather than restarting or leaking the old one.
 
+## Media Organizer (:organizer)
+
+The `:organizer` module provides photo and video browsing, duplicate detection, and date-based
+organization.
+
+### Folder access
+
+Users can add folders from device storage, external SD cards, and USB OTG drives using the Storage
+Access Framework (SAF). Source folders are strictly read-only; the organizer never requests write
+permissions for sources or modifies source media. On Android 10+ (API 29+), the folder picker
+automatically pre-points to detected removable volumes.
+
+### Large-folder notice
+
+Directory browsing uses a breadth-first search limited to 2,000 folders and 50,000 files. When a
+directory tree exceeds these limits or contains unreadable subfolders, the folder row displays a
+notice indicating that only the first batch of files is shown, rather than silently cutting them off.
+
+### Organize by date
+
+* **Copy-only**: Files are copied into `{year}/{month}` or `{year}/{month}/{day}` subfolders of a
+  selected destination tree. Originals are never moved, renamed, or deleted.
+* **Plan shown first**: An organize plan is computed and displayed before copying, showing file counts,
+  destination subfolders, and conflict resolutions.
+* **SHA-256 verification**: Every copy is verified by SHA-256 against the source. On mismatch or
+  cancellation, only the partially written destination file is deleted.
+* **Identical files skipped**: Files whose SHA-256 matches an existing file in the destination
+  subfolder are skipped.
+* **Name clashes disambiguated**: Files with conflicting names but different content are saved as
+  `name (1).ext`, `name (2).ext`, etc.
+
+The organizer has unit test coverage (`:organizer:testDebugUnitTest`), but has not yet been tested
+on a physical device.
+
 ## Build and test
 
 Use the helper script; it locates the JDK and SDK, regenerates `local.properties`, keeps the
