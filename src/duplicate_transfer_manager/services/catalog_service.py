@@ -45,6 +45,7 @@ from ..index import (
 )
 from ..runtime_paths import RuntimePaths, get_runtime_paths
 from ..sorting.metadata import MetadataExtractor
+from .similar_service import DEFAULT_SENSITIVITY, SENSITIVITY
 
 CATALOG_FILENAME = "library_catalog.sqlite3"
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -82,6 +83,7 @@ class CatalogIndexSettings:
     label: str = ""
     filesystem: str = ""
     compute_hashes: bool = False
+    compute_perceptual: bool = False
     skip_hidden_system: bool = True
     exclude_dirs: tuple[str, ...] = tuple(DEFAULT_EXCLUDES)
 
@@ -99,6 +101,7 @@ class CatalogIndexResult:
     volume_status: str = "online"
     cancelled: bool = False
     compute_hashes: bool = False
+    compute_perceptual: bool = False
     writes_performed: int = 0
     warnings: tuple[str, ...] = ()
 
@@ -311,6 +314,8 @@ class CatalogSearchItem:
     camera_model: str | None = None
     width: int | None = None
     height: int | None = None
+    distance: int | None = None
+    perceptual_hash: str | None = None
 
     @property
     def is_offline(self) -> bool:
@@ -417,6 +422,7 @@ class CatalogService:
         volume_prober: Callable[[str | os.PathLike[str]], VolumeIdentity] | None = None,
         online_checker: Callable[[VolumeIdentity | str | os.PathLike[str]], bool] | None = None,
         compute_hashes: bool = False,
+        compute_perceptual: bool = False,
     ) -> None:
         if isinstance(paths, MediaCatalog):
             catalog = paths
@@ -462,6 +468,7 @@ class CatalogService:
         if str(self.db_path) != ":memory:":
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.default_compute_hashes = bool(compute_hashes)
+        self.default_compute_perceptual = bool(compute_perceptual)
         self.metadata_extractor = metadata_extractor or MetadataExtractor()
         self._volume_prober = volume_prober or probe_volume
         self._online_checker = online_checker or is_volume_online
@@ -812,6 +819,7 @@ class CatalogService:
         filesystem: str = "",
         volume_online: bool | None = None,
         compute_hashes: bool | None = None,
+        compute_perceptual: bool | None = None,
         skip_hidden_system: bool = True,
         exclude_dirs: Sequence[str] = DEFAULT_EXCLUDES,
         remove_missing: bool = False,
@@ -829,6 +837,11 @@ class CatalogService:
         """
         eff_stop = stop_event if stop_event is not None else cancellation
         eff_hashes = self.default_compute_hashes if compute_hashes is None else bool(compute_hashes)
+        eff_perceptual = (
+            self.default_compute_perceptual
+            if compute_perceptual is None
+            else bool(compute_perceptual)
+        )
         raw_folder = str(folder_path).strip()
         if not raw_folder:
             raise ServiceError(ErrorCode.VALIDATION, "Choose a folder to index.")
@@ -851,6 +864,7 @@ class CatalogService:
                     volume_status="cancelled",
                     cancelled=True,
                     compute_hashes=eff_hashes,
+                    compute_perceptual=eff_perceptual,
                 )
 
             online = self._is_folder_mounted_and_online(folder, volume_online=volume_online)
@@ -866,6 +880,7 @@ class CatalogService:
                     volume_status="offline",
                     cancelled=False,
                     compute_hashes=eff_hashes,
+                    compute_perceptual=eff_perceptual,
                     writes_performed=0,
                 )
 
@@ -898,6 +913,7 @@ class CatalogService:
                     volume_status="cancelled",
                     cancelled=True,
                     compute_hashes=eff_hashes,
+                    compute_perceptual=eff_perceptual,
                     warnings=tuple(warnings),
                 )
 
@@ -959,6 +975,7 @@ class CatalogService:
                 volume_online=True,
                 compute_hashes=eff_hashes,
                 extract_metadata=True,
+                compute_perceptual=eff_perceptual,
                 hash_fn=(
                     (lambda p: compute_file_sha256(p, stop_event=eff_stop))
                     if eff_hashes
@@ -979,6 +996,7 @@ class CatalogService:
                     volume_status="cancelled",
                     cancelled=True,
                     compute_hashes=eff_hashes,
+                    compute_perceptual=eff_perceptual,
                     writes_performed=0,
                     warnings=tuple(warnings),
                 )
@@ -1011,6 +1029,7 @@ class CatalogService:
                 volume_status=upsert_res.volume_status,
                 cancelled=upsert_res.cancelled,
                 compute_hashes=eff_hashes,
+                compute_perceptual=eff_perceptual,
                 writes_performed=writes_delta,
                 warnings=tuple(warnings),
             )
@@ -1029,6 +1048,7 @@ class CatalogService:
         label: str = "",
         filesystem: str = "",
         compute_hashes: bool | None = None,
+        compute_perceptual: bool | None = None,
         remove_missing: bool = False,
         stop_event: StopEventProtocol | None = None,
         progress_callback: Callable[..., Any] | OperationReporter | None = None,
@@ -1041,6 +1061,7 @@ class CatalogService:
             label=label,
             filesystem=filesystem,
             compute_hashes=compute_hashes,
+            compute_perceptual=compute_perceptual,
             remove_missing=remove_missing,
             stop_event=stop_event,
             progress_callback=progress_callback,
@@ -1054,6 +1075,7 @@ class CatalogService:
         reporter: OperationReporter | None = None,
         *,
         compute_hashes: bool | None = None,
+        compute_perceptual: bool | None = None,
     ) -> OperationResult:
         """Execute an indexing operation returning a standard ``OperationResult``."""
         import time
@@ -1069,15 +1091,26 @@ class CatalogService:
                     if compute_hashes is None
                     else bool(compute_hashes)
                 ),
+                compute_perceptual=(
+                    self.default_compute_perceptual
+                    if compute_perceptual is None
+                    else bool(compute_perceptual)
+                ),
             )
 
         eff_hashes = cfg.compute_hashes if compute_hashes is None else bool(compute_hashes)
+        eff_perceptual = (
+            cfg.compute_perceptual
+            if compute_perceptual is None
+            else bool(compute_perceptual)
+        )
         index_res = self.index_folder(
             cfg.folder_path,
             volume_key=cfg.volume_key,
             label=cfg.label,
             filesystem=cfg.filesystem,
             compute_hashes=eff_hashes,
+            compute_perceptual=eff_perceptual,
             skip_hidden_system=cfg.skip_hidden_system,
             exclude_dirs=cfg.exclude_dirs,
             cancellation=cancellation,
@@ -1287,6 +1320,7 @@ class CatalogService:
     def _to_search_item(
         record: CatalogFileRecord,
         volumes_by_key: Mapping[str, VolumeRecord],
+        distance: int | None = None,
     ) -> CatalogSearchItem:
         vol = volumes_by_key.get(record.volume_key)
         return CatalogSearchItem(
@@ -1311,6 +1345,8 @@ class CatalogService:
             camera_model=record.camera_model,
             width=record.width,
             height=record.height,
+            distance=distance,
+            perceptual_hash=record.perceptual_hash,
         )
 
     def distinct_cameras(self, *, stop_event: Any = None) -> list[tuple[str | None, str | None]]:
@@ -1510,6 +1546,112 @@ class CatalogService:
                 catalog.close()
 
     search_page = search
+
+    def find_similar(
+        self,
+        record_or_path: CatalogSearchItem | CatalogFileRecord | int | str | Path,
+        *,
+        sensitivity: str = DEFAULT_SENSITIVITY,
+        max_distance: int | None = None,
+        rotation_invariant: bool = False,
+        volume_key: str | None = None,
+        limit: int | None = None,
+        stop_event: StopEventProtocol | None = None,
+    ) -> list[CatalogSearchItem]:
+        """Find catalog records perceptually similar to ``record_or_path``.
+
+        Maps sensitivity levels ('strict', 'balanced', 'loose') to thresholds
+        (6, 10, 14) from ``services.similar_service.SENSITIVITY``.
+        Returns plain ``CatalogSearchItem`` instances sorted nearest first,
+        with ``.distance`` and online/offline status populated.
+        """
+        if _is_cancelled(stop_event):
+            return []
+
+        if max_distance is not None:
+            eff_max_distance = max(0, int(max_distance))
+        elif isinstance(sensitivity, str) and sensitivity.lower() in SENSITIVITY:
+            eff_max_distance = SENSITIVITY[sensitivity.lower()]
+        elif isinstance(sensitivity, int):
+            eff_max_distance = max(0, int(sensitivity))
+        else:
+            valid_keys = ", ".join(f"'{k}'" for k in SENSITIVITY.keys())
+            raise ValueError(
+                f"Unknown sensitivity level: {sensitivity!r}. Expected one of {valid_keys}"
+            )
+
+        catalog, should_close = self._open_catalog()
+        try:
+            target_id: int | None = None
+            has_hash = False
+
+            if isinstance(record_or_path, (CatalogSearchItem, CatalogFileRecord)):
+                target_id = record_or_path.id
+                has_hash = bool(record_or_path.perceptual_hash)
+            elif isinstance(record_or_path, int) and not isinstance(record_or_path, bool):
+                target_id = int(record_or_path)
+                row = catalog.connection.execute(
+                    "SELECT id, perceptual_hash FROM files WHERE id = ?",
+                    (target_id,),
+                ).fetchone()
+                if not row:
+                    raise ValueError(f"File ID not found in catalog: {target_id}")
+                has_hash = bool(row["perceptual_hash"])
+            else:
+                path_str = str(record_or_path)
+                norm_path = path_str.replace("\\", "/").lstrip("/")
+                if volume_key is not None:
+                    row = catalog.connection.execute(
+                        "SELECT id, perceptual_hash FROM files WHERE volume_key = ? AND (relative_path = ? OR relative_path LIKE ?) LIMIT 1",
+                        (volume_key, norm_path, f"%/{norm_path}"),
+                    ).fetchone()
+                else:
+                    row = catalog.connection.execute(
+                        "SELECT id, perceptual_hash FROM files WHERE relative_path = ? OR relative_path LIKE ? LIMIT 1",
+                        (norm_path, f"%/{norm_path}"),
+                    ).fetchone()
+                if row:
+                    target_id = int(row["id"])
+                    has_hash = bool(row["perceptual_hash"])
+                else:
+                    raise ValueError(f"File not found in catalog: {record_or_path!r}")
+
+            if not has_hash and target_id is not None:
+                row = catalog.connection.execute(
+                    "SELECT perceptual_hash FROM files WHERE id = ?",
+                    (target_id,),
+                ).fetchone()
+                if row and row["perceptual_hash"]:
+                    has_hash = True
+
+            if not has_hash:
+                raise ValueError(
+                    "Photo has no stored similarity hash. Re-index with 'Compare photos for similarity' enabled."
+                )
+
+            if _is_cancelled(stop_event):
+                return []
+
+            matches = catalog.find_similar(
+                target_id,
+                max_distance=eff_max_distance,
+                rotation_invariant=rotation_invariant,
+                volume_key=volume_key,
+                limit=limit,
+                stop_event=stop_event,
+            )
+
+            if _is_cancelled(stop_event):
+                return []
+
+            volumes_by_key = {vol.volume_key: vol for vol in catalog.list_volumes()}
+            return [
+                self._to_search_item(match.record, volumes_by_key, distance=match.distance)
+                for match in matches
+            ]
+        finally:
+            if should_close:
+                catalog.close()
 
     # ------------------------------------------------------------------
     # Analytics API (plain data structures)
