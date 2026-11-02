@@ -240,7 +240,20 @@ class SimilarReviewPage(BasePage):
         self.scan_button.setEnabled(False)
         self.progress_panel.show()
         self.progress_panel.update_progress(0, "Checking for cloud-only files…", "Reading file attributes only", "")
-        self.start_after_cloud_check([root], False, lambda skip_cloud=False: self._run_scan(root, skip_cloud), self._abandon_scan)
+        self.controller.begin()
+
+        def on_proceed(skip_cloud: bool = False) -> None:
+            if self.controller.stop.is_set():
+                self.controller.finish()
+                self._abandon_scan()
+                return
+            self._run_scan(root, skip_cloud)
+
+        def on_abandon() -> None:
+            self.controller.finish()
+            self._abandon_scan()
+
+        self.start_after_cloud_check([root], False, on_proceed, on_abandon)
         return True
 
     def _abandon_scan(self) -> None:
@@ -251,7 +264,8 @@ class SimilarReviewPage(BasePage):
     def _run_scan(self, root: str, skip_cloud: bool = False) -> None:
         sensitivity = self.sensitivity.currentData() or DEFAULT_SENSITIVITY
         handle = self.controller
-        handle.begin()
+        if not handle.busy:
+            handle.begin()
         self.progress_panel.update_progress(0, "Finding photos…", root, "")
 
         def work():

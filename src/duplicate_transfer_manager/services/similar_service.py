@@ -201,7 +201,7 @@ class SimilarPhotoService:
         review = build_duplicate_review(
             raw_groups,
             prefer="quality",
-            thumbnail_root=thumbnail_root,
+            thumbnail_root=thumbnail_root or (self.paths.cache / "thumbnails"),
             scanned_files=len(images),
         )
 

@@ -177,6 +177,17 @@ class SimilarReviewPageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.application = QApplication.instance() or QApplication([])
+        cls._fixture_dir = tempfile.TemporaryDirectory()
+        cls._fixture_orig = Path(cls._fixture_dir.name) / "IMG_0001.jpg"
+        cls._fixture_resized = Path(cls._fixture_dir.name) / "small.jpg"
+        _photo(cls._fixture_orig)
+        with Image.open(cls._fixture_orig) as handle:
+            handle.resize((240, 180)).save(cls._fixture_resized, "JPEG", quality=80)
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "_fixture_dir"):
+            cls._fixture_dir.cleanup()
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -186,9 +197,8 @@ class SimilarReviewPageTests(unittest.TestCase):
         self.photos.mkdir()
         self.original = self.photos / "IMG_0001.jpg"
         self.resized = self.photos / "small.jpg"
-        _photo(self.original)
-        with Image.open(self.original) as handle:
-            handle.resize((240, 180)).save(self.resized, "JPEG", quality=80)
+        shutil.copy2(self._fixture_orig, self.original)
+        shutil.copy2(self._fixture_resized, self.resized)
         self.page = SimilarReviewPage(get_runtime_paths(root / "data"))
         self.page.path.set_path(str(self.photos))
 
@@ -205,7 +215,7 @@ class SimilarReviewPageTests(unittest.TestCase):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not until():
             self.application.processEvents()
-            time.sleep(0.02)
+            time.sleep(0.005)
         return until()
 
     def _scan(self):
