@@ -217,3 +217,25 @@ class ChoiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScheduledScanTests(unittest.TestCase):
+    def test_an_unattended_scan_never_downloads_and_records_what_it_left_out(self):
+        import json
+
+        from duplicate_transfer_manager.scheduled_scan import run_scheduled_scan
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "photos"
+            source.mkdir()
+            (source / "a.jpg").write_bytes(b"same")
+            (source / "b.jpg").write_bytes(b"same")
+            (source / "cloud.jpg").write_bytes(b"cloud")
+            data_root = root / "data"
+            with patch.object(discovery, "get_file_attributes", _attributes_for({"cloud.jpg"})):
+                self.assertEqual(run_scheduled_scan(str(source), data_root=str(data_root)), 0)
+            records = [json.loads(p.read_text(encoding="utf-8")) for p in data_root.rglob("*.json")]
+        flattened = json.dumps(records)
+        self.assertIn("cloud_only_files_skipped", flattened)
+        self.assertIn('"cloud_only_files_skipped": 1', flattened)
