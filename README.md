@@ -102,6 +102,14 @@ is tracked in [OVERHAUL_PLAN.md](OVERHAUL_PLAN.md).
   persistent thumbnail cache that honours EXIF orientation, decodes JPEGs at
   reduced size, keys entries on path, size and mtime so edited photos refresh,
   and is held to a byte budget.
+- **Live sort destination preview.** When editing a rule's destination template
+  in Sort Files, the dialog displays a live example path rendered from sample
+  photo metadata as you type. Malformed braces or unknown tokens show an inline
+  error and disable saving until corrected.
+- **Quarantine reason column.** The Quarantine table and details panel show a
+  Reason column indicating whether each item was quarantined as a "Duplicate" or
+  a "Similar photo" (records created before this field existed display as
+  "Duplicate").
 
 ### External drives
 
