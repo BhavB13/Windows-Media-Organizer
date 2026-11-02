@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Callable
+import os
 from pathlib import Path
+import subprocess
 from typing import Any
 
-from PySide6.QtCore import QThreadPool, Qt, Signal
+from PySide6.QtCore import QObject, QRunnable, QSize, QThreadPool, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -17,6 +22,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QSpinBox,
     QTableWidget,
@@ -35,6 +42,7 @@ from ..core import (
     OperationResult,
     OperationState,
 )
+from ..previews.thumbnails import ThumbnailCache, ThumbnailResult
 from ..runtime_paths import RuntimePaths, get_runtime_paths
 from ..services.catalog_service import (
     DEFAULT_PAGE_SIZE,
@@ -104,6 +112,99 @@ def _empty_search_page(limit: int = DEFAULT_PAGE_SIZE) -> CatalogSearchPage:
     )
 
 
+def _default_file_opener(path: str | Path) -> bool:
+    candidate = Path(path)
+    if not candidate.exists():
+        return False
+    if os.name == "nt" and candidate.is_file():
+        subprocess.Popen(["explorer.exe", "/select,", str(candidate)])
+        return True
+    target = candidate if candidate.is_dir() else candidate.parent
+    return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(str(target))))
+
+
+def _create_placeholder_icon(label: str, size: tuple[int, int] = (160, 160)) -> QIcon:
+    if QApplication.instance() is None:
+        return QIcon()
+    pixmap = QPixmap(size[0], size[1])
+    pixmap.fill(QColor("#2d3139"))
+    painter = QPainter(pixmap)
+    try:
+        painter.setPen(QColor("#8b949e"))
+        font = painter.font()
+        font.setPointSize(11)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(
+            0,
+            0,
+            size[0],
+            size[1],
+            int(Qt.AlignmentFlag.AlignCenter),
+            label,
+        )
+    finally:
+        painter.end()
+    return QIcon(pixmap)
+
+
+def _query_distinct_cameras(
+    service: CatalogService,
+    stop_event: CancellationToken | None = None,
+) -> list[tuple[str | None, str | None]]:
+    """Camera makes and models present in the catalog, for the filter."""
+
+    try:
+        return service.distinct_cameras(stop_event=stop_event)
+    except Exception:
+        return []
+
+
+class _ThumbnailWorkerSignals(QObject):
+    thumbnail_ready = Signal(int, int, str)
+    all_finished = Signal(int)
+
+
+class _ThumbnailWorker(QRunnable):
+    def __init__(
+        self,
+        generation_id: int,
+        tasks: list[tuple[int, Path]],
+        cache: ThumbnailCache,
+        cancellation: CancellationToken,
+        signals: _ThumbnailWorkerSignals,
+    ) -> None:
+        super().__init__()
+        self.generation_id = generation_id
+        self.tasks = tasks
+        self.cache = cache
+        self.cancellation = cancellation
+        self.signals = signals
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            for file_id, full_path in self.tasks:
+                if self.cancellation.is_set():
+                    break
+                try:
+                    res = self.cache.get_or_create(
+                        full_path,
+                        size=(160, 160),
+                        stop_event=self.cancellation,
+                    )
+                    if self.cancellation.is_set():
+                        break
+                    if res.ok and res.thumbnail_path is not None:
+                        self.signals.thumbnail_ready.emit(
+                            self.generation_id, file_id, str(res.thumbnail_path)
+                        )
+                except Exception:
+                    pass
+        finally:
+            self.signals.all_finished.emit(self.generation_id)
+
+
 class LibraryController(BaseOperationController):
     """Qt operation controller executing catalog indexing, search, and analytics off the main thread."""
 
@@ -165,6 +266,7 @@ class LibraryController(BaseOperationController):
 
             analytics = self.service.get_storage_analytics(stop_event=cancellation)
             search_page = self.service.search(stop_event=cancellation, **query_kwargs)
+            cameras = _query_distinct_cameras(self.service, cancellation)
             if cancellation.is_cancelled():
                 return OperationResult(
                     status=OperationState.CANCELLED,
@@ -189,6 +291,7 @@ class LibraryController(BaseOperationController):
                     "index_result": index_res,
                     "analytics": analytics,
                     "search_page": search_page,
+                    "cameras": cameras,
                 },
             )
 
@@ -234,6 +337,7 @@ class LibraryController(BaseOperationController):
             )
             analytics = self.service.get_storage_analytics(stop_event=cancellation)
             page = self.service.search(stop_event=cancellation, **kwargs)
+            cameras = _query_distinct_cameras(self.service, cancellation)
             if cancellation.is_cancelled():
                 return OperationResult(
                     status=OperationState.CANCELLED,
@@ -245,7 +349,31 @@ class LibraryController(BaseOperationController):
                     "operation": "refresh",
                     "analytics": analytics,
                     "search_page": page,
+                    "cameras": cameras,
                 },
+            )
+
+        return self.start_task(_task)
+
+    def start_load_cameras(self) -> bool:
+        def _task(
+            cancellation: CancellationToken,
+            reporter: OperationReporter,
+        ) -> OperationResult:
+            reporter.set_state(
+                OperationState.SCANNING,
+                phase=OperationPhase.DISCOVERY,
+                message="Loading cameras…",
+            )
+            cameras = _query_distinct_cameras(self.service, cancellation)
+            if cancellation.is_cancelled():
+                return OperationResult(
+                    status=OperationState.CANCELLED,
+                    data={"operation": "cameras"},
+                )
+            return OperationResult(
+                status=OperationState.COMPLETED,
+                data={"operation": "cameras", "cameras": cameras},
             )
 
         return self.start_task(_task)
@@ -275,6 +403,9 @@ class LibraryPage(BasePage):
         search_controller: LibraryController | None = None,
         db_path: str | Path | None = None,
         page_size: int = DEFAULT_PAGE_SIZE,
+        thumbnail_cache: ThumbnailCache | None = None,
+        opener: Callable[[str | Path], Any] | None = None,
+        view_mode: str = "table",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(
@@ -307,6 +438,18 @@ class LibraryPage(BasePage):
             parent=self,
         )
 
+        self.thumbnail_cache = (
+            thumbnail_cache
+            if thumbnail_cache is not None
+            else ThumbnailCache(paths=self.paths)
+        )
+        self.opener: Callable[[str | Path], Any] = opener or _default_file_opener
+        self._thumbnail_pool = QThreadPool(parent=self)
+        self._thumbnail_pool.setMaxThreadCount(2)
+        self._thumbnail_cancellation: CancellationToken | None = None
+        self._thumbnail_generation_id: int = 0
+        self._thumbnail_signals: _ThumbnailWorkerSignals | None = None
+
         self._page_size = max(1, int(page_size))
         self._current_page = 1
         self.analytics_data: CatalogStorageAnalytics = _empty_analytics()
@@ -319,6 +462,8 @@ class LibraryPage(BasePage):
         self._build_search_section()
         self._configure_focus_order()
         self._connect_signals()
+
+        self.set_view_mode(view_mode)
 
         # Render initial empty state immediately so the summary is valid before any index exists.
         self._apply_analytics(self.analytics_data)
@@ -642,6 +787,16 @@ class LibraryPage(BasePage):
         filter_grid.addWidget(QLabel("Date to"), 2, 2)
         filter_grid.addWidget(self.date_end_filter, 2, 3)
 
+        self.camera_filter = QComboBox()
+        self.camera_filter.addItem("All cameras", None)
+        set_accessible(
+            self.camera_filter,
+            "Filter by camera",
+            "Choose a camera make or model to filter catalog search results.",
+        )
+        filter_grid.addWidget(QLabel("Camera"), 3, 0)
+        filter_grid.addWidget(self.camera_filter, 3, 1, 1, 3)
+
         layout.addLayout(filter_grid)
 
         action_row = QHBoxLayout()
@@ -659,6 +814,25 @@ class LibraryPage(BasePage):
             "Number of catalog search results displayed per page.",
         )
 
+        self.table_button = QPushButton("Table")
+        self.table_button.setCheckable(True)
+        self.table_button.setChecked(True)
+        set_accessible(
+            self.table_button,
+            "Table view",
+            "Display catalog search results in a detailed table.",
+        )
+
+        self.gallery_button = QPushButton("Gallery")
+        self.gallery_button.setCheckable(True)
+        self.gallery_button.setChecked(False)
+        set_accessible(
+            self.gallery_button,
+            "Gallery view",
+            "Display catalog search results as a thumbnail gallery grid.",
+        )
+        self.view_toggle = self.gallery_button
+
         self.clear_filters_button = QPushButton("Clear filters")
         set_accessible(
             self.clear_filters_button,
@@ -675,6 +849,10 @@ class LibraryPage(BasePage):
 
         action_row.addWidget(QLabel("Page size"))
         action_row.addWidget(self.page_size_combo)
+        action_row.addSpacing(Spacing.MD)
+        action_row.addWidget(QLabel("View:"))
+        action_row.addWidget(self.table_button)
+        action_row.addWidget(self.gallery_button)
         action_row.addStretch(1)
         action_row.addWidget(self.clear_filters_button)
         action_row.addWidget(self.search_button)
@@ -704,6 +882,26 @@ class LibraryPage(BasePage):
         )
         self.table = self.results_table
         layout.addWidget(self.results_table)
+
+        self.gallery_widget = QListWidget()
+        self.gallery_widget.setViewMode(QListWidget.ViewMode.IconMode)
+        self.gallery_widget.setIconSize(QSize(160, 160))
+        self.gallery_widget.setGridSize(QSize(200, 230))
+        self.gallery_widget.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.gallery_widget.setMovement(QListWidget.Movement.Static)
+        self.gallery_widget.setSpacing(10)
+        self.gallery_widget.setWordWrap(True)
+        self.gallery_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.gallery_widget.setMinimumHeight(240)
+        self.gallery_widget.hide()
+        set_accessible(
+            self.gallery_widget,
+            "Catalog search results gallery",
+            "Paged thumbnail gallery of matching files in the library catalog.",
+        )
+        self.gallery = self.gallery_widget
+        self.gallery_list = self.gallery_widget
+        layout.addWidget(self.gallery_widget)
 
         pager_row = QHBoxLayout()
         pager_row.setSpacing(Spacing.SM)
@@ -750,10 +948,14 @@ class LibraryPage(BasePage):
             self.max_size_filter,
             self.date_start_filter,
             self.date_end_filter,
+            self.camera_filter,
             self.page_size_combo,
+            self.table_button,
+            self.gallery_button,
             self.clear_filters_button,
             self.search_button,
             self.results_table,
+            self.gallery_widget,
             self.prev_page_button,
             self.next_page_button,
         ]
@@ -765,12 +967,17 @@ class LibraryPage(BasePage):
         self.refresh_button.clicked.connect(self.refresh)
         self.progress_panel.cancel_requested.connect(self.cancel_indexing)
 
+        self.table_button.clicked.connect(lambda: self.set_view_mode("table"))
+        self.gallery_button.clicked.connect(lambda: self.set_view_mode("gallery"))
         self.search_button.clicked.connect(lambda: self.start_search(page=1))
         self.clear_filters_button.clicked.connect(self.clear_filters)
         self.filename_filter.returnPressed.connect(lambda: self.start_search(page=1))
+        self.camera_filter.currentIndexChanged.connect(self._on_camera_filter_changed)
         self.page_size_combo.currentIndexChanged.connect(self._on_page_size_changed)
         self.prev_page_button.clicked.connect(self.previous_page)
         self.next_page_button.clicked.connect(self.next_page)
+        self.gallery_widget.itemDoubleClicked.connect(self._on_gallery_item_double_clicked)
+        self.results_table.itemDoubleClicked.connect(self._on_table_item_double_clicked)
 
         for ctrl in (self.controller, self.search_controller):
             ctrl.progress.connect(self._on_progress)
@@ -805,6 +1012,17 @@ class LibraryPage(BasePage):
         cap_start = self.date_start_filter.text().strip() or None
         cap_end = self.date_end_filter.text().strip() or None
 
+        camera_data = self.camera_filter.currentData()
+        camera_make = None
+        camera_model = None
+        if isinstance(camera_data, dict):
+            camera_make = camera_data.get("camera_make")
+            camera_model = camera_data.get("camera_model")
+        elif isinstance(camera_data, (tuple, list)) and len(camera_data) == 2:
+            camera_make, camera_model = camera_data
+        elif isinstance(camera_data, str) and camera_data:
+            camera_make = camera_data
+
         return {
             "media_kind": media_kind,
             "filename": filename,
@@ -812,6 +1030,8 @@ class LibraryPage(BasePage):
             "max_size": max_size,
             "capture_start": cap_start,
             "capture_end": cap_end,
+            "camera_make": camera_make,
+            "camera_model": camera_model,
             "page": target_page,
             "page_size": self._page_size,
         }
@@ -880,12 +1100,14 @@ class LibraryPage(BasePage):
 
     cancel = cancel_indexing
 
-    def start_search(self, *, page: int | None = None) -> bool:
+    def start_search(self, *, page: int | None = None, **extra_kwargs: Any) -> bool:
         """Run a paged catalog search on a Qt worker thread."""
+        self._cancel_thumbnail_generation()
         if page is not None:
             self._current_page = max(1, int(page))
         try:
             kwargs = self._collect_search_kwargs(page=self._current_page)
+            kwargs.update(extra_kwargs)
         except ValueError as exc:
             self._show_message(f"Invalid search filter: {exc}", "warning")
             return False
@@ -910,6 +1132,9 @@ class LibraryPage(BasePage):
 
     def clear_filters(self) -> None:
         self.media_kind_filter.setCurrentIndex(0)
+        self.camera_filter.blockSignals(True)
+        self.camera_filter.setCurrentIndex(0)
+        self.camera_filter.blockSignals(False)
         self.filename_filter.clear()
         self.min_size_filter.setValue(0)
         self.max_size_filter.setValue(0)
@@ -955,11 +1180,12 @@ class LibraryPage(BasePage):
     def wait_for_done(self, timeout_ms: int = 5000) -> bool:
         ok1 = self.controller.wait_for_done(timeout_ms)
         ok2 = self.search_controller.wait_for_done(timeout_ms)
+        ok3 = self._thumbnail_pool.waitForDone(timeout_ms)
         app = QApplication.instance()
         if app is not None:
             for _ in range(10):
                 app.processEvents()
-        return ok1 and ok2
+        return ok1 and ok2 and ok3
 
     # ------------------------------------------------------------------
     # Slots & Rendering (Main Thread Only)
@@ -996,6 +1222,9 @@ class LibraryPage(BasePage):
     def _on_completed(self, result: OperationResult) -> None:
         data = result.data or {}
         op = data.get("operation", "")
+        cameras = data.get("cameras")
+        if cameras is not None:
+            self._apply_cameras(cameras)
         if op == "index":
             self.progress_panel.hide()
             index_res: CatalogIndexResult | None = data.get("index_result")
@@ -1158,6 +1387,55 @@ class LibraryPage(BasePage):
                 cell.setData(Qt.ItemDataRole.UserRole, rec.id)
                 self.results_table.setItem(row_idx, col_idx, cell)
 
+        # Update Gallery
+        self._cancel_thumbnail_generation()
+        self._thumbnail_generation_id += 1
+        current_gen_id = self._thumbnail_generation_id
+        self.gallery_widget.clear()
+
+        thumbnail_tasks: list[tuple[int, Path]] = []
+        for rec in items:
+            cap_text = rec.capture_date[:10] if rec.capture_date else "—"
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, rec.id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, rec)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+            item.setToolTip(f"{rec.filename}\n{rec.relative_path}")
+
+            if rec.is_offline:
+                item.setText(f"{rec.filename}\nOffline\n{cap_text}")
+                item.setIcon(_create_placeholder_icon("Offline"))
+            elif rec.media_kind != "image":
+                item.setText(f"{rec.filename}\n{cap_text}")
+                label = rec.media_kind.upper()[:5] if rec.media_kind else "FILE"
+                item.setIcon(_create_placeholder_icon(label))
+            else:
+                item.setText(f"{rec.filename}\n{cap_text}")
+                item.setIcon(_create_placeholder_icon("Loading…"))
+                if rec.volume_root:
+                    full_path = Path(rec.volume_root) / rec.relative_path
+                else:
+                    full_path = Path(rec.relative_path)
+                thumbnail_tasks.append((rec.id, full_path))
+
+            self.gallery_widget.addItem(item)
+
+        if thumbnail_tasks:
+            cancellation = CancellationToken()
+            self._thumbnail_cancellation = cancellation
+            signals = _ThumbnailWorkerSignals(self)
+            signals.thumbnail_ready.connect(self._on_thumbnail_ready)
+            signals.all_finished.connect(self._on_thumbnail_worker_finished)
+            self._thumbnail_signals = signals
+            worker = _ThumbnailWorker(
+                generation_id=current_gen_id,
+                tasks=thumbnail_tasks,
+                cache=self.thumbnail_cache,
+                cancellation=cancellation,
+                signals=signals,
+            )
+            self._thumbnail_pool.start(worker)
+
         if page.total_count == 0:
             self.page_label.setText("Page 0 of 0 • 0 matching files")
         else:
@@ -1169,6 +1447,131 @@ class LibraryPage(BasePage):
 
         self.prev_page_button.setEnabled(page.has_previous)
         self.next_page_button.setEnabled(page.has_next)
+
+    @property
+    def view_mode(self) -> str:
+        return "gallery" if self.gallery_button.isChecked() else "table"
+
+    def set_view_mode(self, mode: str) -> None:
+        target = str(mode).strip().lower()
+        if target == "gallery":
+            self.gallery_button.blockSignals(True)
+            self.table_button.blockSignals(True)
+            self.gallery_button.setChecked(True)
+            self.table_button.setChecked(False)
+            self.gallery_button.blockSignals(False)
+            self.table_button.blockSignals(False)
+            self.results_table.hide()
+            self.gallery_widget.show()
+        else:
+            self.gallery_button.blockSignals(True)
+            self.table_button.blockSignals(True)
+            self.gallery_button.setChecked(False)
+            self.table_button.setChecked(True)
+            self.gallery_button.blockSignals(False)
+            self.table_button.blockSignals(False)
+            self.gallery_widget.hide()
+            self.results_table.show()
+
+    def _on_camera_filter_changed(self) -> None:
+        if not self.camera_filter.signalsBlocked():
+            self.start_search(page=1)
+
+    def _apply_cameras(self, cameras: list[tuple[str | None, str | None]]) -> None:
+        current_data = self.camera_filter.currentData()
+        self.camera_filter.blockSignals(True)
+        self.camera_filter.clear()
+        self.camera_filter.addItem("All cameras", None)
+
+        if cameras:
+            models_by_make: dict[str, set[str]] = defaultdict(set)
+            for make, model in cameras:
+                if make and model:
+                    models_by_make[make].add(model)
+
+            for make, model in cameras:
+                if make and model:
+                    if len(models_by_make[make]) > 1:
+                        all_label = f"{make} (all)"
+                        all_data = {"camera_make": make, "camera_model": None}
+                        if self.camera_filter.findText(all_label) < 0:
+                            self.camera_filter.addItem(all_label, all_data)
+                    label = model if model.lower().startswith(make.lower()) else f"{make} {model}"
+                    self.camera_filter.addItem(label, {"camera_make": make, "camera_model": model})
+                elif make:
+                    self.camera_filter.addItem(make, {"camera_make": make, "camera_model": None})
+                elif model:
+                    self.camera_filter.addItem(model, {"camera_make": None, "camera_model": model})
+
+        if current_data is not None:
+            for idx in range(self.camera_filter.count()):
+                if self.camera_filter.itemData(idx) == current_data:
+                    self.camera_filter.setCurrentIndex(idx)
+                    break
+        self.camera_filter.blockSignals(False)
+
+    def load_cameras(self) -> bool:
+        """Trigger background loading of distinct camera makes/models."""
+        if self.search_controller.busy:
+            return False
+        return self.search_controller.start_load_cameras()
+
+    def _cancel_thumbnail_generation(self) -> None:
+        if self._thumbnail_cancellation is not None:
+            self._thumbnail_cancellation.cancel()
+            self._thumbnail_cancellation = None
+
+    @Slot(int, int, str)
+    def _on_thumbnail_ready(self, gen_id: int, file_id: int, thumb_path: str) -> None:
+        if gen_id != self._thumbnail_generation_id:
+            return
+        if not thumb_path or not Path(thumb_path).is_file():
+            return
+        icon = QIcon(thumb_path)
+        for idx in range(self.gallery_widget.count()):
+            widget_item = self.gallery_widget.item(idx)
+            if widget_item is not None and widget_item.data(Qt.ItemDataRole.UserRole) == file_id:
+                widget_item.setIcon(icon)
+                break
+
+    @Slot(int)
+    def _on_thumbnail_worker_finished(self, gen_id: int) -> None:
+        if gen_id == self._thumbnail_generation_id:
+            self._thumbnail_cancellation = None
+
+    def open_item(self, item: CatalogSearchItem | Path | str) -> bool:
+        """Open the containing folder with the file selected via the configured opener."""
+        if isinstance(item, CatalogSearchItem):
+            if item.is_offline:
+                self._show_message("Cannot open file: volume is offline.", "warning")
+                return False
+            if item.volume_root:
+                target_path = Path(item.volume_root) / item.relative_path
+            else:
+                target_path = Path(item.relative_path)
+        else:
+            target_path = Path(item)
+
+        if self.opener is not None:
+            self.opener(target_path)
+            return True
+        return False
+
+    def _on_gallery_item_double_clicked(self, item: QListWidgetItem) -> None:
+        rec = item.data(Qt.ItemDataRole.UserRole + 1)
+        if isinstance(rec, CatalogSearchItem):
+            self.open_item(rec)
+
+    def _on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        if 0 <= row < len(self.search_page_data.items):
+            rec = self.search_page_data.items[row]
+            self.open_item(rec)
+
+    def close(self) -> bool:
+        self._cancel_thumbnail_generation()
+        self._thumbnail_pool.waitForDone(500)
+        return super().close()
 
     def _show_message(self, message: str, kind: str = "info") -> None:
         self.banner.set_message(message, kind)
