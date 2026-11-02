@@ -524,36 +524,40 @@ class CatalogService:
         norm_target = _norm_path_key(folder)
         existing_volumes = catalog.list_volumes()
 
-        if explicit_volume_key.strip():
-            key = explicit_volume_key.strip()
-            existing = catalog.get_volume(key)
-        else:
-            existing = next(
-                (vol for vol in existing_volumes if _norm_path_key(vol.root_path) == norm_target),
-                None,
-            )
-            if existing is None and folder.name:
-                # If an existing offline volume has a matching folder basename and its old path is gone,
-                # check if it was the same volume key.
-                existing = None
-            key = existing.volume_key if existing is not None else ""
-
         try:
             identity = self._volume_prober(folder)
         except Exception:
             identity = VolumeIdentity(mount_point=str(folder))
 
-        if not key:
-            mount_norm = _norm_path_key(identity.mount_point) if identity.mount_point else ""
-            if mount_norm and mount_norm == norm_target:
-                key = identity.stable_key
+        mount_norm = _norm_path_key(identity.mount_point) if identity.mount_point else ""
+        if mount_norm and mount_norm == norm_target:
+            derived_key = identity.stable_key
+        else:
+            rel_from_mount = relative_path_from_mount(folder, identity.mount_point or None)
+            if rel_from_mount:
+                rel_slug = sanitize_path_fallback(rel_from_mount).lower()
+                derived_key = f"{identity.stable_key}:{rel_slug}"
             else:
-                rel_from_mount = relative_path_from_mount(folder, identity.mount_point or None)
-                if rel_from_mount:
-                    rel_slug = sanitize_path_fallback(rel_from_mount).lower()
-                    key = f"{identity.stable_key}:{rel_slug}"
-                else:
-                    key = identity.stable_key
+                derived_key = identity.stable_key
+
+        if explicit_volume_key.strip():
+            key = explicit_volume_key.strip()
+            existing = catalog.get_volume(key)
+        else:
+            by_path = next(
+                (vol for vol in existing_volumes if _norm_path_key(vol.root_path) == norm_target),
+                None,
+            )
+            # A path match alone does not prove it is the same drive: Windows
+            # hands a freed letter to the next drive plugged in, and reusing the
+            # old key merged the new drive's files into the old drive's records,
+            # keeping hashes that described the other drive's bytes. Reuse a
+            # path match only when the drive's identity agrees, or when there is
+            # no strong identity to check against.
+            if by_path is not None and (identity.is_fallback or by_path.volume_key == derived_key):
+                existing, key = by_path, by_path.volume_key
+            else:
+                existing, key = catalog.get_volume(derived_key), derived_key
 
         label = explicit_label.strip()
         if not label:
