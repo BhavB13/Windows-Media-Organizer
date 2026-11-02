@@ -43,6 +43,7 @@ from ..controllers import DeviceController, DuplicateScanController, TransferCon
 from ..controllers.base import OperationWorker
 from ..core import AppSettings, CancellationToken, OperationResult, OperationState
 from ..services.cloud_guard import assess_cloud_downloads
+from ..services.transfer_service import DESTINATION_DISCONNECTED_TEXT
 from ..runtime_paths import get_runtime_paths
 from ..sorting import SortExecutor
 from ..services import (
@@ -2057,7 +2058,31 @@ class ImportPage(BasePage):
             failures=[failure.message for failure in result.failures],
         )
         errors = int(result.counts.get("errors", 0))
-        if errors:
+        engine_result = (
+            result.data.get("engine_result", {})
+            if hasattr(result, "data") and isinstance(result.data, dict)
+            else {}
+        )
+        is_disconnected = bool(
+            engine_result.get("destination_disconnected")
+            or any(getattr(f, "code", "") == "destination_disconnected" for f in getattr(result, "failures", ()))
+        )
+        too_large_count = int(engine_result.get("too_large_skipped", 0) or 0)
+        if is_disconnected:
+            self.banner.set_message(
+                DESTINATION_DISCONNECTED_TEXT,
+                "warning",
+            )
+            self.run_button.setEnabled(True)
+            self.run_button.show()
+        elif too_large_count > 0:
+            file_word = "file was" if too_large_count == 1 else "files were"
+            self.banner.set_message(
+                f"{too_large_count} {file_word} too large for this FAT32 drive. "
+                "exFAT or NTFS drives can hold them.",
+                "info",
+            )
+        elif errors:
             # A green "Import complete" next to a non-zero error count told the
             # user everything had arrived when some of it had not.
             self.banner.set_message(
@@ -2092,15 +2117,32 @@ class ImportPage(BasePage):
         self.review_button.setEnabled(True)
         self.run_button.setEnabled(True)
         self.progress_panel.hide()
+        detail = str(getattr(error, "technical_detail", ""))
+        msg = str(getattr(error, "message", str(error)))
+        engine_result = getattr(error, "data", {}).get("engine_result", {}) if hasattr(error, "data") and isinstance(error.data, dict) else {}
+        disconnect_message = DESTINATION_DISCONNECTED_TEXT
+        is_disconnected = (
+            disconnect_message in detail
+            or disconnect_message in msg
+            or getattr(error, "code", "") == "destination_disconnected"
+            or bool(engine_result.get("destination_disconnected"))
+            or "destination drive was disconnected" in detail.lower()
+            or "destination drive was disconnected" in msg.lower()
+        )
         self.operation_service.record(
             "import",
             "failed",
             title="Failed import",
             summary={"resume_setup": self._resume_setup()},
-            failures=[getattr(error, "message", str(error))],
+            failures=[disconnect_message if is_disconnected else msg],
             resume_available=True,
         )
-        self.banner.set_message(getattr(error, "message", str(error)), "danger")
+        if is_disconnected:
+            self.banner.set_message(disconnect_message, "warning")
+            self.run_button.setEnabled(True)
+            self.run_button.show()
+        else:
+            self.banner.set_message(msg, "danger")
         self.banner.show()
 
 
