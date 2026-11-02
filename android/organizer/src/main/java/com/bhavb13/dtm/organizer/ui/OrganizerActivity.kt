@@ -1,5 +1,6 @@
 package com.bhavb13.dtm.organizer.ui
 
+import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -10,9 +11,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import com.bhavb13.dtm.organizer.data.AndroidPermissionHelper
+import com.bhavb13.dtm.organizer.data.UsbStorageHelper
 
 /**
- * Main entry-point Activity for the Read-Only Jetpack Compose Media Organizer MVP.
+ * Main entry-point Activity for the Jetpack Compose Media Organizer.
  */
 class OrganizerActivity : ComponentActivity() {
 
@@ -24,20 +26,30 @@ class OrganizerActivity : ComponentActivity() {
         viewModel.refreshPermissionsAndReload()
     }
 
-    private val safTreeLauncher = registerForActivityResult(
+    private val safSourceFolderLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
     ) { treeUri ->
         if (treeUri != null) {
-            try {
-                // Take only READ permission; never request or persist write permission.
-                contentResolver.takePersistableUriPermission(
-                    treeUri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (_: SecurityException) {
-                // Non-persistable grant is still usable for the current session.
+            viewModel.addGrantedSourceFolder(treeUri)
+        }
+    }
+
+    private val safDestFolderLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { treeUri ->
+        if (treeUri != null) {
+            viewModel.setOrganizeDestination(treeUri)
+        }
+    }
+
+    private val volumeTreeLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val treeUri = result.data?.data
+            if (treeUri != null) {
+                viewModel.addGrantedSourceFolder(treeUri)
             }
-            viewModel.addSafFolderReadOnly(treeUri)
         }
     }
 
@@ -53,8 +65,27 @@ class OrganizerActivity : ComponentActivity() {
                         permissionLauncher.launch(AndroidPermissionHelper.permissionsToRequest())
                     },
                     onOpenSafFolder = {
-                        safTreeLauncher.launch(null)
+                        safSourceFolderLauncher.launch(null)
                     },
+                    onRemoveGrantedFolder = viewModel::removeGrantedFolder,
+                    onGrantVolumeAccess = { volumeInfo ->
+                        val volume = UsbStorageHelper.findVolume(this, volumeInfo.id)
+                        if (volume != null) {
+                            val intent = UsbStorageHelper.createVolumeTreeIntent(volume)
+                            volumeTreeLauncher.launch(intent)
+                        } else {
+                            safSourceFolderLauncher.launch(null)
+                        }
+                    },
+                    onSelectDestinationFolder = {
+                        safDestFolderLauncher.launch(null)
+                    },
+                    onSelectOrganizeTemplate = viewModel::selectOrganizeTemplate,
+                    onCreateOrganizePlan = viewModel::createOrganizePlan,
+                    onClearOrganizePlan = viewModel::clearOrganizePlan,
+                    onExecuteOrganizePlan = viewModel::executeOrganizePlan,
+                    onCancelOrganize = viewModel::cancelOrganize,
+                    onDismissOrganizeResult = viewModel::dismissOrganizeResult,
                     onFilenameQueryChange = viewModel::updateFilenameQuery,
                     onMediaKindFilterChange = viewModel::updateMediaKindFilter,
                     onSizePresetChange = viewModel::updateSizePreset,
@@ -75,7 +106,7 @@ class OrganizerActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Re-check permissions when returning from system Settings.
+        viewModel.refreshDrivesAndGrantedFolders()
         val latest = AndroidPermissionHelper.checkPermissionStatus(this)
         if (latest != viewModel.uiState.value.permissionStatus) {
             viewModel.refreshPermissionsAndReload()
