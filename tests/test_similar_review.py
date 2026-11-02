@@ -163,8 +163,9 @@ try:
     import os as _os
 
     _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtWidgets import QApplication, QDialog
+    from PySide6.QtWidgets import QApplication, QDialog, QLabel
 
+    from duplicate_transfer_manager.services.duplicate_workflow import format_duplicate_size
     from duplicate_transfer_manager.ui.similar_review_page import SimilarReviewPage
     from duplicate_transfer_manager.ui.widgets import ConfirmationDialog
 except Exception:  # pragma: no cover - page tests skip without PySide6
@@ -245,6 +246,186 @@ class SimilarReviewPageTests(unittest.TestCase):
             self.page.quarantine_selected()
         self.application.processEvents()
         self.assertTrue(Path(victim.path).exists())
+
+    def test_select_all_except_recommended_and_clear_selection(self):
+        self._scan()
+        group = self.page.review.groups[0]
+        keeper = next(item for item in group.items if item.id == group.keeper_id)
+        victim = next(item for item in group.items if item.id != group.keeper_id)
+
+        # Initial: nothing selected, keeper checkbox disabled
+        self.assertEqual(self.page.selected_ids(), [])
+        self.assertFalse(self.page.checks[keeper.id].isEnabled())
+        self.assertTrue(self.page.checks[victim.id].isEnabled())
+
+        # Select all except recommended
+        self.page.select_all_button.click()
+        self.assertEqual(self.page.selected_ids(), [victim.id])
+        self.assertTrue(self.page.checks[victim.id].isChecked())
+        self.assertFalse(self.page.checks[keeper.id].isChecked())
+        self.assertTrue(self.page.quarantine_button.isEnabled())
+
+        # Clear selection
+        self.page.clear_selection_button.click()
+        self.assertEqual(self.page.selected_ids(), [])
+        self.assertFalse(self.page.checks[victim.id].isChecked())
+        self.assertFalse(self.page.quarantine_button.isEnabled())
+
+    def test_keep_this_one_instead_swaps_disabled_and_selection(self):
+        self._scan()
+        group = self.page.review.groups[0]
+        old_keeper = next(item for item in group.items if item.id == group.keeper_id)
+        new_keeper = next(item for item in group.items if item.id != group.keeper_id)
+
+        # Select the victim (new_keeper)
+        self.page.checks[new_keeper.id].setChecked(True)
+        self.assertEqual(self.page.selected_ids(), [new_keeper.id])
+
+        # Click "Keep this one instead" on new_keeper
+        keep_btn = self.page.tile_widgets[new_keeper.id]["keep_button"]
+        self.assertFalse(keep_btn.isHidden())
+        keep_btn.click()
+
+        # Which checkbox is disabled and what is selected should be swapped
+        self.assertFalse(self.page.checks[new_keeper.id].isEnabled())
+        self.assertFalse(self.page.checks[new_keeper.id].isChecked())
+        self.assertTrue(self.page.checks[old_keeper.id].isEnabled())
+        self.assertTrue(self.page.checks[old_keeper.id].isChecked())
+        self.assertEqual(self.page.selected_ids(), [old_keeper.id])
+
+        # Keeper mark moved: new_keeper has visible badge, keep_button is hidden
+        self.assertFalse(self.page.tile_widgets[new_keeper.id]["badge"].isHidden())
+        self.assertTrue(self.page.tile_widgets[new_keeper.id]["keep_button"].isHidden())
+
+        # Old keeper's badge is hidden, keep_button is visible
+        self.assertTrue(self.page.tile_widgets[old_keeper.id]["badge"].isHidden())
+        self.assertFalse(self.page.tile_widgets[old_keeper.id]["keep_button"].isHidden())
+
+        # Group reasons stay visible on the group card
+        card = self.page.group_cards[group.id]
+        reason_labels = [w for w in card.findChildren(QLabel) if "Recommended keep:" in w.text()]
+        self.assertTrue(bool(reason_labels))
+
+    def test_filter_hides_the_right_groups(self):
+        # Create an identical pair
+        ident1 = self.photos / "ident1.jpg"
+        _photo(ident1, phase=3.5)
+        ident2 = self.photos / "ident2.jpg"
+        shutil.copy2(ident1, ident2)
+
+        self._scan()
+        self.assertEqual(len(self.page.review.groups), 2)
+        kinds = {g.id: g.kind for g in self.page.review.groups}
+        identical_id = next(gid for gid, k in kinds.items() if k == "identical")
+        similar_id = next(gid for gid, k in kinds.items() if k == "similar")
+
+        card_ident = self.page.group_cards[identical_id]
+        card_sim = self.page.group_cards[similar_id]
+
+        # All groups: both visible (not hidden)
+        self.assertFalse(card_ident.isHidden())
+        self.assertFalse(card_sim.isHidden())
+
+        # Filter: Identical copies only
+        idx_ident = self.page.show_combo.findData("identical")
+        self.page.show_combo.setCurrentIndex(idx_ident)
+        self.assertFalse(card_ident.isHidden())
+        self.assertTrue(card_sim.isHidden())
+
+        # Bulk select while filtered to identical: only identical non-keepers ticked
+        self.page.select_all_button.click()
+        selected = set(self.page.selected_ids())
+        ident_group = next(g for g in self.page.review.groups if g.id == identical_id)
+        ident_item_ids = {i.id for i in ident_group.items}
+        self.assertTrue(selected.issubset(ident_item_ids))
+        self.assertEqual(len(selected), 1)
+
+        # Filter: Similar only
+        self.page.clear_selection_button.click()
+        idx_sim = self.page.show_combo.findData("similar")
+        self.page.show_combo.setCurrentIndex(idx_sim)
+        self.assertTrue(card_ident.isHidden())
+        self.assertFalse(card_sim.isHidden())
+
+        # Filter: back to All
+        idx_all = self.page.show_combo.findData("all")
+        self.page.show_combo.setCurrentIndex(idx_all)
+        self.assertFalse(card_ident.isHidden())
+        self.assertFalse(card_sim.isHidden())
+
+    def test_ordering_by_recoverable_bytes(self):
+        # Create a second group with multiple larger copies (larger recoverable bytes)
+        large_orig = self.photos / "large_orig.jpg"
+        _photo(large_orig, size=(640, 480), phase=1.7)
+        large_copy1 = self.photos / "large_copy1.jpg"
+        shutil.copy2(large_orig, large_copy1)
+        large_copy2 = self.photos / "large_copy2.jpg"
+        shutil.copy2(large_orig, large_copy2)
+
+        self._scan()
+        self.assertEqual(len(self.page.review.groups), 2)
+
+        # Compute recoverable bytes for each group
+        rec_sizes = []
+        for g in self.page.review.groups:
+            rec = sum(i.size for i in g.items if i.id != g.keeper_id)
+            rec_sizes.append(rec)
+
+        # Groups must be ordered descending by recoverable bytes
+        self.assertEqual(rec_sizes, sorted(rec_sizes, reverse=True))
+        self.assertGreater(rec_sizes[0], rec_sizes[1])
+
+        # Rendered cards in results layout are in the same descending order
+        rendered_rec_sizes = []
+        for card in self.page.cards:
+            gid = card.group_id
+            group = next(g for g in self.page.review.groups if g.id == gid)
+            rendered_rec_sizes.append(sum(i.size for i in group.items if i.id != group.keeper_id))
+        self.assertEqual(rendered_rec_sizes, sorted(rendered_rec_sizes, reverse=True))
+
+    def test_selection_size_text_and_confirmation(self):
+        self._scan()
+        group = self.page.review.groups[0]
+        victim = next(item for item in group.items if item.id != group.keeper_id)
+        keeper = next(item for item in group.items if item.id == group.keeper_id)
+
+        # Initial text
+        self.assertEqual(self.page.selection_label.text(), "No photos selected.")
+
+        # Select victim
+        self.page.checks[victim.id].setChecked(True)
+        expected_size = format_duplicate_size(victim.size)
+
+        label_text = self.page.selection_label.text()
+        self.assertIn("1 photo(s) selected", label_text)
+        self.assertIn(expected_size, label_text)
+
+        # Safety: keeper's checkbox is disabled, cannot select all members from UI
+        self.assertFalse(self.page.checks[keeper.id].isEnabled())
+
+        # Test confirmation text contains count, total size, and that photos can be restored
+        captured_labels = []
+
+        def mock_exec(dialog_self):
+            for lbl in dialog_self.findChildren(QLabel):
+                captured_labels.append(lbl.text())
+            return QDialog.DialogCode.Rejected
+
+        with patch.object(ConfirmationDialog, "exec", mock_exec):
+            self.page.quarantine_selected()
+
+        combined = " ".join(captured_labels)
+        self.assertIn("1 photo(s)", combined)
+        self.assertIn(expected_size, combined)
+        self.assertIn("restored", combined)
+
+    def test_service_guard_still_holds_if_code_bypasses_ui(self):
+        self._scan()
+        all_ids = [item.id for item in self.page.review.groups[0].items]
+        with self.assertRaises(ServiceError) as ctx:
+            self.page.service.quarantine(self.page.review, all_ids)
+        self.assertIn("Keep at least one photo", str(ctx.exception))
+
 
 
 @unittest.skipIf(Image is None, "Pillow is required to generate fixtures")
