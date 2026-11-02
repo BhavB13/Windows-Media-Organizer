@@ -268,3 +268,42 @@ emulator image under `.android/avd` predates this work.
 **525 tests, OK (1 skipped)**, run once on its own by the coordinator. The skip
 is the pre-existing elevated-symlink case. Android: `:organizer` unit tests
 (22) and both debug APKs built; nothing has been run on a device or emulator.
+
+## Waves 4 and 5 on Gemini Flash (2026-11-02)
+
+Argon 4 (`gemini-4-argon-high`) refused real tasks with `RESOURCE_EXHAUSTED`
+until its reset (about 22:30 UTC on 2026-11-02); a short "PONG" probe still
+succeeded, so a probe is not evidence of capacity. `gemini-3.8-flash-high`
+accepted every task. Two or three workers ran at a time because of disk space.
+
+Full suite after merging waves 4 and 5: **639 tests, OK (1 skipped)**. Android
+`:organizer`: 42 JVM tests and a debug APK build; nothing run on a device.
+
+Merged from Flash: W17 (catalog perceptual hashes), W18 (video dates without
+ffprobe), W19 (Canon CR3 metadata), W20 (Similar Photos bulk review), W21
+(Library gallery and camera filter), W23 (disconnect and FAT32 results), W24
+(Find similar from Library), W25 (scan only files on this PC), W27 (RAW
+thumbnails), W29 (live sort-template example), W30 (quarantine reason), W22
+(Android SAF folders, USB OTG volumes, copy-only organize).
+
+### Coordinator corrections in wave 5
+
+- **W30** loosened `quarantine(...)` from keyword-only to `*args` so a reason
+  could be passed positionally; restored keyword-only.
+- **W29** added five alias attributes for the same two widgets and repeated
+  the restyling block three times; reduced to one label, one Save button and
+  one update path.
+- **W22** planning missed a name claimed earlier in the batch when that file's
+  hash was unknown; hashed every source file before showing a plan (now lazy,
+  only on a name collision); and hashed existing destination files through a
+  guessed `"$parentDocId/$name"` document id after calling
+  `getOrCreateSubfolder` during planning (now the listed document URI). Three
+  planner tests cover these.
+
+### Known limits left open
+
+- Android: the SAF tree browser stops after 64 subfolders without saying so,
+  and a destination grant also appears in the source-folder list.
+- The Quarantine page does not yet show the new duplicate/similar reason.
+- `tests.test_similar_review` page tests can time out when run alongside a
+  Gradle build; they pass alone.
