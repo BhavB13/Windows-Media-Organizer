@@ -1322,6 +1322,35 @@ private fun FoldersTabContent(
                             overflow = TextOverflow.Ellipsis
                         )
                         Spacer(modifier = Modifier.height(8.dp))
+                        if (folder.isTruncated) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Showing the first ${folder.itemCount} files — this folder is larger than the organizer reads at once.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        } else if (folder.itemCount > 0) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "${folder.itemCount} files found",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        if (folder.unreadableSubfolders > 0) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            val unreadableMsg = if (folder.unreadableSubfolders == 1) {
+                                "1 subfolder could not be read"
+                            } else {
+                                "${folder.unreadableSubfolders} subfolders could not be read"
+                            }
+                            Text(
+                                text = unreadableMsg,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
                         OutlinedButton(onClick = { onRemoveGrantedFolder(folder.treeUri) }) {
                             Text("Remove Access")
                         }

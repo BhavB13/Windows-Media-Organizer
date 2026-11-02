@@ -181,7 +181,9 @@ data class GrantedFolderInfo(
     val treeUri: String,
     val displayName: String,
     val isReadOnly: Boolean,
-    val itemCount: Int = 0
+    val itemCount: Int = 0,
+    val isTruncated: Boolean = false,
+    val unreadableSubfolders: Int = 0
 )
 
 /**
