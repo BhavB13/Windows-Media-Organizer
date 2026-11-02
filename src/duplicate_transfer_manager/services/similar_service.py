@@ -255,11 +255,19 @@ class SimilarPhotoService:
         if unknown:
             raise ServiceError(ErrorCode.VALIDATION, "The selection does not match this review. Scan again.")
         for group in review.groups:
-            ids = {item.id for item in group.items}
-            if ids and ids <= selected:
+            if not any(item.id in selected for item in group.items):
+                continue
+            # Compare against what is still in place, not just this selection:
+            # quarantining B and then A in two separate actions would otherwise
+            # pass both times and leave the group with no copy where it was.
+            staying = [
+                item for item in group.items
+                if item.id not in selected and os.path.exists(item.path)
+            ]
+            if not staying:
                 raise ServiceError(
                     ErrorCode.VALIDATION,
-                    "Keep at least one photo from every group. Every copy of one photo was selected.",
+                    "Keep at least one photo from every group. This would leave no copy of one photo in place.",
                 )
         return DuplicateQuarantineService(self.paths).quarantine(
             review.duplicate_review, selected, dry_run=dry_run

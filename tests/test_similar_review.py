@@ -495,3 +495,24 @@ class PerceptualHashStoreTests(unittest.TestCase):
         review, hashed = self._scan_counting()
         self.assertEqual(len(review.groups), 1)
         self.assertEqual(len(hashed), 2)
+
+
+@unittest.skipIf(Image is None, "Pillow is required to generate fixtures")
+class QuarantineAcrossActionsTests(unittest.TestCase):
+    def test_two_separate_actions_cannot_remove_every_copy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            photos = root / "photos"
+            photos.mkdir()
+            original = photos / "a.jpg"
+            _photo(original)
+            with Image.open(original) as handle:
+                handle.resize((240, 180)).save(photos / "b.jpg", "JPEG", quality=80)
+            service = SimilarPhotoService(get_runtime_paths(root / "data"))
+            review = service.scan([str(photos)], thumbnail_root=root / "thumbs")
+            first, second = review.groups[0].items
+
+            service.quarantine(review, [second.id])
+            with self.assertRaises(ServiceError):
+                service.quarantine(review, [first.id])
+            self.assertTrue(Path(first.path).exists(), "the last copy must stay where it was")
