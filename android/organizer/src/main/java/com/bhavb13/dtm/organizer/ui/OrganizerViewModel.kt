@@ -3,6 +3,7 @@ package com.bhavb13.dtm.organizer.ui
 import android.app.Application
 import android.graphics.Bitmap
 import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.bhavb13.dtm.organizer.core.AccessLevel
@@ -10,17 +11,29 @@ import com.bhavb13.dtm.organizer.core.DuplicateDetector
 import com.bhavb13.dtm.organizer.core.DuplicateReport
 import com.bhavb13.dtm.organizer.core.DuplicateScanProgress
 import com.bhavb13.dtm.organizer.core.DuplicateScanResult
+import com.bhavb13.dtm.organizer.core.ExistingDestinationFile
+import com.bhavb13.dtm.organizer.core.GrantedFolderInfo
 import com.bhavb13.dtm.organizer.core.LibraryAccessOutcome
 import com.bhavb13.dtm.organizer.core.MediaFilter
 import com.bhavb13.dtm.organizer.core.MediaFilterCriteria
 import com.bhavb13.dtm.organizer.core.MediaItem
 import com.bhavb13.dtm.organizer.core.MediaKind
+import com.bhavb13.dtm.organizer.core.OrganizePlan
+import com.bhavb13.dtm.organizer.core.OrganizePlanner
+import com.bhavb13.dtm.organizer.core.OrganizeProgress
+import com.bhavb13.dtm.organizer.core.OrganizeResult
+import com.bhavb13.dtm.organizer.core.OrganizeTemplate
 import com.bhavb13.dtm.organizer.core.PermissionEvaluator
 import com.bhavb13.dtm.organizer.core.PermissionStatus
+import com.bhavb13.dtm.organizer.core.Sha256Hasher
 import com.bhavb13.dtm.organizer.core.StorageAggregator
 import com.bhavb13.dtm.organizer.core.StorageSummary
+import com.bhavb13.dtm.organizer.core.UsbVolumeInfo
 import com.bhavb13.dtm.organizer.data.AndroidPermissionHelper
 import com.bhavb13.dtm.organizer.data.MediaStoreRepository
+import com.bhavb13.dtm.organizer.data.SafFolderManager
+import com.bhavb13.dtm.organizer.data.SafeCopyExecutor
+import com.bhavb13.dtm.organizer.data.UsbStorageHelper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -35,7 +48,9 @@ import kotlinx.coroutines.withContext
 enum class OrganizerTab(val title: String) {
     LIBRARY("Library"),
     DUPLICATES("Duplicates"),
-    STORAGE("Storage")
+    ORGANIZE("Organize"),
+    STORAGE("Storage"),
+    FOLDERS("Folders & USB")
 }
 
 enum class SizeRangePreset(val label: String, val minBytes: Long?, val maxBytes: Long?) {
@@ -70,7 +85,19 @@ data class OrganizerUiState(
     val scanProgress: DuplicateScanProgress? = null,
     val duplicateScanResult: DuplicateScanResult? = null,
     val duplicateReport: DuplicateReport? = null,
-    val storageSummary: StorageSummary = StorageAggregator.summarize(emptyList())
+    val storageSummary: StorageSummary = StorageAggregator.summarize(emptyList()),
+    // SAF Folders & USB OTG
+    val grantedFolders: List<GrantedFolderInfo> = emptyList(),
+    val removableVolumes: List<UsbVolumeInfo> = emptyList(),
+    // Safe Organize
+    val destinationTreeUri: String? = null,
+    val destinationLabel: String? = null,
+    val selectedOrganizeTemplate: OrganizeTemplate = OrganizeTemplate.YEAR_MONTH,
+    val isPlanningOrganize: Boolean = false,
+    val organizePlan: OrganizePlan? = null,
+    val isExecutingOrganize: Boolean = false,
+    val organizeProgress: OrganizeProgress? = null,
+    val organizeResult: OrganizeResult? = null
 )
 
 class OrganizerViewModel(application: Application) : AndroidViewModel(application) {
@@ -81,6 +108,8 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private val repository = MediaStoreRepository(application.applicationContext)
+    private val safFolderManager = SafFolderManager(application.applicationContext)
+    private val safeCopyExecutor = SafeCopyExecutor(application.applicationContext)
 
     private val mediaStoreItems = mutableListOf<MediaItem>()
     private val safItems = mutableListOf<MediaItem>()
@@ -88,6 +117,7 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
 
     private var duplicateScanJob: Job? = null
     private var pageLoadJob: Job? = null
+    private var organizeJob: Job? = null
 
     private val _uiState: MutableStateFlow<OrganizerUiState>
 
@@ -100,13 +130,61 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
                 libraryOutcome = initialOutcome
             )
         )
+        refreshDrivesAndGrantedFolders()
         refreshPermissionsAndReload()
+        loadPersistedFolderItems()
     }
 
     val uiState: StateFlow<OrganizerUiState> = _uiState.asStateFlow()
 
     fun selectTab(tab: OrganizerTab) {
         _uiState.update { it.copy(activeTab = tab) }
+    }
+
+    fun refreshDrivesAndGrantedFolders() {
+        val volumes = UsbStorageHelper.getRemovableVolumes(getApplication())
+        val grants = safFolderManager.listPersistedFolderGrants()
+        _uiState.update {
+            it.copy(
+                removableVolumes = volumes,
+                grantedFolders = grants
+            )
+        }
+    }
+
+    private fun loadPersistedFolderItems() {
+        val grants = safFolderManager.listPersistedFolderGrants()
+        if (grants.isEmpty()) return
+
+        viewModelScope.launch {
+            for (grant in grants) {
+                try {
+                    val uri = Uri.parse(grant.treeUri)
+                    val scanned = safFolderManager.browseTreeFiles(uri)
+                    val existingIds = safItems.mapTo(mutableSetOf()) { it.id }
+                    for (item in scanned) {
+                        if (item.id !in existingIds) {
+                            safItems.add(item)
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Ignore transient load failure on startup
+                }
+            }
+            val combined = mergeItems()
+            _uiState.update { state ->
+                val outcome = PermissionEvaluator.resolveLibraryOutcome(combined, state.permissionStatus)
+                state.copy(
+                    allItems = combined,
+                    filteredItems = MediaFilter.filter(combined, state.filterCriteria),
+                    libraryOutcome = outcome,
+                    storageSummary = StorageAggregator.summarize(
+                        combined,
+                        state.duplicateScanResult?.groups ?: emptyList()
+                    )
+                )
+            }
+        }
     }
 
     fun refreshPermissionsAndReload() {
@@ -174,16 +252,18 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun addSafFolderReadOnly(treeUri: Uri) {
+    fun addGrantedSourceFolder(treeUri: Uri) {
+        safFolderManager.takePersistableReadPermission(treeUri)
         viewModelScope.launch {
             _uiState.update { it.copy(isLoadingPage = true) }
-            val scanned = repository.scanSafFolderTreeReadOnly(treeUri)
+            val scanned = safFolderManager.browseTreeFiles(treeUri)
             val existingIds = safItems.mapTo(mutableSetOf()) { it.id }
             for (item in scanned) {
                 if (item.id !in existingIds) {
                     safItems.add(item)
                 }
             }
+            refreshDrivesAndGrantedFolders()
             val combined = mergeItems()
             _uiState.update { state ->
                 val outcome = PermissionEvaluator.resolveLibraryOutcome(combined, state.permissionStatus)
@@ -199,6 +279,161 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
         }
+    }
+
+    fun addSafFolderReadOnly(treeUri: Uri) {
+        addGrantedSourceFolder(treeUri)
+    }
+
+    fun removeGrantedFolder(folderUriString: String) {
+        val uri = Uri.parse(folderUriString)
+        safFolderManager.releaseReadPermission(uri)
+        val folderLabel = safFolderManager.resolveFolderDisplayName(uri)
+        val bucketTarget = "SAF: $folderLabel"
+        safItems.removeAll { it.bucketName == bucketTarget || it.id.startsWith(folderUriString) }
+
+        refreshDrivesAndGrantedFolders()
+        val combined = mergeItems()
+        _uiState.update { state ->
+            val outcome = PermissionEvaluator.resolveLibraryOutcome(combined, state.permissionStatus)
+            state.copy(
+                allItems = combined,
+                filteredItems = MediaFilter.filter(combined, state.filterCriteria),
+                libraryOutcome = outcome,
+                storageSummary = StorageAggregator.summarize(
+                    combined,
+                    state.duplicateScanResult?.groups ?: emptyList()
+                )
+            )
+        }
+    }
+
+    fun setOrganizeDestination(treeUri: Uri) {
+        safFolderManager.takePersistableReadWritePermission(treeUri)
+        val label = safFolderManager.resolveFolderDisplayName(treeUri)
+        _uiState.update {
+            it.copy(
+                destinationTreeUri = treeUri.toString(),
+                destinationLabel = label,
+                organizePlan = null,
+                organizeResult = null
+            )
+        }
+    }
+
+    fun selectOrganizeTemplate(template: OrganizeTemplate) {
+        _uiState.update {
+            it.copy(
+                selectedOrganizeTemplate = template,
+                organizePlan = null,
+                organizeResult = null
+            )
+        }
+    }
+
+    fun createOrganizePlan() {
+        val destUriStr = _uiState.value.destinationTreeUri ?: return
+        val destLabel = _uiState.value.destinationLabel ?: "Destination"
+        val template = _uiState.value.selectedOrganizeTemplate
+        val itemsToOrganize = if (_uiState.value.filterCriteria.isDefault) {
+            _uiState.value.allItems
+        } else {
+            _uiState.value.filteredItems
+        }
+        if (itemsToOrganize.isEmpty()) return
+
+        _uiState.update { it.copy(isPlanningOrganize = true, organizePlan = null, organizeResult = null) }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            val destUri = Uri.parse(destUriStr)
+            val subfolders = itemsToOrganize.map {
+                template.render(it.captureDateMillis, it.dateModifiedMillis)
+            }.distinct()
+
+            val existingFilesBySubfolder = mutableMapOf<String, List<ExistingDestinationFile>>()
+            for (sub in subfolders) {
+                val existing = safeCopyExecutor.listExistingFilesInSubfolder(destUri, sub)
+                existingFilesBySubfolder[sub] = existing
+            }
+
+            val plan = OrganizePlanner.plan(
+                items = itemsToOrganize,
+                template = template,
+                destinationTreeUri = destUriStr,
+                destinationLabel = destLabel,
+                destinationFiles = { subfolder, fileName ->
+                    existingFilesBySubfolder[subfolder]?.firstOrNull { it.fileName.equals(fileName, ignoreCase = true) }
+                },
+                sourceSha256Provider = { item ->
+                    try {
+                        repository.openStream(item).use { Sha256Hasher.hashStream(it) }
+                    } catch (_: Exception) {
+                        null
+                    }
+                },
+                destSha256Provider = { existing ->
+                    existing.documentUri?.let { safeCopyExecutor.hashExistingDocument(Uri.parse(it)) }
+                }
+            )
+
+            _uiState.update { it.copy(isPlanningOrganize = false, organizePlan = plan) }
+        }
+    }
+
+    fun clearOrganizePlan() {
+        _uiState.update { it.copy(organizePlan = null, organizeResult = null) }
+    }
+
+    fun executeOrganizePlan() {
+        val plan = _uiState.value.organizePlan ?: return
+        if (_uiState.value.isExecutingOrganize) return
+
+        _uiState.update {
+            it.copy(
+                isExecutingOrganize = true,
+                organizeProgress = OrganizeProgress(
+                    completedCount = 0,
+                    totalCount = plan.items.size,
+                    currentFileName = "",
+                    bytesCopied = 0L,
+                    totalBytesToCopy = plan.totalCopyBytes,
+                    phase = "Starting safe organize copy..."
+                ),
+                organizeResult = null
+            )
+        }
+
+        organizeJob = viewModelScope.launch {
+            val result = safeCopyExecutor.execute(
+                plan = plan,
+                onProgress = { prog ->
+                    _uiState.update { it.copy(organizeProgress = prog) }
+                },
+                isCancelled = { !coroutineContext.isActive }
+            )
+            _uiState.update {
+                it.copy(
+                    isExecutingOrganize = false,
+                    organizeProgress = null,
+                    organizeResult = result
+                )
+            }
+        }
+    }
+
+    fun cancelOrganize() {
+        organizeJob?.cancel()
+        organizeJob = null
+        _uiState.update {
+            it.copy(
+                isExecutingOrganize = false,
+                organizeProgress = null
+            )
+        }
+    }
+
+    fun dismissOrganizeResult() {
+        _uiState.update { it.copy(organizeResult = null) }
     }
 
     fun updateFilenameQuery(query: String) {
