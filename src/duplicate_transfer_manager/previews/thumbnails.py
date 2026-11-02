@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -14,6 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Protocol, Sequence, Iterable
 
+from ..media.container_exif import (
+    RAW_EXTENSIONS,
+    extract_embedded_jpeg,
+    read_raw_orientation,
+)
 from ..runtime_paths import RuntimePaths, get_runtime_paths
 
 try:
@@ -589,98 +595,214 @@ class ThumbnailCache:
 
         # Open source strictly read-only ("rb") so user media is never modified.
         try:
-            with candidate.open("rb") as source_stream:
-                with Image.open(source_stream) as image:
-                    raw_width, raw_height = int(image.width), int(image.height)
-                    raw_orientation = _extract_exif_orientation(image) if apply_exif_orientation else 0
+            is_raw = candidate.suffix.lower() in RAW_EXTENSIONS
+            if is_raw:
+                raw_orientation = read_raw_orientation(candidate) if apply_exif_orientation else 0
+                with self._lock:
+                    if apply_exif_orientation:
+                        self._orientation_memo[memo_key] = raw_orientation
+
+                key = build_cache_key(
+                    candidate,
+                    size_bytes=size_bytes,
+                    mtime_ns=mtime_ns,
+                    requested_size=requested_size,
+                    exif_orientation=raw_orientation,
+                )
+                existing = self._lookup_existing_entry(key)
+                if existing is not None:
+                    thumb_dims, thumb_fmt = _read_cached_dimensions(existing)
                     with self._lock:
-                        if apply_exif_orientation:
-                            self._orientation_memo[memo_key] = raw_orientation
-
-                    upright_dims = (
-                        (raw_height, raw_width)
-                        if raw_orientation in {5, 6, 7, 8}
-                        else (raw_width, raw_height)
-                    )
-                    key = build_cache_key(
-                        candidate,
-                        size_bytes=size_bytes,
-                        mtime_ns=mtime_ns,
+                        self._hits += 1
+                    return ThumbnailResult(
+                        source_path=source_str,
+                        thumbnail_path=existing,
+                        cache_key=key,
                         requested_size=requested_size,
+                        size=thumb_dims,
+                        source_dimensions=(0, 0),
                         exif_orientation=raw_orientation,
+                        format=thumb_fmt,
+                        cache_hit=True,
+                        generated=False,
                     )
 
-                    # Check on-disk cache before decoding pixel data (handles warm disk cache across runs).
-                    existing = self._lookup_existing_entry(key)
-                    if existing is not None:
-                        thumb_dims, thumb_fmt = _read_cached_dimensions(existing)
+                if _is_cancelled(stop_event):
+                    return ThumbnailResult(
+                        source_path=source_str,
+                        thumbnail_path=None,
+                        cache_key=key,
+                        requested_size=requested_size,
+                        cancelled=True,
+                    )
+
+                # Try opening with Pillow first; if that fails or yields a tiny IFD0
+                # thumbnail smaller than the requested size, decode the embedded JPEG.
+                pillow_img = None
+                try:
+                    with candidate.open("rb") as source_stream:
+                        candidate_img = Image.open(source_stream)
+                        if candidate_img.width >= requested_size[0] or candidate_img.height >= requested_size[1]:
+                            pillow_img = candidate_img
+                            pillow_img.load()
+                except Exception:
+                    pillow_img = None
+
+                if pillow_img is not None:
+                    work_image = pillow_img
+                    source_format = (pillow_img.format or "").upper()
+                else:
+                    jpeg_bytes = extract_embedded_jpeg(candidate)
+                    if not jpeg_bytes:
+                        raise ValueError("No supported image or embedded JPEG preview found in RAW file")
+                    work_image = Image.open(io.BytesIO(jpeg_bytes))
+                    source_format = "JPEG"
+
+                raw_width, raw_height = int(work_image.width), int(work_image.height)
+                upright_dims = (
+                    (raw_height, raw_width)
+                    if raw_orientation in {5, 6, 7, 8}
+                    else (raw_width, raw_height)
+                )
+
+                if _is_cancelled(stop_event):
+                    return ThumbnailResult(
+                        source_path=source_str,
+                        thumbnail_path=None,
+                        cache_key=key,
+                        requested_size=requested_size,
+                        cancelled=True,
+                    )
+
+                if source_format == "JPEG":
+                    draft_size = (
+                        (requested_size[1], requested_size[0])
+                        if raw_orientation in {5, 6, 7, 8}
+                        else requested_size
+                    )
+                    try:
+                        work_image.draft("RGB", draft_size)
+                    except Exception:
+                        pass
+
+                if apply_exif_orientation and raw_orientation > 1:
+                    work_image = _apply_exif_orientation(work_image, raw_orientation)
+                else:
+                    work_image.load()
+
+                if _is_cancelled(stop_event):
+                    return ThumbnailResult(
+                        source_path=source_str,
+                        thumbnail_path=None,
+                        cache_key=key,
+                        requested_size=requested_size,
+                        cancelled=True,
+                    )
+
+                keep_alpha = _has_transparency(work_image)
+                target_mode = "RGBA" if keep_alpha else "RGB"
+                if work_image.mode != target_mode:
+                    work_image = work_image.convert(target_mode)
+
+                resample_ns = getattr(Image, "Resampling", Image)
+                resample_filter = getattr(resample_ns, "LANCZOS", getattr(Image, "LANCZOS", 1))
+                work_image.thumbnail(requested_size, resample=resample_filter)
+                final_size = (int(work_image.width), int(work_image.height))
+                target_ext = "png" if keep_alpha else "jpg"
+                target_format = "PNG" if keep_alpha else "JPEG"
+            else:
+                with candidate.open("rb") as source_stream:
+                    with Image.open(source_stream) as image:
+                        raw_width, raw_height = int(image.width), int(image.height)
+                        raw_orientation = _extract_exif_orientation(image) if apply_exif_orientation else 0
                         with self._lock:
-                            self._hits += 1
-                        return ThumbnailResult(
-                            source_path=source_str,
-                            thumbnail_path=existing,
-                            cache_key=key,
-                            requested_size=requested_size,
-                            size=thumb_dims,
-                            source_dimensions=upright_dims,
-                            exif_orientation=raw_orientation,
-                            format=thumb_fmt,
-                            cache_hit=True,
-                            generated=False,
-                        )
+                            if apply_exif_orientation:
+                                self._orientation_memo[memo_key] = raw_orientation
 
-                    if _is_cancelled(stop_event):
-                        return ThumbnailResult(
-                            source_path=source_str,
-                            thumbnail_path=None,
-                            cache_key=key,
-                            requested_size=requested_size,
-                            cancelled=True,
-                        )
-
-                    # Main performance win: for JPEGs, configure draft mode before any pixel
-                    # access so libjpeg decodes at a reduced DCT scale factor instead of
-                    # decoding the full-resolution photo first.
-                    source_format = (image.format or "").upper()
-                    if source_format == "JPEG":
-                        draft_size = (
-                            (requested_size[1], requested_size[0])
+                        upright_dims = (
+                            (raw_height, raw_width)
                             if raw_orientation in {5, 6, 7, 8}
-                            else requested_size
+                            else (raw_width, raw_height)
                         )
-                        try:
-                            image.draft("RGB", draft_size)
-                        except Exception:
-                            pass
-
-                    work_image: Any = image
-                    if apply_exif_orientation and raw_orientation > 1:
-                        work_image = _apply_exif_orientation(work_image, raw_orientation)
-                    else:
-                        work_image.load()
-
-                    if _is_cancelled(stop_event):
-                        return ThumbnailResult(
-                            source_path=source_str,
-                            thumbnail_path=None,
-                            cache_key=key,
+                        key = build_cache_key(
+                            candidate,
+                            size_bytes=size_bytes,
+                            mtime_ns=mtime_ns,
                             requested_size=requested_size,
-                            cancelled=True,
+                            exif_orientation=raw_orientation,
                         )
 
-                    keep_alpha = _has_transparency(work_image)
-                    target_mode = "RGBA" if keep_alpha else "RGB"
-                    if work_image.mode != target_mode:
-                        work_image = work_image.convert(target_mode)
-                    elif work_image is image:
-                        work_image = work_image.copy()
+                        # Check on-disk cache before decoding pixel data (handles warm disk cache across runs).
+                        existing = self._lookup_existing_entry(key)
+                        if existing is not None:
+                            thumb_dims, thumb_fmt = _read_cached_dimensions(existing)
+                            with self._lock:
+                                self._hits += 1
+                            return ThumbnailResult(
+                                source_path=source_str,
+                                thumbnail_path=existing,
+                                cache_key=key,
+                                requested_size=requested_size,
+                                size=thumb_dims,
+                                source_dimensions=upright_dims,
+                                exif_orientation=raw_orientation,
+                                format=thumb_fmt,
+                                cache_hit=True,
+                                generated=False,
+                            )
 
-                    resample_ns = getattr(Image, "Resampling", Image)
-                    resample_filter = getattr(resample_ns, "LANCZOS", getattr(Image, "LANCZOS", 1))
-                    work_image.thumbnail(requested_size, resample=resample_filter)
-                    final_size = (int(work_image.width), int(work_image.height))
-                    target_ext = "png" if keep_alpha else "jpg"
-                    target_format = "PNG" if keep_alpha else "JPEG"
+                        if _is_cancelled(stop_event):
+                            return ThumbnailResult(
+                                source_path=source_str,
+                                thumbnail_path=None,
+                                cache_key=key,
+                                requested_size=requested_size,
+                                cancelled=True,
+                            )
+
+                        # Main performance win: for JPEGs, configure draft mode before any pixel
+                        # access so libjpeg decodes at a reduced DCT scale factor instead of
+                        # decoding the full-resolution photo first.
+                        source_format = (image.format or "").upper()
+                        if source_format == "JPEG":
+                            draft_size = (
+                                (requested_size[1], requested_size[0])
+                                if raw_orientation in {5, 6, 7, 8}
+                                else requested_size
+                            )
+                            try:
+                                image.draft("RGB", draft_size)
+                            except Exception:
+                                pass
+
+                        work_image: Any = image
+                        if apply_exif_orientation and raw_orientation > 1:
+                            work_image = _apply_exif_orientation(work_image, raw_orientation)
+                        else:
+                            work_image.load()
+
+                        if _is_cancelled(stop_event):
+                            return ThumbnailResult(
+                                source_path=source_str,
+                                thumbnail_path=None,
+                                cache_key=key,
+                                requested_size=requested_size,
+                                cancelled=True,
+                            )
+
+                        keep_alpha = _has_transparency(work_image)
+                        target_mode = "RGBA" if keep_alpha else "RGB"
+                        if work_image.mode != target_mode:
+                            work_image = work_image.convert(target_mode)
+                        elif work_image is image:
+                            work_image = work_image.copy()
+
+                        resample_ns = getattr(Image, "Resampling", Image)
+                        resample_filter = getattr(resample_ns, "LANCZOS", getattr(Image, "LANCZOS", 1))
+                        work_image.thumbnail(requested_size, resample=resample_filter)
+                        final_size = (int(work_image.width), int(work_image.height))
+                        target_ext = "png" if keep_alpha else "jpg"
+                        target_format = "PNG" if keep_alpha else "JPEG"
         except Exception as exc:
             with self._lock:
                 self._errors += 1
