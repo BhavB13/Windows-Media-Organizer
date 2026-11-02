@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 import hashlib
 import os
@@ -13,6 +13,7 @@ import struct
 import time
 from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
+from ..media import perceptual
 from .schema import (
     DEFAULT_BUSY_TIMEOUT_MS,
     SCHEMA_VERSION,
@@ -112,6 +113,249 @@ class StopEventProtocol(Protocol):
 
 def _is_cancelled(stop_event: StopEventProtocol | None) -> bool:
     return bool(stop_event is not None and stop_event.is_set())
+
+
+def _format_perceptual_hash(val: Any) -> str | None:
+    """Serialize a perceptual hash (int, ImageHash, or hex string) as lowercase hex text.
+
+    SQLite INTEGER values are signed 64-bit (-2^63 to 2^63 - 1), so an unsigned 64-bit
+    hash with its top bit set (>= 2^63) would overflow or negate if stored as an INTEGER.
+    Storing as hex text guarantees exact 64-bit round-tripping for any hash value.
+    """
+    if val is None:
+        return None
+    if isinstance(val, perceptual.ImageHash):
+        return str(val.to_hex())
+    if isinstance(val, int) and not isinstance(val, bool):
+        return f"{val:016x}"
+    if isinstance(val, str):
+        cleaned = val.strip().lower()
+        if cleaned.startswith("0x"):
+            cleaned = cleaned[2:]
+        if not cleaned:
+            return None
+        if len(cleaned) < 16:
+            cleaned = cleaned.zfill(16)
+        return cleaned
+    return None
+
+
+def _format_rotation_hashes(rotations: Any) -> str | None:
+    """Serialize a sequence of rotation hashes as comma-separated hex strings."""
+    if not rotations:
+        return None
+    if isinstance(rotations, str):
+        return rotations.strip()
+    parts: list[str] = []
+    for item in rotations:
+        formatted = _format_perceptual_hash(item)
+        if formatted:
+            parts.append(formatted)
+    return ",".join(parts) if parts else None
+
+
+def partition_bit_slices(bit_count: int = 64, max_distance: int = 8) -> tuple[tuple[int, int], ...]:
+    """Compute (shift, mask) slices for multi-index pigeonhole prefix bucketing.
+
+    By the pigeonhole principle, if a ``bit_count``-bit hash is partitioned into
+    ``B = max_distance + 1`` disjoint bit slices, any two hashes with Hamming
+    distance ``<= max_distance`` are guaranteed to share at least one identical
+    slice (zero bit errors within that slice). For ``max_distance == 0``, a
+    single full-width slice is used.
+    """
+    if max_distance <= 0:
+        return ((0, (1 << bit_count) - 1),)
+    num_bands = max_distance + 1
+    if num_bands > bit_count // 2:
+        return ((0, (1 << bit_count) - 1),)
+
+    slices: list[tuple[int, int]] = []
+    base_width = bit_count // num_bands
+    remainder = bit_count % num_bands
+    shift = 0
+    for band in range(num_bands):
+        width = base_width + (1 if band < remainder else 0)
+        mask = (1 << width) - 1
+        slices.append((shift, mask))
+        shift += width
+    return tuple(slices)
+
+
+class _UnionFind:
+    """Disjoint-set (Union-Find) data structure with path compression and rank heuristic."""
+
+    def __init__(self, size: int) -> None:
+        self.parent: list[int] = list(range(size))
+        self.rank: list[int] = [0] * size
+
+    def find(self, item: int) -> int:
+        root = item
+        while self.parent[root] != root:
+            root = self.parent[root]
+        curr = item
+        while curr != root:
+            nxt = self.parent[curr]
+            self.parent[curr] = root
+            curr = nxt
+        return root
+
+    def union(self, a: int, b: int) -> None:
+        root_a = self.find(a)
+        root_b = self.find(b)
+        if root_a == root_b:
+            return
+        if self.rank[root_a] < self.rank[root_b]:
+            root_a, root_b = root_b, root_a
+        self.parent[root_b] = root_a
+        if self.rank[root_a] == self.rank[root_b]:
+            self.rank[root_a] += 1
+
+
+def banded_candidate_search(
+    hashes: Sequence[int | str | perceptual.ImageHash],
+    max_distance: int = 8,
+    *,
+    stop_event: StopEventProtocol | None = None,
+) -> set[tuple[int, int]]:
+    """Find all unique pairs (i, j) with i < j whose Hamming distance is <= max_distance.
+
+    Candidate Generation (Multi-Index Pigeonhole Banding):
+        Rather than performing an O(N^2) brute-force scan, the 64-bit hash is partitioned
+        into B = max_distance + 1 disjoint bit slices (bands). By the Pigeonhole Principle,
+        any two hashes differing in at most max_distance bits MUST be identical in at
+        least one of the B bands.
+
+        Each hash is indexed into buckets keyed by (band_index, band_slice_value). Only
+        pairs colliding in at least one bucket are generated as candidates; their exact
+        64-bit Hamming distance is verified before admission.
+    """
+    if _is_cancelled(stop_event):
+        return set()
+
+    int_hashes: list[int] = []
+    for h in hashes:
+        if isinstance(h, int) and not isinstance(h, bool):
+            int_hashes.append(h)
+        elif isinstance(h, perceptual.ImageHash):
+            int_hashes.append(h.bits)
+        elif isinstance(h, str):
+            clean = h.strip().lower()
+            if clean.startswith("0x"):
+                clean = clean[2:]
+            int_hashes.append(int(clean, 16))
+        else:
+            raise TypeError(f"Unsupported hash type: {type(h).__name__}")
+
+    n = len(int_hashes)
+    if n < 2:
+        return set()
+
+    slices = partition_bit_slices(64, max_distance)
+    buckets: dict[tuple[int, int], list[int]] = {}
+
+    for idx, val in enumerate(int_hashes):
+        if _is_cancelled(stop_event):
+            return set()
+        for slice_idx, (shift, mask) in enumerate(slices):
+            key = (slice_idx, (val >> shift) & mask)
+            bucket = buckets.get(key)
+            if bucket is None:
+                buckets[key] = [idx]
+            elif bucket[-1] != idx:
+                bucket.append(idx)
+
+    matching_pairs: set[tuple[int, int]] = set()
+    tested_pairs: set[tuple[int, int]] = set()
+
+    for bucket in buckets.values():
+        if _is_cancelled(stop_event):
+            return set()
+        b_len = len(bucket)
+        if b_len < 2:
+            continue
+        for i in range(b_len):
+            idx_a = bucket[i]
+            for j in range(i + 1, b_len):
+                idx_b = bucket[j]
+                pair = (idx_a, idx_b) if idx_a < idx_b else (idx_b, idx_a)
+                if pair in tested_pairs:
+                    continue
+                tested_pairs.add(pair)
+                dist = (int_hashes[pair[0]] ^ int_hashes[pair[1]]).bit_count()
+                if dist <= max_distance:
+                    matching_pairs.add(pair)
+
+    return matching_pairs
+
+
+class SimilarMatch(tuple):
+    """Catalog record paired with its perceptual Hamming distance to a query image.
+
+    Behaves as a 2-tuple (record, distance) while also exposing ``.record`` and
+    ``.distance`` properties and transparently delegating record attribute lookups.
+    """
+
+    def __new__(cls, record: Any, distance: int) -> SimilarMatch:
+        return super().__new__(cls, (record, int(distance)))
+
+    @property
+    def record(self) -> Any:
+        return self[0]
+
+    @property
+    def distance(self) -> int:
+        return self[1]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self[0], name)
+
+    def __repr__(self) -> str:
+        rec_path = getattr(self[0], "relative_path", self[0])
+        return f"SimilarMatch(record={rec_path!r}, distance={self[1]})"
+
+
+class SimilarCatalogGroup(Sequence["CatalogFileRecord"]):
+    """A transitive cluster of perceptually similar catalog records in deterministic order."""
+
+    def __init__(self, records: Sequence["CatalogFileRecord"]) -> None:
+        self._records = tuple(records)
+
+    @property
+    def records(self) -> tuple["CatalogFileRecord", ...]:
+        return self._records
+
+    @property
+    def paths(self) -> tuple[str, ...]:
+        return tuple(r.relative_path for r in self._records)
+
+    @property
+    def items(self) -> tuple["CatalogFileRecord", ...]:
+        return self._records
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __iter__(self) -> Iterator["CatalogFileRecord"]:
+        return iter(self._records)
+
+    def __getitem__(self, index: int | slice) -> Any:
+        return self._records[index]
+
+    def __contains__(self, item: object) -> bool:
+        if isinstance(item, str):
+            return any(r.relative_path == item for r in self._records)
+        return item in self._records
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, SimilarCatalogGroup):
+            return self._records == other._records
+        if isinstance(other, (tuple, list)):
+            return self._records == tuple(other)
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        paths_repr = [r.relative_path for r in self._records]
+        return f"SimilarCatalogGroup({paths_repr!r})"
 
 
 def classify_media_kind(path_or_ext: str | Path) -> str:
@@ -277,6 +521,9 @@ class CatalogFileInput:
     camera_model: str | None = None
     width: int | None = None
     height: int | None = None
+    perceptual_hash: str | int | perceptual.ImageHash | None = None
+    perceptual_algo: str | None = None
+    perceptual_rotations: str | Sequence[str | int | perceptual.ImageHash] | None = None
 
     def resolved_metadata(self) -> MediaMetadata | None:
         if self.metadata is not None:
@@ -324,10 +571,37 @@ class CatalogFileRecord:
     camera_model: str | None = None
     width: int | None = None
     height: int | None = None
+    perceptual_hash: str | None = None
+    perceptual_algo: str | None = None
+    perceptual_rotations: str | None = None
+    similarity_distance: int | None = None
 
     @property
     def is_offline(self) -> bool:
         return not self.volume_online
+
+    @property
+    def distance(self) -> int | None:
+        return self.similarity_distance
+
+    @property
+    def perceptual_bits(self) -> int | None:
+        if self.perceptual_hash is None:
+            return None
+        try:
+            return int(self.perceptual_hash, 16)
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def perceptual_algorithm(self) -> str | None:
+        return self.perceptual_algo
+
+    @property
+    def rotation_hashes(self) -> tuple[str, ...]:
+        if not self.perceptual_rotations:
+            return ()
+        return tuple(p for p in self.perceptual_rotations.split(",") if p)
 
     @property
     def metadata(self) -> MediaMetadata:
@@ -1067,6 +1341,9 @@ class MediaCatalog:
                 media_kind=item.media_kind,
                 file_path=file_path,
                 metadata=item.resolved_metadata(),
+                perceptual_hash=_format_perceptual_hash(item.perceptual_hash),
+                perceptual_algo=item.perceptual_algo,
+                perceptual_rotations=_format_rotation_hashes(item.perceptual_rotations),
             )
 
         if isinstance(item, (str, Path)):
@@ -1105,6 +1382,12 @@ class MediaCatalog:
             else:
                 meta_obj = None
 
+            raw_p_hash = item.get("perceptual_hash")
+            if raw_p_hash is None:
+                raw_p_hash = item.get("perceptual_bits")
+            raw_p_algo = item.get("perceptual_algo") or item.get("perceptual_algorithm")
+            raw_p_rot = item.get("perceptual_rotations") or item.get("rotation_hashes")
+
             candidate_input = CatalogFileInput(
                 relative_path=str(item["relative_path"]),
                 size=item.get("size"),
@@ -1118,6 +1401,9 @@ class MediaCatalog:
                 camera_model=item.get("camera_model"),
                 width=item.get("width"),
                 height=item.get("height"),
+                perceptual_hash=_format_perceptual_hash(raw_p_hash),
+                perceptual_algo=str(raw_p_algo) if raw_p_algo else None,
+                perceptual_rotations=_format_rotation_hashes(raw_p_rot),
             )
             return self._coerce_file_input(candidate_input, volume_root)
 
@@ -1134,8 +1420,12 @@ class MediaCatalog:
         volume_online: bool | None = None,
         compute_hashes: bool = True,
         extract_metadata: bool = True,
+        compute_perceptual: bool = False,
+        perceptual_algo: str = "phash",
+        rotation_invariant_hashes: bool = False,
         hash_fn: Callable[[Path], str | None] | None = None,
         metadata_fn: Callable[[Path], MediaMetadata | None] | None = None,
+        perceptual_hash_fn: Callable[[Path], Any] | None = None,
         remove_missing: bool = False,
         stop_event: StopEventProtocol | None = None,
     ) -> UpsertResult:
@@ -1201,13 +1491,39 @@ class MediaCatalog:
         seen_paths: set[str] = set()
 
         # Prepared operations:
-        # insert_ops: (rel_path, filename, ext, size, mtime_ns, content_hash, media_kind, indexed_at, meta)
+        # insert_ops: (rel_path, filename, ext, size, mtime_ns, content_hash, media_kind, indexed_at, meta, p_hash, p_algo, p_rot)
         insert_ops: list[
-            tuple[str, str, str, int, int, str | None, str, float, MediaMetadata | None]
+            tuple[
+                str,
+                str,
+                str,
+                int,
+                int,
+                str | None,
+                str,
+                float,
+                MediaMetadata | None,
+                str | None,
+                str | None,
+                str | None,
+            ]
         ] = []
-        # update_ops: (file_id, filename, ext, size, mtime_ns, content_hash, media_kind, indexed_at, meta)
+        # update_ops: (file_id, filename, ext, size, mtime_ns, content_hash, media_kind, indexed_at, meta, p_hash, p_algo, p_rot)
         update_ops: list[
-            tuple[int, str, str, int, int, str | None, str, float, MediaMetadata | None]
+            tuple[
+                int,
+                str,
+                str,
+                int,
+                int,
+                str | None,
+                str,
+                float,
+                MediaMetadata | None,
+                str | None,
+                str | None,
+                str | None,
+            ]
         ] = []
 
         now = time.time()
@@ -1260,15 +1576,71 @@ class MediaCatalog:
                 else classify_media_kind(ext or filename)
             )
 
+            p_hash = coerced.perceptual_hash
+            p_algo = coerced.perceptual_algo or perceptual_algo
+            p_rot = coerced.perceptual_rotations
+
+            if p_hash is None and compute_perceptual and media_kind == "image" and file_path_obj is not None:
+                try:
+                    if perceptual_hash_fn is not None:
+                        computed_h = perceptual_hash_fn(file_path_obj)
+                    else:
+                        computed_h = perceptual.compute_image_hash(
+                            file_path_obj,
+                            algorithm=p_algo,
+                            stop_event=stop_event,
+                        )
+                    if _is_cancelled(stop_event):
+                        return UpsertResult(volume_status="cancelled", cancelled=True)
+                    if computed_h is not None:
+                        p_hash = _format_perceptual_hash(computed_h)
+                        if rotation_invariant_hashes:
+                            rot_res = perceptual.orientation_invariant_hashes(
+                                file_path_obj,
+                                algorithm=p_algo,
+                                stop_event=stop_event,
+                            )
+                            if rot_res:
+                                p_rot = _format_rotation_hashes(rot_res)
+                except Exception:
+                    p_hash = None
+                    p_rot = None
+
             if existing_entry is None:
                 insert_ops.append(
-                    (rel_path, filename, ext, size, mtime_ns, content_hash, media_kind, now, meta)
+                    (
+                        rel_path,
+                        filename,
+                        ext,
+                        size,
+                        mtime_ns,
+                        content_hash,
+                        media_kind,
+                        now,
+                        meta,
+                        p_hash,
+                        p_algo,
+                        p_rot,
+                    )
                 )
                 added += 1
             else:
                 file_id = existing_entry[0]
                 update_ops.append(
-                    (file_id, filename, ext, size, mtime_ns, content_hash, media_kind, now, meta)
+                    (
+                        file_id,
+                        filename,
+                        ext,
+                        size,
+                        mtime_ns,
+                        content_hash,
+                        media_kind,
+                        now,
+                        meta,
+                        p_hash,
+                        p_algo,
+                        p_rot,
+                    )
                 )
                 updated += 1
 
@@ -1333,6 +1705,9 @@ class MediaCatalog:
                 media_kind,
                 indexed_at,
                 meta,
+                p_hash,
+                p_algo,
+                p_rot,
             ) in insert_ops:
                 if _is_cancelled(stop_event):
                     self._rollback()
@@ -1341,9 +1716,10 @@ class MediaCatalog:
                     """
                     INSERT INTO files (
                         volume_key, relative_path, filename, extension,
-                        size, mtime_ns, content_hash, media_kind, indexed_at
+                        size, mtime_ns, content_hash, media_kind, indexed_at,
+                        perceptual_hash, perceptual_algo, perceptual_rotations
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         key,
@@ -1355,6 +1731,9 @@ class MediaCatalog:
                         content_hash,
                         media_kind,
                         indexed_at,
+                        p_hash,
+                        p_algo,
+                        p_rot,
                     ),
                 )
                 new_file_id = int(cursor.lastrowid)
@@ -1370,6 +1749,9 @@ class MediaCatalog:
                 media_kind,
                 indexed_at,
                 meta,
+                p_hash,
+                p_algo,
+                p_rot,
             ) in update_ops:
                 if _is_cancelled(stop_event):
                     self._rollback()
@@ -1378,7 +1760,8 @@ class MediaCatalog:
                     """
                     UPDATE files
                     SET filename = ?, extension = ?, size = ?, mtime_ns = ?,
-                        content_hash = ?, media_kind = ?, indexed_at = ?
+                        content_hash = ?, media_kind = ?, indexed_at = ?,
+                        perceptual_hash = ?, perceptual_algo = ?, perceptual_rotations = ?
                     WHERE id = ?
                     """,
                     (
@@ -1389,6 +1772,9 @@ class MediaCatalog:
                         content_hash,
                         media_kind,
                         indexed_at,
+                        p_hash,
+                        p_algo,
+                        p_rot,
                         file_id,
                     ),
                 )
@@ -1426,8 +1812,12 @@ class MediaCatalog:
         filesystem: str = "",
         compute_hashes: bool = True,
         extract_metadata: bool = True,
+        compute_perceptual: bool = False,
+        perceptual_algo: str = "phash",
+        rotation_invariant_hashes: bool = False,
         hash_fn: Callable[[Path], str | None] | None = None,
         metadata_fn: Callable[[Path], MediaMetadata | None] | None = None,
+        perceptual_hash_fn: Callable[[Path], Any] | None = None,
         remove_missing: bool = False,
         stop_event: StopEventProtocol | None = None,
     ) -> UpsertResult:
@@ -1444,8 +1834,12 @@ class MediaCatalog:
             filesystem=filesystem,
             compute_hashes=compute_hashes,
             extract_metadata=extract_metadata,
+            compute_perceptual=compute_perceptual,
+            perceptual_algo=perceptual_algo,
+            rotation_invariant_hashes=rotation_invariant_hashes,
             hash_fn=hash_fn,
             metadata_fn=metadata_fn,
+            perceptual_hash_fn=perceptual_hash_fn,
             remove_missing=remove_missing,
             stop_event=stop_event,
         )
@@ -1492,6 +1886,7 @@ class MediaCatalog:
             SELECT
                 f.id, f.volume_key, f.relative_path, f.filename, f.extension,
                 f.size, f.mtime_ns, f.content_hash, f.media_kind, f.indexed_at,
+                f.perceptual_hash, f.perceptual_algo, f.perceptual_rotations,
                 v.is_online AS volume_online,
                 m.capture_timestamp, m.capture_date, m.capture_year,
                 m.camera_make, m.camera_model, m.width, m.height
@@ -1680,6 +2075,7 @@ class MediaCatalog:
             SELECT
                 f.id, f.volume_key, f.relative_path, f.filename, f.extension,
                 f.size, f.mtime_ns, f.content_hash, f.media_kind, f.indexed_at,
+                f.perceptual_hash, f.perceptual_algo, f.perceptual_rotations,
                 v.is_online AS volume_online,
                 m.capture_timestamp, m.capture_date, m.capture_year,
                 m.camera_make, m.camera_model, m.width, m.height
@@ -1711,6 +2107,7 @@ class MediaCatalog:
     @staticmethod
     def _row_to_file_record(row: sqlite3.Row) -> CatalogFileRecord:
         online = bool(row["volume_online"])
+        keys = row.keys()
         return CatalogFileRecord(
             id=int(row["id"]),
             volume_key=str(row["volume_key"]),
@@ -1735,7 +2132,434 @@ class MediaCatalog:
             camera_model=str(row["camera_model"]) if row["camera_model"] is not None else None,
             width=int(row["width"]) if row["width"] is not None else None,
             height=int(row["height"]) if row["height"] is not None else None,
+            perceptual_hash=(
+                str(row["perceptual_hash"])
+                if "perceptual_hash" in keys and row["perceptual_hash"] is not None
+                else None
+            ),
+            perceptual_algo=(
+                str(row["perceptual_algo"])
+                if "perceptual_algo" in keys and row["perceptual_algo"] is not None
+                else None
+            ),
+            perceptual_rotations=(
+                str(row["perceptual_rotations"])
+                if "perceptual_rotations" in keys and row["perceptual_rotations"] is not None
+                else None
+            ),
         )
+
+    # ------------------------------------------------------------------
+    # Perceptual Similarity Queries (Task W17)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def banded_candidate_search(
+        hashes: Sequence[int | str | perceptual.ImageHash],
+        max_distance: int = 8,
+        *,
+        stop_event: StopEventProtocol | None = None,
+    ) -> set[tuple[int, int]]:
+        """Find all unique pairs (i, j) with i < j whose Hamming distance is <= max_distance.
+
+        Candidate Generation (Multi-Index Pigeonhole Banding):
+            Partitions the 64-bit hash into B = max_distance + 1 disjoint bit slices (bands).
+            By the Pigeonhole Principle, any two hashes differing in at most max_distance
+            bits MUST share at least one band identically.
+
+            Each hash is indexed into buckets keyed by (band_index, band_slice_value). Only
+            pairs colliding in at least one bucket are generated as candidates, and their
+            exact Hamming distance is verified before admission.
+        """
+        return banded_candidate_search(hashes, max_distance=max_distance, stop_event=stop_event)
+
+    def find_similar(
+        self,
+        file_id_or_path: int | str | Path | CatalogFileRecord,
+        *,
+        max_distance: int = 8,
+        rotation_invariant: bool = False,
+        volume_key: str | None = None,
+        limit: int | None = None,
+        stop_event: StopEventProtocol | None = None,
+    ) -> list[SimilarMatch]:
+        """Find catalog records perceptually similar to a query image within ``max_distance``.
+
+        Candidate Generation (Prefix/Band Multi-Index Pigeonhole Filtering):
+            Rather than performing a full O(N) scan across large catalogs, candidate
+            filtering leverages the pigeonhole principle: the 64-bit perceptual hash is
+            partitioned into B = max_distance + 1 disjoint bit slices (bands). Any two
+            hashes within Hamming distance d must match identically in at least one band
+            when B > d.
+
+            Only candidate records sharing at least one band slice with the query image
+            are evaluated for exact Hamming distance, pruning non-matching images rapidly.
+
+        Args:
+            file_id_or_path: Target catalog file ID, path, or record.
+            max_distance: Maximum Hamming distance threshold (default 8).
+            rotation_invariant: When True, compares EXIF-normalized 0/90/180/270 rotations.
+            volume_key: Optional volume filter to constrain search.
+            limit: Optional maximum number of matches to return.
+            stop_event: Optional cooperative cancellation event.
+
+        Returns:
+            List of ``SimilarMatch`` (record, distance) instances, sorted nearest first.
+        """
+        if _is_cancelled(stop_event):
+            return []
+
+        target_id: int | None = None
+        target_rec: CatalogFileRecord | None = None
+        target_bits: int | None = None
+        target_algo: str = "phash"
+        target_rot_hashes: tuple[perceptual.ImageHash, ...] = ()
+
+        if isinstance(file_id_or_path, CatalogFileRecord):
+            target_rec = file_id_or_path
+            target_id = target_rec.id
+            if target_rec.perceptual_hash:
+                target_bits = int(target_rec.perceptual_hash, 16)
+                target_algo = target_rec.perceptual_algo or "phash"
+                if target_rec.perceptual_rotations:
+                    target_rot_hashes = tuple(
+                        perceptual.ImageHash(algorithm=target_algo, bits=int(h, 16))
+                        for h in target_rec.rotation_hashes
+                    )
+        elif isinstance(file_id_or_path, int) and not isinstance(file_id_or_path, bool):
+            target_id = int(file_id_or_path)
+            rows = self.connection.execute(
+                """
+                SELECT
+                    f.id, f.volume_key, f.relative_path, f.filename, f.extension,
+                    f.size, f.mtime_ns, f.content_hash, f.media_kind, f.indexed_at,
+                    f.perceptual_hash, f.perceptual_algo, f.perceptual_rotations,
+                    v.is_online AS volume_online,
+                    m.capture_timestamp, m.capture_date, m.capture_year,
+                    m.camera_make, m.camera_model, m.width, m.height
+                FROM files f
+                JOIN volumes v ON v.volume_key = f.volume_key
+                LEFT JOIN metadata m ON m.file_id = f.id
+                WHERE f.id = ?
+                """,
+                (target_id,),
+            ).fetchall()
+            if not rows:
+                raise ValueError(f"File ID not found in catalog: {target_id}")
+            target_rec = self._row_to_file_record(rows[0])
+            if target_rec.perceptual_hash:
+                target_bits = int(target_rec.perceptual_hash, 16)
+                target_algo = target_rec.perceptual_algo or "phash"
+                if target_rec.perceptual_rotations:
+                    target_rot_hashes = tuple(
+                        perceptual.ImageHash(algorithm=target_algo, bits=int(h, 16))
+                        for h in target_rec.rotation_hashes
+                    )
+        else:
+            path_str = str(file_id_or_path)
+            if volume_key is not None:
+                target_rec = self.get_file(volume_key, path_str)
+            if target_rec is None:
+                norm_path = path_str.replace("\\", "/").lstrip("/")
+                rows = self.connection.execute(
+                    """
+                    SELECT
+                        f.id, f.volume_key, f.relative_path, f.filename, f.extension,
+                        f.size, f.mtime_ns, f.content_hash, f.media_kind, f.indexed_at,
+                        f.perceptual_hash, f.perceptual_algo, f.perceptual_rotations,
+                        v.is_online AS volume_online,
+                        m.capture_timestamp, m.capture_date, m.capture_year,
+                        m.camera_make, m.camera_model, m.width, m.height
+                    FROM files f
+                    JOIN volumes v ON v.volume_key = f.volume_key
+                    LEFT JOIN metadata m ON m.file_id = f.id
+                    WHERE f.relative_path = ? OR f.relative_path LIKE ?
+                    LIMIT 1
+                    """,
+                    (norm_path, f"%/{norm_path}"),
+                ).fetchall()
+                if rows:
+                    target_rec = self._row_to_file_record(rows[0])
+
+            if target_rec is not None:
+                target_id = target_rec.id
+                if target_rec.perceptual_hash:
+                    target_bits = int(target_rec.perceptual_hash, 16)
+                    target_algo = target_rec.perceptual_algo or "phash"
+                    if target_rec.perceptual_rotations:
+                        target_rot_hashes = tuple(
+                            perceptual.ImageHash(algorithm=target_algo, bits=int(h, 16))
+                            for h in target_rec.rotation_hashes
+                        )
+
+        if target_bits is None:
+            target_path = Path(file_id_or_path) if isinstance(file_id_or_path, (str, Path)) else None
+            if target_path is None and target_rec is not None:
+                vol = self.get_volume(target_rec.volume_key)
+                if vol and vol.root_path:
+                    candidate = Path(vol.root_path) / target_rec.relative_path
+                    if candidate.exists():
+                        target_path = candidate
+            if target_path is not None and target_path.exists():
+                try:
+                    h_obj = perceptual.compute_image_hash(
+                        target_path, algorithm=target_algo, stop_event=stop_event
+                    )
+                    target_bits = h_obj.bits
+                    target_algo = h_obj.algorithm
+                    if rotation_invariant:
+                        target_rot_hashes = perceptual.orientation_invariant_hashes(
+                            target_path, algorithm=target_algo, stop_event=stop_event
+                        )
+                except Exception:
+                    return []
+            else:
+                if target_rec is None:
+                    raise ValueError(f"File not found in catalog or on disk: {file_id_or_path!r}")
+                return []
+
+        if target_bits is None or _is_cancelled(stop_event):
+            return []
+
+        target_hash_obj = perceptual.ImageHash(algorithm=target_algo, bits=target_bits)
+        if rotation_invariant and not target_rot_hashes:
+            target_rot_hashes = (target_hash_obj,)
+
+        query_sql = """
+        SELECT
+            f.id, f.volume_key, f.relative_path, f.filename, f.extension,
+            f.size, f.mtime_ns, f.content_hash, f.media_kind, f.indexed_at,
+            f.perceptual_hash, f.perceptual_algo, f.perceptual_rotations,
+            v.is_online AS volume_online,
+            m.capture_timestamp, m.capture_date, m.capture_year,
+            m.camera_make, m.camera_model, m.width, m.height
+        FROM files f
+        JOIN volumes v ON v.volume_key = f.volume_key
+        LEFT JOIN metadata m ON m.file_id = f.id
+        WHERE f.perceptual_hash IS NOT NULL AND f.perceptual_hash != ''
+        """
+        params: list[Any] = []
+        if volume_key is not None:
+            query_sql += " AND f.volume_key = ?"
+            params.append(str(volume_key).strip())
+        if target_id is not None:
+            query_sql += " AND f.id != ?"
+            params.append(target_id)
+
+        candidate_rows = self.connection.execute(query_sql, tuple(params)).fetchall()
+        if not candidate_rows or _is_cancelled(stop_event):
+            return []
+
+        slices = partition_bit_slices(64, max_distance)
+        target_band_keys: set[tuple[int, int]] = set()
+        hashes_to_band = target_rot_hashes if (rotation_invariant and target_rot_hashes) else (target_hash_obj,)
+        for th in hashes_to_band:
+            for slice_idx, (shift, mask) in enumerate(slices):
+                target_band_keys.add((slice_idx, (th.bits >> shift) & mask))
+
+        matches: list[tuple[int, CatalogFileRecord]] = []
+
+        for row in candidate_rows:
+            if _is_cancelled(stop_event):
+                return []
+            cand_hex = str(row["perceptual_hash"])
+            try:
+                cand_bits = int(cand_hex, 16)
+            except (ValueError, TypeError):
+                continue
+            cand_algo = str(row["perceptual_algo"]) if row["perceptual_algo"] else target_algo
+
+            cand_rotations_str = str(row["perceptual_rotations"]) if row["perceptual_rotations"] else ""
+            if rotation_invariant and cand_rotations_str:
+                cand_rot_hashes = tuple(
+                    perceptual.ImageHash(algorithm=cand_algo, bits=int(h, 16))
+                    for h in cand_rotations_str.split(",")
+                    if h
+                )
+            else:
+                cand_rot_hashes = (perceptual.ImageHash(algorithm=cand_algo, bits=cand_bits),)
+
+            cand_shares_band = False
+            for ch in cand_rot_hashes:
+                for slice_idx, (shift, mask) in enumerate(slices):
+                    if (slice_idx, (ch.bits >> shift) & mask) in target_band_keys:
+                        cand_shares_band = True
+                        break
+                if cand_shares_band:
+                    break
+
+            if not cand_shares_band:
+                continue
+
+            if rotation_invariant:
+                dist = perceptual.min_rotation_distance(hashes_to_band, cand_rot_hashes)
+            else:
+                dist = (target_bits ^ cand_bits).bit_count()
+
+            if dist <= max_distance:
+                rec = self._row_to_file_record(row)
+                matches.append((dist, rec))
+
+        matches.sort(key=lambda item: (item[0], item[1].volume_key, item[1].relative_path, item[1].id))
+
+        if limit is not None and limit >= 0:
+            matches = matches[:limit]
+
+        return [
+            SimilarMatch(
+                replace(rec, similarity_distance=dist),
+                dist,
+            )
+            for dist, rec in matches
+        ]
+
+    def similar_groups(
+        self,
+        *,
+        max_distance: int = 8,
+        volume_key: str | None = None,
+        rotation_invariant: bool = False,
+        stop_event: StopEventProtocol | None = None,
+        exclude_exact: bool = False,
+    ) -> list[SimilarCatalogGroup]:
+        """Cluster catalog records into transitive similarity groups within ``max_distance``.
+
+        Candidate Generation (Prefix/Band Multi-Index Pigeonhole Bucketing):
+            Rather than performing an O(N^2) pairwise scan across large catalogs, each
+            64-bit perceptual hash is partitioned into B = max_distance + 1 disjoint bit
+            slices (bands). By the pigeonhole principle, any two hashes differing in at
+            most max_distance bits must share at least one band identically.
+
+            Each catalog record is indexed into hash buckets keyed by (band_index, band_val).
+            Only pairs sharing at least one bucket are evaluated as candidate neighbours, and
+            their exact Hamming distance is verified before merging into a Union-Find
+            structure. Pairs already in the same connected component are skipped in near-O(1)
+            time.
+
+        Grouping Semantics:
+            - Transitive: if A matches B and B matches C, {A, B, C} form one group.
+            - Order-independent: regardless of insertion order, groups and their members
+              are returned in deterministic canonical order.
+            - Offline volumes: rows from offline volumes are preserved and included,
+              carrying their volume's offline state.
+            - Exact duplicates: when ``exclude_exact=True``, duplicate files already identical
+              by byte content hash are excluded so only perceptual near-duplicates are grouped.
+
+        Returns:
+            List of ``SimilarCatalogGroup`` instances with len >= 2, sorted deterministically.
+        """
+        if _is_cancelled(stop_event):
+            return []
+
+        query_sql = """
+        SELECT
+            f.id, f.volume_key, f.relative_path, f.filename, f.extension,
+            f.size, f.mtime_ns, f.content_hash, f.media_kind, f.indexed_at,
+            f.perceptual_hash, f.perceptual_algo, f.perceptual_rotations,
+            v.is_online AS volume_online,
+            m.capture_timestamp, m.capture_date, m.capture_year,
+            m.camera_make, m.camera_model, m.width, m.height
+        FROM files f
+        JOIN volumes v ON v.volume_key = f.volume_key
+        LEFT JOIN metadata m ON m.file_id = f.id
+        WHERE f.perceptual_hash IS NOT NULL AND f.perceptual_hash != ''
+        """
+        params: list[Any] = []
+        if volume_key is not None:
+            query_sql += " AND f.volume_key = ?"
+            params.append(str(volume_key).strip())
+        query_sql += " ORDER BY f.volume_key ASC, f.relative_path ASC, f.id ASC"
+
+        rows = self.connection.execute(query_sql, tuple(params)).fetchall()
+        if not rows or _is_cancelled(stop_event):
+            return []
+
+        raw_records = [self._row_to_file_record(r) for r in rows]
+
+        if exclude_exact:
+            seen_content: set[str] = set()
+            records: list[CatalogFileRecord] = []
+            for rec in raw_records:
+                if rec.content_hash:
+                    if rec.content_hash in seen_content:
+                        continue
+                    seen_content.add(rec.content_hash)
+                records.append(rec)
+        else:
+            records = raw_records
+
+        n = len(records)
+        if n < 2 or _is_cancelled(stop_event):
+            return []
+
+        record_hashes: list[tuple[perceptual.ImageHash, ...]] = []
+        for rec in records:
+            algo = rec.perceptual_algo or "phash"
+            assert rec.perceptual_hash is not None
+            bits = int(rec.perceptual_hash, 16)
+            primary = perceptual.ImageHash(algorithm=algo, bits=bits)
+            if rotation_invariant and rec.perceptual_rotations:
+                rot_tuple = tuple(
+                    perceptual.ImageHash(algorithm=algo, bits=int(h, 16))
+                    for h in rec.rotation_hashes
+                )
+                record_hashes.append(rot_tuple)
+            else:
+                record_hashes.append((primary,))
+
+        uf = _UnionFind(n)
+        slices = partition_bit_slices(64, max_distance)
+        buckets: dict[tuple[int, int], list[int]] = {}
+
+        for idx in range(n):
+            if _is_cancelled(stop_event):
+                return []
+            for h in record_hashes[idx]:
+                val = h.bits
+                for slice_idx, (shift, mask) in enumerate(slices):
+                    key = (slice_idx, (val >> shift) & mask)
+                    b = buckets.setdefault(key, [])
+                    if not b or b[-1] != idx:
+                        b.append(idx)
+
+        for bucket in buckets.values():
+            if _is_cancelled(stop_event):
+                return []
+            b_len = len(bucket)
+            if b_len < 2:
+                continue
+            for i in range(b_len):
+                idx_a = bucket[i]
+                for j in range(i + 1, b_len):
+                    if _is_cancelled(stop_event):
+                        return []
+                    idx_b = bucket[j]
+                    if uf.find(idx_a) == uf.find(idx_b):
+                        continue
+                    if rotation_invariant:
+                        dist = perceptual.min_rotation_distance(record_hashes[idx_a], record_hashes[idx_b])
+                    else:
+                        dist = (record_hashes[idx_a][0].bits ^ record_hashes[idx_b][0].bits).bit_count()
+                    if dist <= max_distance:
+                        uf.union(idx_a, idx_b)
+
+        components: dict[int, list[CatalogFileRecord]] = {}
+        for idx in range(n):
+            root = uf.find(idx)
+            components.setdefault(root, []).append(records[idx])
+
+        groups: list[SimilarCatalogGroup] = []
+        for comp_records in components.values():
+            if len(comp_records) < 2:
+                continue
+            sorted_records = sorted(
+                comp_records,
+                key=lambda r: (r.volume_key, r.relative_path, r.id),
+            )
+            groups.append(SimilarCatalogGroup(sorted_records))
+
+        groups.sort(key=lambda g: (g[0].volume_key, g[0].relative_path, g[0].id))
+        return groups
 
     # ------------------------------------------------------------------
     # Storage analytics

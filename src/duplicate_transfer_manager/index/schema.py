@@ -32,6 +32,8 @@ or analytics aggregation:
   Accelerates ``analytics_by_capture_year()`` (``GROUP BY capture_year``).
 - ``idx_metadata_camera`` on ``metadata(camera_make COLLATE NOCASE, camera_model COLLATE NOCASE)``:
   Accelerates ``search(camera_make=..., camera_model=...)`` filtering.
+- ``idx_files_perceptual_hash`` on ``files(perceptual_hash) WHERE perceptual_hash IS NOT NULL``:
+  Accelerates candidate similarity lookup and similar photo queries.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ import sqlite3
 from typing import Callable, Mapping, Sequence
 
 INITIAL_SCHEMA_VERSION: int = 1
-SCHEMA_VERSION: int = 2
+SCHEMA_VERSION: int = 3
 DEFAULT_BUSY_TIMEOUT_MS: int = 5000
 
 MigrationFn = Callable[[sqlite3.Connection], None]
@@ -85,6 +87,10 @@ INDEX_DOCUMENTATION: dict[str, str] = {
     ),
     "idx_metadata_camera": (
         "Backs case-insensitive search(camera_make=..., camera_model=...) filtering."
+    ),
+    "idx_files_perceptual_hash": (
+        "Partial index on non-null perceptual_hash backing candidate similarity lookup "
+        "and similar photo grouping."
     ),
 }
 
@@ -243,9 +249,36 @@ def _migrate_to_v2(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_to_v3(conn: sqlite3.Connection) -> None:
+    """Upgrade v2 schema to v3 with perceptual hash columns and candidate index.
+
+    Adds nullable ``perceptual_hash``, ``perceptual_algo``, and ``perceptual_rotations``
+    columns to ``files`` and creates ``idx_files_perceptual_hash`` while preserving
+    all existing v1 and v2 rows intact.
+    """
+    _migrate_to_v2(conn)
+
+    file_cols = _table_columns(conn, "files")
+    if "perceptual_hash" not in file_cols:
+        conn.execute("ALTER TABLE files ADD COLUMN perceptual_hash TEXT")
+    if "perceptual_algo" not in file_cols:
+        conn.execute("ALTER TABLE files ADD COLUMN perceptual_algo TEXT")
+    if "perceptual_rotations" not in file_cols:
+        conn.execute("ALTER TABLE files ADD COLUMN perceptual_rotations TEXT")
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_files_perceptual_hash
+            ON files(perceptual_hash)
+            WHERE perceptual_hash IS NOT NULL
+        """
+    )
+
+
 BUILTIN_MIGRATIONS: Mapping[int, MigrationStep] = {
     1: _migrate_to_v1,
     2: _migrate_to_v2,
+    3: _migrate_to_v3,
 }
 
 
