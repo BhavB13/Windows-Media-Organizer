@@ -22,7 +22,7 @@ from urllib.request import urlopen
 
 from packaging.version import InvalidVersion, Version
 
-from adb_bridge import ADBBridge, resolve_adb_executable
+from adb_bridge import ADB_STATE_HELP, ADBBridge, describe_device_state, resolve_adb_executable
 from ..scheduled_tasks import build_task_command
 
 from ..core import (
@@ -184,29 +184,8 @@ class ScheduledScanService:
             raise ServiceError(ErrorCode.IO_ERROR, "Windows could not schedule the organization preview.", technical_detail=(completed.stderr or completed.stdout or "schtasks failed").strip())
 
 
-ADB_CONNECTION_HELP = {
-    "": (
-        "No Android device was detected. Enable USB debugging in Developer options, "
-        "set the phone's USB mode to file transfer rather than charging only, and "
-        "check that the cable carries data — many charging cables do not."
-    ),
-    "unauthorized": (
-        "This PC has not been authorized by the phone. Unlock the screen and approve "
-        "the \"Allow USB debugging\" prompt. If no prompt appears, use Developer "
-        "options, choose Revoke USB debugging authorizations, and reconnect."
-    ),
-    "offline": (
-        "The phone is connected but not responding. Unlock the screen, then unplug "
-        "and reconnect the cable. A locked phone commonly reports this state."
-    ),
-    "recovery": "The phone is in recovery mode. Restart it into Android before importing.",
-    "sideload": "The phone is in sideload mode. Restart it into Android before importing.",
-    "bootloader": "The phone is in bootloader mode. Restart it into Android before importing.",
-    "no permissions": (
-        "Windows is not allowing access to the phone. Reconnect the cable, and if the "
-        "problem continues install the manufacturer's USB driver for this model."
-    ),
-}
+# Kept under its old name for existing callers; the table lives in adb_bridge.
+ADB_CONNECTION_HELP = ADB_STATE_HELP
 
 
 class DeviceService:
@@ -246,10 +225,7 @@ class DeviceService:
         for state in states:
             if state in ADB_CONNECTION_HELP and state:
                 return ADB_CONNECTION_HELP[state]
-        return (
-            f"The phone reported status \"{states[0]}\" instead of being ready. Unlock the "
-            "screen, reconnect the cable, and confirm USB debugging is still enabled."
-        )
+        return describe_device_state(states[0])
 
     def inspect(self, serial: str) -> dict[str, Any]:
         ready, detail = ADBBridge.probe_device(serial)

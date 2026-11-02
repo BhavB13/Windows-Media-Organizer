@@ -149,6 +149,7 @@ class DuplicateScanService:
                 "duplicate_groups": len(duplicates),
                 "duplicate_files": duplicate_count,
                 "scan_errors": len(discovery.errors),
+                "skipped_cloud_files": int(getattr(discovery, "skipped_cloud_files", 0) or 0),
             },
             duration_seconds=time.monotonic() - started,
             warnings=tuple(discovery.errors),

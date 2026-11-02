@@ -1,3 +1,4 @@
+import ctypes
 import os
 import queue
 import subprocess
@@ -7,6 +8,51 @@ from dataclasses import dataclass
 
 from models import FileInfo
 from utils import is_hidden_or_system, normalize_extensions, normalize_excludes
+
+FILE_ATTRIBUTE_OFFLINE = 0x00001000
+FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
+FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
+CLOUD_PLACEHOLDER_ATTRIBUTES = (
+    FILE_ATTRIBUTE_OFFLINE
+    | FILE_ATTRIBUTE_RECALL_ON_OPEN
+    | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+)
+
+def get_file_attributes(path: str) -> int:
+    """Win32 attributes of ``path`` without opening it, or 0 when unknown.
+
+    ``os.stat`` reads attributes from the directory entry and does not recall a
+    cloud placeholder, so this is safe to call on a OneDrive file.
+    """
+
+    try:
+        st = os.stat(path, follow_symlinks=False)
+        attrs = getattr(st, "st_file_attributes", None)
+        if attrs is not None:
+            return int(attrs)
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            kernel32 = getattr(getattr(ctypes, "windll", None), "kernel32", None)
+            if kernel32 is not None:
+                val = kernel32.GetFileAttributesW(str(path))
+                if val != -1 and val != 0xFFFFFFFF:
+                    return int(val) & 0xFFFFFFFF
+        except Exception:
+            pass
+    return 0
+
+
+def is_cloud_placeholder(path: str) -> bool:
+    """True when reading ``path`` would download it from cloud storage."""
+
+    try:
+        attrs = int(get_file_attributes(path) or 0)
+    except Exception:
+        return False
+    return bool(attrs & CLOUD_PLACEHOLDER_ATTRIBUTES)
+
 
 
 ADB_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -26,6 +72,7 @@ class ScanProgress:
     message: str = ""
     is_adb: bool = False
     cancelled: bool = False
+    skipped_cloud_files: int = 0
 
 
 @dataclass
@@ -41,6 +88,8 @@ class DiscoveryResult:
     # files, or an import will silently leave files behind.
     incomplete: bool = False
     unreadable: tuple = ()
+    # Cloud-only files left out because the caller asked not to download them.
+    skipped_cloud_files: int = 0
 
 
 def _normalize_settings(settings):
@@ -202,6 +251,7 @@ def scan_local_tree(root, settings, stop_event, progress_callback=None, logger=N
     errors = []
     folders_scanned = 0
     files_found = 0
+    skipped_cloud_files = 0
     progress = ScanProgress(
         phase="discovering",
         source=root,
@@ -240,6 +290,10 @@ def scan_local_tree(root, settings, stop_event, progress_callback=None, logger=N
                             continue
                         if _is_excluded_local(entry_path, settings):
                             continue
+                        if getattr(settings, "skip_cloud_placeholders", False) and is_cloud_placeholder(entry_path):
+                            skipped_cloud_files += 1
+                            progress.skipped_cloud_files = skipped_cloud_files
+                            continue
                         stat_result = entry.stat(follow_symlinks=False)
                         size = int(stat_result.st_size)
                         if not _should_include_file(entry_path, size, settings):
@@ -275,6 +329,7 @@ def scan_local_tree(root, settings, stop_event, progress_callback=None, logger=N
     progress.current_path = root
     progress.folders_scanned = folders_scanned
     progress.files_found = files_found
+    progress.skipped_cloud_files = skipped_cloud_files
     progress.message = "Discovery finished" if not progress.cancelled else "Discovery cancelled"
     _emit_progress(progress_callback, progress, last_emit, force=True)
     return DiscoveryResult(
@@ -284,6 +339,7 @@ def scan_local_tree(root, settings, stop_event, progress_callback=None, logger=N
         errors,
         progress.cancelled,
         incomplete=bool(errors) and not progress.cancelled,
+        skipped_cloud_files=skipped_cloud_files,
     )
 
 
@@ -556,7 +612,7 @@ def scan_adb_tree(root, settings, stop_event, progress_callback=None, logger=Non
     progress.phase = "complete" if not progress.cancelled else "cancelled"
     progress.message = "Discovery finished" if not progress.cancelled else "Discovery cancelled"
     _emit_progress(progress_callback, progress, last_emit, force=True)
-    return DiscoveryResult(
+    result = DiscoveryResult(
         files,
         progress.folders_scanned,
         len(files),
@@ -565,6 +621,7 @@ def scan_adb_tree(root, settings, stop_event, progress_callback=None, logger=Non
         incomplete=incomplete,
         unreadable=tuple(unreadable),
     )
+    return result
 
 
 def discover_files(root, settings, stop_event, progress_callback=None, logger=None):

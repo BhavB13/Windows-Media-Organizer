@@ -1,6 +1,7 @@
 import json
 import hashlib
 import ctypes
+import inspect
 import os
 import shutil
 import time
@@ -8,6 +9,7 @@ from datetime import datetime
 
 from adb_bridge import ADBBridge, ADBOperationError
 from runtime_paths import get_runtime_paths
+from volume_identity import FAT_MAX_FILE_BYTES, has_fat_4gib_limit, probe_volume
 
 
 ES_CONTINUOUS = 0x80000000
@@ -47,13 +49,35 @@ class TransferJournal:
         self.load()
 
     def load(self):
+        """Load a journal, ignoring anything that is not a v1 journal.
+
+        The file is valid JSON but arbitrary shape as far as this code is
+        concerned: a list, a string, or a dict whose ``completed`` is a list all
+        parse successfully and then blew up on the first attribute access. A
+        journal that cannot be understood is treated as absent, which costs a
+        re-verification pass and never a wrong resume decision.
+        """
+
         try:
             with open(self.path, "r", encoding="utf-8") as handle:
                 loaded = json.load(handle)
-            if loaded.get("version") == 1:
-                self.data = loaded
-        except (OSError, json.JSONDecodeError):
-            pass
+        except (OSError, json.JSONDecodeError, ValueError, RecursionError):
+            return
+        if not isinstance(loaded, dict) or loaded.get("version") != 1:
+            return
+        completed = loaded.get("completed", {})
+        failures = loaded.get("failures", {})
+        if not isinstance(completed, dict) or not isinstance(failures, dict):
+            return
+        # Entries themselves are validated where they are read, but dropping
+        # non-dict ones here keeps every later ``.get`` honest.
+        loaded["completed"] = {
+            key: value for key, value in completed.items() if isinstance(value, dict)
+        }
+        loaded["failures"] = {
+            key: value for key, value in failures.items() if isinstance(value, dict)
+        }
+        self.data = loaded
 
     def save(self, force=False):
         if not force and self._dirty_entries < 25 and time.monotonic() - self._last_save < 5:
@@ -98,11 +122,27 @@ class TransferJournal:
         self._dirty_entries += 1
         self.save()
 
-    def fail(self, source, error, partial_path=""):
+    def fail(self, source, error, partial_path="", recovery=None):
+        """Record a failed transfer and where its pieces were left.
+
+        ``recovery`` carries the locations a person would need to put things
+        back by hand: the quarantined copy that failed verification, and the
+        backup holding a replaced original that could not be restored
+        automatically. Without it, a rollback that could not complete left the
+        user's file somewhere with nothing recording where.
+        """
+
         entry = self.data["failures"].setdefault(source, {"attempts": 0})
-        entry.update({"attempts": entry["attempts"] + 1, "error": str(error), "updated_at": time.time()})
+        attempts = entry.get("attempts", 0)
+        if not isinstance(attempts, int):
+            attempts = 0
+        entry.update({"attempts": attempts + 1, "error": str(error), "updated_at": time.time()})
         if partial_path:
             entry["partial_path"] = os.path.abspath(partial_path)
+        if recovery:
+            entry["recovery"] = {
+                key: value for key, value in recovery.items() if value not in ("", None)
+            }
         self._dirty_entries += 1
         self.save()
 
@@ -184,9 +224,47 @@ def _hash_local_file(path, algorithm, mode):
 
 
 def default_journal_path(output_root, serial="local"):
+    """Name the journal file without bringing the runtime tree into being.
+
+    ``create=False``: naming a path is a question, not a change. The default
+    creates the whole application data tree as a side effect, so merely asking
+    where a dry run's journal would live created directories. ``save`` makes the
+    parent directory when it actually writes, so nothing is lost by waiting.
+    """
+
     safe_serial = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in serial) or "local"
     root_tag = hashlib.sha256(os.path.abspath(output_root).encode("utf-8")).hexdigest()[:10]
-    return str(get_runtime_paths().journals / f"{safe_serial}_{root_tag}.journal.json")
+    journals = get_runtime_paths(create=False).journals
+    return str(journals / f"{safe_serial}_{root_tag}.journal.json")
+
+
+def files_too_large_for_destination(output_root, source_files):
+    """Return the files the destination filesystem cannot store at all.
+
+    FAT32 keeps a file's size in 32 bits, so nothing of 4 GiB or more fits on
+    it, and many USB sticks and camera cards still ship formatted that way.
+    Without this the limit was discovered by the copy itself, after gigabytes of
+    a long video had already been written. An unidentified filesystem limits
+    nothing: refusing files on a guess would be worse than the late failure.
+
+    Returns ``(files, filesystem)``.
+    """
+
+    identity = probe_volume(output_root)
+    if not has_fat_4gib_limit(identity):
+        return [], identity.filesystem
+    return (
+        [info for info in source_files if (getattr(info, "size", 0) or 0) > FAT_MAX_FILE_BYTES],
+        identity.filesystem,
+    )
+
+
+def too_large_message(filesystem):
+    label = (filesystem or "FAT").upper()
+    return (
+        f"Too large for this {label} drive: {label} cannot store files of 4 GB or more. "
+        "Copy it to an exFAT or NTFS drive, or back up and reformat this one as exFAT."
+    )
 
 
 def preflight_transfer(
@@ -212,6 +290,19 @@ def preflight_transfer(
             os.remove(probe)
         except OSError as exc:
             errors.append(f"Output folder is not writable: {exc}")
+    skipped_as_too_large = set()
+    try:
+        too_large, filesystem = files_too_large_for_destination(output_root, source_files)
+        skipped_as_too_large = {info.path for info in too_large}
+        if too_large:
+            label = (filesystem or "FAT").upper()
+            warnings.append(
+                f"{len(too_large)} file(s) are 4 GB or larger and cannot be stored on this "
+                f"{label} drive. They will be skipped and listed in the report; everything "
+                "else will copy. Use an exFAT or NTFS destination to include them."
+            )
+    except Exception as exc:  # noqa: BLE001 - an advisory check must not block a transfer
+        warnings.append(f"Could not check the destination's file-size limit: {exc}")
     try:
         # Files the journal already proved complete will not be written again,
         # so charging their bytes against free space made resuming impossible
@@ -220,6 +311,9 @@ def preflight_transfer(
         outstanding = []
         already_complete = 0
         for info in source_files:
+            # Nor will a file the destination cannot hold at all.
+            if info.path in skipped_as_too_large:
+                continue
             if journal is not None:
                 try:
                     if journal.is_complete(info.path, info.size, verify_resumed):
@@ -256,6 +350,15 @@ def preflight_transfer(
     return errors, warnings
 
 
+def _pull_accepts_stop_event():
+    """Report whether ``ADBBridge.pull`` can observe a cancellation event."""
+
+    try:
+        return "stop_event" in inspect.signature(ADBBridge.pull).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def pull_with_retries(
     source,
     target,
@@ -277,6 +380,12 @@ def pull_with_retries(
     os.makedirs(os.path.dirname(partial), exist_ok=True)
     last_error = None
     for attempt in range(1, max(1, attempts) + 1):
+        # Checked before every attempt, not only inside the drive wait. A
+        # cancelled transfer used to keep pulling: each remaining attempt ran in
+        # full and a device-unavailable failure entered a reconnect wait of up
+        # to ``reconnect_timeout`` seconds, so Cancel took minutes to observe.
+        if stop_event and stop_event.is_set():
+            raise OSError("Transfer cancelled before the ADB pull attempt.")
         try:
             destination_root = os.path.splitdrive(os.path.abspath(target))[0] + os.sep
             wait_started = time.monotonic()
@@ -298,12 +407,24 @@ def pull_with_retries(
                 ".mp4", ".mov", ".mkv", ".avi", ".3gp", ".mp3", ".aac", ".m4a", ".zip",
             }
             disable_compression = os.path.splitext(source)[1].lower() in compressed_media
+            # Forwarded only when the bridge advertises it. Cancelling an
+            # in-flight pull needs the adb subprocess terminated, which only
+            # ADBBridge.pull can do; raising out of the progress callback would
+            # abandon a running adb holding the partial file open. Passing the
+            # event conditionally means the bridge gaining the parameter starts
+            # working here with no further change.
+            cancellation_kwargs = (
+                {"stop_event": stop_event}
+                if stop_event is not None and _pull_accepts_stop_event()
+                else {}
+            )
             ADBBridge.pull(
                 source,
                 partial,
                 serial=serial,
                 disable_compression=disable_compression,
                 stall_timeout=stall_timeout,
+                **cancellation_kwargs,
                 progress_callback=(
                     lambda current: progress_callback(
                         overall_bytes_before + current,
@@ -325,6 +446,11 @@ def pull_with_retries(
             last_error = exc
             if logger:
                 logger.log(f"WARNING: ADB pull attempt {attempt}/{attempts} failed: {exc}")
+            # Checked before the reconnect wait, not after it. A cancelled
+            # transfer whose device had gone away used to enter a wait of up to
+            # ``reconnect_timeout`` seconds before anyone looked at the flag.
+            if stop_event and stop_event.is_set():
+                raise OSError("Transfer cancelled during the ADB pull.") from exc
             if isinstance(exc, ADBOperationError) and exc.device_unavailable:
                 ready, detail = ADBBridge.wait_for_device(
                     serial,
@@ -334,7 +460,15 @@ def pull_with_retries(
                 if not ready and logger:
                     logger.log(f"WARNING: ADB reconnect wait failed: {detail}")
             if attempt < attempts:
-                time.sleep(min(2 ** (attempt - 1), 8))
+                # Waited on the stop event rather than slept, so cancelling
+                # during the backoff returns immediately instead of after the
+                # full delay.
+                waiter = getattr(stop_event, "wait", None)
+                if callable(waiter):
+                    if waiter(min(2 ** (attempt - 1), 8)):
+                        raise OSError("Transfer cancelled during the ADB pull.") from exc
+                else:
+                    time.sleep(min(2 ** (attempt - 1), 8))
     raise last_error
 
 
@@ -349,7 +483,7 @@ def cleanup_partial_files(root, dry_run=False):
 
     # Version-1 journals remain readable; newer failure entries may additionally
     # identify an app-owned partial path. Never infer ownership from a suffix.
-    for journal_path in get_runtime_paths().journals.glob("*.json"):
+    for journal_path in get_runtime_paths(create=False).journals.glob("*.json"):
         try:
             with journal_path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)

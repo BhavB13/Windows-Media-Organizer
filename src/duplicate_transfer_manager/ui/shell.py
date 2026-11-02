@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QObject, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -44,6 +44,8 @@ from .pages import (
     SettingsPage,
 )
 from .disk_audit_page import DiskAuditPage
+from .library_page import LibraryPage
+from .similar_review_page import SimilarReviewPage
 from .sort_workspace import SortWorkspace
 from .theme import Spacing, ThemeManager
 from .widgets import add_shortcut, set_accessible
@@ -60,7 +62,13 @@ class Route:
 ROUTES = (
     Route("overview", "Overview", "overview", "Alt+1"),
     Route("audit", "Disk Audit", "drive", "Alt+2"),
+    # Sits beside Disk Audit because both answer "what is on my storage", but
+    # takes Alt+0 so the nine shortcuts people already know do not move.
+    Route("library", "Library", "library", "Alt+0"),
     Route("duplicates", "Find Duplicates", "duplicates", "Alt+3"),
+    # No shortcut: every Alt+digit is taken, and a chord such as Ctrl+Alt+3
+    # types a character on keyboard layouts that use AltGr.
+    Route("similar", "Similar Photos", "similar", ""),
     Route("import", "Import Files", "import", "Alt+4"),
     Route("sort", "Sort Files", "folder", "Alt+5"),
     Route("activity", "Activity", "activity", "Alt+6"),
@@ -122,19 +130,24 @@ class Sidebar(QFrame):
             button.setProperty("nav", True)
             button.setIcon(icon(route.icon_name, self._icon_color))
             button.setIconSize(icon_size())
-            button.setToolTip(f"{route.label}  ({route.shortcut})")
-            set_accessible(
-                button,
-                route.label,
-                f"Open {route.label}. Keyboard shortcut {route.shortcut}.",
-            )
+            if route.shortcut:
+                button.setToolTip(f"{route.label}  ({route.shortcut})")
+                set_accessible(
+                    button,
+                    route.label,
+                    f"Open {route.label}. Keyboard shortcut {route.shortcut}.",
+                )
+            else:
+                button.setToolTip(route.label)
+                set_accessible(button, route.label, f"Open {route.label}.")
             button.clicked.connect(
                 lambda checked=False, key=route.key: checked
                 and self.route_requested.emit(key)
             )
             self.group.addButton(button, index)
             self.buttons[route.key] = button
-            self.shortcuts.append(add_shortcut(button, route.shortcut))
+            if route.shortcut:
+                self.shortcuts.append(add_shortcut(button, route.shortcut))
             layout.addWidget(button)
         self.buttons["overview"].setChecked(True)
 
@@ -270,12 +283,14 @@ class MainWindow(QMainWindow):
                 settings_service,
                 self.operation_records,
             ),
+            "library": LibraryPage(self.runtime_paths, settings),
             "duplicates": DuplicatesPage(
                 hash_cache=hash_cache,
                 quarantine_service=DuplicateQuarantineService(self.runtime_paths),
                 operation_service=self.operation_records,
                 settings=settings,
             ),
+            "similar": SimilarReviewPage(self.runtime_paths),
             "import": ImportPage(
                 hash_cache=hash_cache,
                 operation_service=self.operation_records,
@@ -377,10 +392,11 @@ class MainWindow(QMainWindow):
 
     def _busy_controllers(self) -> list:
         controllers = []
-        for key in ("audit", "duplicates", "import", "sort"):
-            controller = getattr(self.pages.get(key), "controller", None)
-            if controller is not None and controller.busy:
-                controllers.append(controller)
+        for key in ("audit", "library", "duplicates", "similar", "import", "sort"):
+            for attribute in ("controller", "search_controller", "device_controller"):
+                controller = getattr(self.pages.get(key), attribute, None)
+                if controller is not None and controller.busy:
+                    controllers.append(controller)
         return controllers
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -394,11 +410,13 @@ class MainWindow(QMainWindow):
         """
 
         busy = self._busy_controllers()
-        if busy:
+        pool = QThreadPool.globalInstance()
+        background_active = pool.activeThreadCount() > 0
+        if busy or background_active:
             answer = QMessageBox.question(
                 self,
                 "Stop the running operation?",
-                f"{len(busy)} operation(s) are still running. "
+                f"{max(1, len(busy))} operation(s) are still running. "
                 "Closing will stop them safely; work already finished is kept.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -411,11 +429,32 @@ class MainWindow(QMainWindow):
                     controller.cancel()
                 except Exception:  # noqa: BLE001 - shutdown must not be blocked
                     pass
+            for page in self.pages.values():
+                workers = list(getattr(page, "_background_workers", ()))
+                monitor = getattr(page, "_monitor_worker", None)
+                if monitor is not None:
+                    workers.append(monitor)
+                for worker in workers:
+                    worker.cancellation.cancel()
+            stopped = True
             for controller in busy:
                 try:
-                    controller.wait_for_done(self.SHUTDOWN_WAIT_MS)
-                except Exception:  # noqa: BLE001 - shutdown must not be blocked
-                    pass
+                    stopped = controller.wait_for_done(self.SHUTDOWN_WAIT_MS) and stopped
+                except Exception:
+                    stopped = False
+            # Quarantine, restore, and folder browsing can run outside the
+            # primary page controllers. They must also finish before teardown.
+            if background_active:
+                stopped = pool.waitForDone(self.SHUTDOWN_WAIT_MS) and stopped
+            if not stopped:
+                QMessageBox.warning(
+                    self,
+                    "Still stopping",
+                    "An operation is still finishing its current file. The window will stay open "
+                    "to protect your files. Wait for it to stop, then close again.",
+                )
+                event.ignore()
+                return
         self.settings_service.save(self.settings)
         super().closeEvent(event)
 
@@ -424,6 +463,8 @@ class MainWindow(QMainWindow):
 
         controllers = (
             self.pages["audit"].controller,
+            self.pages["library"].controller,
+            self.pages["library"].search_controller,
             self.pages["duplicates"].controller,
             self.pages["import"].controller,
             self.pages["sort"].controller,

@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Iterable
 
 from ..core import CancellationToken, ErrorCode, OperationReporter, ServiceError
+from ..media.video_meta import read_video_metadata
+from ..media.container_exif import SUPPORTED_EXTENSIONS as CONTAINER_EXTENSIONS, read_container_metadata
 from .models import FileMetadata
 
 try:
@@ -27,6 +29,11 @@ class MetadataExtractor:
         stat = candidate.stat()
         mime_type, _encoding = mimetypes.guess_type(candidate.name)
         media_type = (mime_type or "application/octet-stream").split("/", 1)[0]
+        if candidate.suffix.lower() in CONTAINER_EXTENSIONS:
+            # Windows only maps RAW extensions to image types when camera codecs
+            # are installed; without them an iPhone HEIC or a CR2 was filed
+            # under "Application".
+            media_type = "image"
         width = height = 0
         captured = 0.0
         attributes: dict[str, object] = {}
@@ -36,6 +43,12 @@ class MetadataExtractor:
                     width, height = image.size
                     attributes["format"] = image.format or ""
                     exif = image.getexif()
+                    # Make (271) and Model (272) identify the camera or phone,
+                    # which the planner offers as the {camera} folder token.
+                    for tag, key in ((271, "camera_make"), (272, "camera_model")):
+                        value = str(exif.get(tag) or "").replace("\x00", "").strip()
+                        if value:
+                            attributes[key] = value
                     raw_date = exif.get(36867) or exif.get(306)
                     if raw_date:
                         # An EXIF capture time is a zoneless wall clock. It is
@@ -46,10 +59,21 @@ class MetadataExtractor:
                         captured = datetime.strptime(str(raw_date), "%Y:%m:%d %H:%M:%S").timestamp()
             except (OSError, TypeError, ValueError):
                 pass
+        if media_type == "image" and candidate.suffix.lower() in CONTAINER_EXTENSIONS and not captured:
+            # Pillow cannot open HEIC or most RAW files; read their EXIF directly.
+            container = read_container_metadata(candidate)
+            captured = container.captured or captured
+            if not (width and height) and container.width and container.height:
+                width, height = container.width, container.height
+            if container.make:
+                attributes.setdefault("camera_make", container.make)
+            if container.model:
+                attributes.setdefault("camera_model", container.model)
         elif media_type == "video":
             video = self._video_metadata(candidate)
             width = int(video.get("width", 0) or 0)
             height = int(video.get("height", 0) or 0)
+            captured = float(video.get("captured", 0) or 0) or captured
             attributes.update(video)
         return FileMetadata(
             path=str(candidate.resolve()), name=candidate.name, extension=candidate.suffix.lower(),
@@ -61,21 +85,31 @@ class MetadataExtractor:
     @staticmethod
     def _video_metadata(path: Path) -> dict[str, object]:
         executable = shutil.which("ffprobe")
-        if not executable:
-            return {}
-        try:
-            completed = subprocess.run(
-                [executable, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration:format=duration", "-of", "json", str(path)],
-                capture_output=True, text=True, timeout=15, check=False,
-            )
-            if completed.returncode != 0:
-                return {}
-            payload = json.loads(completed.stdout or "{}")
-            stream = (payload.get("streams") or [{}])[0]
-            duration = stream.get("duration") or payload.get("format", {}).get("duration") or 0
-            return {"width": int(stream.get("width", 0) or 0), "height": int(stream.get("height", 0) or 0), "duration": float(duration)}
-        except (OSError, subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError):
-            return {}
+        # ffprobe, when installed, measures the stream; it does not report when
+        # the clip was shot or on what. Those always come from the container.
+        meta = read_video_metadata(path)
+        extra: dict[str, object] = {"captured": meta.captured}
+        if meta.make:
+            extra["camera_make"] = meta.make
+        if meta.model:
+            extra["camera_model"] = meta.model
+        if executable:
+            try:
+                completed = subprocess.run(
+                    [executable, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration:format=duration", "-of", "json", str(path)],
+                    capture_output=True, text=True, timeout=15, check=False,
+                )
+                if completed.returncode == 0:
+                    payload = json.loads(completed.stdout or "{}")
+                    stream = (payload.get("streams") or [{}])[0]
+                    duration = stream.get("duration") or payload.get("format", {}).get("duration") or 0
+                    width = int(stream.get("width", 0) or 0)
+                    height = int(stream.get("height", 0) or 0)
+                    if width or height or duration:
+                        return {"width": width, "height": height, "duration": float(duration), **extra}
+            except (OSError, subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+        return {"width": meta.width, "height": meta.height, "duration": meta.duration, **extra}
 
 
 class SortScanner:

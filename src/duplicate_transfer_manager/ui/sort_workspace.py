@@ -39,6 +39,7 @@ from ..controllers.base import OperationWorker
 from ..core import AppSettings, CancellationToken, OperationResult, OperationState
 from ..runtime_paths import RuntimePaths, get_runtime_paths
 from ..services import OperationRecordService, SettingsService
+from ..sorting.planner import preview_destination
 from ..sorting import (
     Association,
     ConflictPolicy,
@@ -159,6 +160,14 @@ class AssociationDialog(QDialog):
             self.action.addItem(value.value.replace("_", " ").title(), value)
         self.destination = QLineEdit(association.destination if association else "")
         self.destination.setPlaceholderText(r"D:\Sorted\{media_type}\{year}")
+        self.destination.setToolTip(
+            "Folder tokens: {media_type}, {extension}, {year}, {month}, {day} (from the photo's capture "
+            "date when it has one), {camera}, {camera_make}, {camera_model}. "
+            r"Example: D:\Sorted\{camera}\{year}\{month}"
+        )
+        self.destination_preview = QLabel()
+        self.destination_preview.setWordWrap(True)
+        self.destination_preview.setProperty("muted", True)
         self.rename_template = QLineEdit(association.rename_template if association else "{stem}{suffix}")
         self.conflict = QComboBox()
         for value in ConflictPolicy:
@@ -169,6 +178,7 @@ class AssociationDialog(QDialog):
         form.addRow("Condition logic", self.match_mode)
         form.addRow("Action", self.action)
         form.addRow("Destination", self.destination)
+        form.addRow("", self.destination_preview)
         form.addRow("Rename template", self.rename_template)
         form.addRow("Conflict policy", self.conflict)
         outer.addLayout(form)
@@ -198,8 +208,16 @@ class AssociationDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._validate_accept)
         buttons.rejected.connect(self.reject)
+        self.save_button = buttons.button(QDialogButtonBox.StandardButton.Save)
         outer.addWidget(buttons)
         self._render_conditions()
+
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(150)
+        self._preview_timer.timeout.connect(self._update_destination_preview)
+        self.destination.textChanged.connect(lambda _text: self._preview_timer.start())
+        self._update_destination_preview()
 
     def _add_condition(self) -> None:
         dialog = ConditionDialog(parent=self)
@@ -229,6 +247,27 @@ class AssociationDialog(QDialog):
             for column, value in enumerate(values):
                 self.condition_table.setItem(row, column, QTableWidgetItem(value))
 
+    def _update_destination_preview(self) -> None:
+        text = self.destination.text().strip()
+        rendered, error = preview_destination(text) if text else ("", "")
+        if error:
+            message = error
+        elif rendered:
+            message = f"Example: {rendered}"
+        else:
+            message = ""
+        label = self.destination_preview
+        label.setText(message)
+        label.setProperty("status", "danger" if error else "")
+        label.setProperty("muted", not error)
+        label.style().unpolish(label)
+        label.style().polish(label)
+        self.save_button.setEnabled(not error)
+
+    def done(self, result: int) -> None:
+        self._preview_timer.stop()
+        super().done(result)
+
     def _validate_accept(self) -> None:
         if not self.name.text().strip():
             QMessageBox.warning(self, "Association needs a name", "Give this association a clear name.")
@@ -236,6 +275,11 @@ class AssociationDialog(QDialog):
         if self.action.currentData() in {SortAction.MOVE, SortAction.COPY} and not self.destination.text().strip():
             QMessageBox.warning(self, "Destination required", "Move and Copy associations need a destination folder.")
             return
+        if self.destination.text().strip():
+            _, error = preview_destination(self.destination.text().strip())
+            if error:
+                QMessageBox.warning(self, "Invalid destination template", error)
+                return
         self.accept()
 
     def association(self) -> Association:

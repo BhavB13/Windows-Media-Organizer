@@ -201,6 +201,14 @@ def summarize_transfer_result(result) -> dict[str, str]:
     conflict_skipped = int(raw.get("conflict_skipped", 0) or 0)
     if conflict_skipped:
         summary["Not copied, name already taken"] = str(conflict_skipped)
+    too_large_skipped = int(raw.get("too_large_skipped", 0) or 0)
+    if too_large_skipped:
+        summary["Too large for this drive (FAT32)"] = str(too_large_skipped)
+    skipped_cloud = int(raw.get("skipped_cloud_files", 0) or 0)
+    if skipped_cloud:
+        summary["Cloud-only files left out (not downloaded)"] = str(skipped_cloud)
+    if raw.get("destination_disconnected"):
+        summary["Stopped: destination disconnected"] = "Yes"
     return summary
 
 

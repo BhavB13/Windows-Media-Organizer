@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="screen_padding">16dp</dimen>
+    <dimen name="gap">12dp</dimen>
+    <!-- Keeps every tappable control at or above the 48dp accessibility target. -->
+    <dimen name="touch_target">48dp</dimen>
+</resources>

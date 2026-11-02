@@ -843,6 +843,119 @@ class SortExecutorTests(unittest.TestCase):
             self.assertTrue(source.exists())
             self.assertFalse(destination.exists())
 
+    def test_an_unrelated_partial_file_is_never_deleted_by_a_copy(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths, source, destination, plan = self._plan(Path(temp_dir), SortAction.COPY)
+            stale = destination.with_name(f".{destination.name}.dtm-partial")
+            stale.write_bytes(b"unrelated partial")
+
+            result = SortExecutor(paths).execute(plan, approved_sources=[str(source)], confirmed=True)
+
+            self.assertEqual(result.completed, 1)
+            self.assertEqual(destination.read_bytes(), b"safe payload")
+            self.assertTrue(source.exists())
+            self.assertEqual(stale.read_bytes(), b"unrelated partial")
+
+    def test_a_destination_created_just_before_publication_is_not_overwritten(self):
+        for action in (SortAction.COPY, SortAction.MOVE):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as temp_dir:
+                paths, source, destination, plan = self._plan(Path(temp_dir), action)
+                executor = SortExecutor(paths)
+                original = executor._copy if action == SortAction.COPY else executor._move
+
+                def racing(src, dst, control, _original=original):
+                    dst.write_bytes(b"someone else's file")
+                    return _original(src, dst, control)
+
+                if action == SortAction.COPY:
+                    executor._copy = racing
+                else:
+                    executor._move = racing
+
+                result = executor.execute(plan, approved_sources=[str(source)], confirmed=True, retry_attempts=0)
+
+                self.assertEqual(result.failed, 1)
+                self.assertEqual(destination.read_bytes(), b"someone else's file")
+                self.assertEqual(source.read_bytes(), b"safe payload")
+
+    def test_a_failed_copy_leaves_a_file_that_appeared_at_the_destination(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths, source, destination, plan = self._plan(Path(temp_dir), SortAction.COPY)
+            executor = SortExecutor(paths)
+
+            def failing_copy(src, dst, control):
+                dst.write_bytes(b"unrelated arrival")
+                raise OSError("copy failed")
+
+            executor._copy = failing_copy
+
+            result = executor.execute(plan, approved_sources=[str(source)], confirmed=True, retry_attempts=0)
+
+            self.assertEqual(result.failed, 1)
+            self.assertEqual(destination.read_bytes(), b"unrelated arrival")
+            self.assertEqual(source.read_bytes(), b"safe payload")
+
+    def _overwrite_plan(self, root: Path):
+        paths, source, destination, _plan = self._plan(root, SortAction.COPY, conflict=ConflictPolicy.OVERWRITE)
+        destination.write_bytes(b"old payload")
+        association = Association("Copy", (), SortAction.COPY, str(destination.parent), conflict_policy=ConflictPolicy.OVERWRITE)
+        profile = SortingProfile("Copy", (association,), ml_enabled=False)
+        plan = SortPlanner(paths).build(profile, [MetadataExtractor().extract(source)], dry_run=False)
+        return paths, source, destination, plan
+
+    @staticmethod
+    def _retained_backups(result) -> list[bytes]:
+        replaced = Path(result.journal_path).parent / "replaced"
+        return sorted(path.read_bytes() for path in replaced.glob("*") if path.is_file())
+
+    def test_an_overwrite_that_fails_keeps_both_the_arrival_and_the_incumbent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths, source, destination, plan = self._overwrite_plan(Path(temp_dir))
+            executor = SortExecutor(paths)
+
+            def racing_copy(src, dst, control):
+                dst.write_bytes(b"someone else's file")
+                raise OSError("copy failed")
+
+            executor._copy = racing_copy
+
+            result = executor.execute(plan, approved_sources=[str(source)], confirmed=True, retry_attempts=0)
+
+            self.assertEqual(result.failed, 1)
+            self.assertEqual(destination.read_bytes(), b"someone else's file")
+            self.assertEqual(source.read_bytes(), b"safe payload")
+            self.assertEqual(self._retained_backups(result), [b"old payload"])
+            kept = [
+                record for record in executor.load_run(result.run_id)["records"]
+                if record.get("status") == "replaced_retained"
+            ]
+            self.assertEqual(len(kept), 1)
+            self.assertEqual(Path(kept[0]["replaced_backup"]).read_bytes(), b"old payload")
+            self.assertIn(kept[0]["replaced_backup"], result.failures[0])
+
+    def test_a_retried_overwrite_does_not_overwrite_the_original_it_already_kept(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths, source, destination, plan = self._overwrite_plan(Path(temp_dir))
+            executor = SortExecutor(paths)
+            attempts = []
+
+            def racing_copy(src, dst, control):
+                attempts.append(1)
+                dst.write_bytes(b"arrival %d" % len(attempts))
+                raise OSError("copy failed")
+
+            executor._copy = racing_copy
+
+            result = executor.execute(plan, approved_sources=[str(source)], confirmed=True, retry_attempts=1)
+
+            self.assertEqual(result.failed, 1)
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(destination.read_bytes(), b"arrival 2")
+            self.assertEqual(source.read_bytes(), b"safe payload")
+            # The second attempt must retain the first arrival under its own
+            # name rather than copying over the original it kept a moment ago.
+            self.assertEqual(self._retained_backups(result), [b"arrival 1", b"old payload"])
+
     def test_undo_refuses_destination_changed_after_sorting(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             paths, source, destination, plan = self._plan(Path(temp_dir), SortAction.MOVE)

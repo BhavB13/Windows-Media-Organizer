@@ -54,6 +54,7 @@ def main() -> int:
         "--route",
         choices=[
             "overview",
+            "audit",
             "duplicates",
             "import",
             "sort",

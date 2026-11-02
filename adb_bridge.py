@@ -75,6 +75,94 @@ def resolve_adb_executable():
 resolve_adb_executable.cache_clear = _discover_adb_executable.cache_clear
 
 
+
+# What to do about each state ``adb devices`` can report. It lives here, beside
+# the code that reads the states, so the transfer engine can use it too: the
+# engine sits below the packaged services and must not import from them.
+ADB_STATE_HELP = {
+    "": (
+        "No Android device was detected. Enable USB debugging in Developer options, "
+        "set the phone's USB mode to file transfer rather than charging only, and "
+        "check that the cable carries data — many charging cables do not."
+    ),
+    "unauthorized": (
+        "This PC has not been authorized by the phone. Unlock the screen and approve "
+        "the \"Allow USB debugging\" prompt. If no prompt appears, use Developer "
+        "options, choose Revoke USB debugging authorizations, and reconnect."
+    ),
+    "authorizing": (
+        "The phone is still deciding whether to trust this PC. Unlock the screen and "
+        "approve the \"Allow USB debugging\" prompt."
+    ),
+    "connecting": "The phone is still connecting. Wait a moment, then try again.",
+    "offline": (
+        "The phone is connected but not responding. Unlock the screen, then unplug "
+        "and reconnect the cable. A locked phone commonly reports this state."
+    ),
+    "recovery": "The phone is in recovery mode. Restart it into Android before importing.",
+    "rescue": "The phone is in rescue mode. Restart it into Android before importing.",
+    "sideload": "The phone is in sideload mode. Restart it into Android before importing.",
+    "bootloader": "The phone is in bootloader mode. Restart it into Android before importing.",
+    "host": "This entry is another computer acting as an ADB host, not a phone. Choose your phone instead.",
+    "no permissions": (
+        "Windows is not allowing access to the phone. Reconnect the cable, and if the "
+        "problem continues install the manufacturer's USB driver for this model."
+    ),
+}
+
+
+def describe_device_state(state):
+    """A plain instruction for a device that is not ready, or "" when it is."""
+
+    state = str(state or "").strip().casefold()
+    if state == "device":
+        return ""
+    if state in ADB_STATE_HELP:
+        return ADB_STATE_HELP[state]
+    return (
+        f"The phone reported status \"{state}\" instead of being ready. Unlock the "
+        "screen, reconnect the cable, and confirm USB debugging is still enabled."
+    )
+
+
+def parse_devices_output(text):
+    """Parse ``adb devices -l`` into ``{"serial", "status", "model", ...}`` dicts.
+
+    Two shapes broke the old split-on-whitespace parser. When the server starts
+    on demand adb prints "* daemon not running; starting now at tcp:5037" and
+    "* daemon started successfully" around the list, which came back as a device
+    whose serial was "*". And "no permissions (...)" is a two-word state, which
+    came back as the state "no", so the help written for it never applied.
+    """
+
+    devices = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("*") or line.lower().startswith("list of devices"):
+            continue
+        parts = line.split()
+        serial = parts[0]
+        rest = parts[1:]
+        if len(rest) >= 2 and rest[0] == "no" and rest[1].startswith("permissions"):
+            status = "no permissions"
+            # adb appends its own explanation in parentheses; it is not a field.
+            details = [token for token in rest[2:] if ":" in token and not token.startswith("(")]
+        else:
+            status = rest[0] if rest else "unknown"
+            details = rest[1:]
+        entry = {"serial": serial, "status": status, "model": serial}
+        for token in details:
+            key, _, value = token.partition(":")
+            if not value:
+                continue
+            if key == "model":
+                entry["model"] = value.replace("_", " ")
+            elif key in {"product", "device", "transport_id", "usb"}:
+                entry[key] = value
+        devices.append(entry)
+    return devices
+
+
 class ADBOperationError(RuntimeError):
     def __init__(self, operation, path, detail):
         self.operation = operation
@@ -197,19 +285,10 @@ class ADBBridge:
         except Exception:
             return devices
 
-        for line in output[1:]:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split()
-            serial = parts[0]
-            status = parts[1] if len(parts) > 1 else "unknown"
-            model = serial
-            detail_tokens = parts[2:]
-            for token in detail_tokens:
-                if token.startswith("model:"):
-                    model = token.split(":", 1)[1].replace("_", " ")
-                    break
+        for entry in parse_devices_output("\n".join(output)):
+            serial = entry["serial"]
+            status = entry["status"]
+            model = entry["model"]
             if status == "device" and model == serial:
                 try:
                     model = subprocess.check_output(

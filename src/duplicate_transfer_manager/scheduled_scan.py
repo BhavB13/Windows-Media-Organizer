@@ -42,6 +42,9 @@ def run_scheduled_scan(source: str, *, data_root: str = "") -> int:
         preserve_structure=True,
         max_hash_workers=4,
     )
+    # Nobody is present to answer the cloud-download warning, so an unattended
+    # run never downloads: cloud-only files are left out and counted instead.
+    settings.skip_cloud_placeholders = True
     messages: list[str] = []
     try:
         result = DuplicateScanService(cache).run(
@@ -62,7 +65,11 @@ def run_scheduled_scan(source: str, *, data_root: str = "") -> int:
         "completed" if result.status == OperationState.COMPLETED else "cancelled",
         title="Scheduled duplicate scan",
         counts=result.counts,
-        summary={"source": str(source_path), "read_only": True},
+        summary={
+            "source": str(source_path),
+            "read_only": True,
+            "cloud_only_files_skipped": int(result.counts.get("skipped_cloud_files", 0) or 0),
+        },
         warnings=list(result.warnings),
         failures=[failure.message for failure in result.failures],
     )

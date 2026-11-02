@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    android:padding="@dimen/screen_padding">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/label_source"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/heading_source"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:accessibilityHeading="true" />
+
+        <TextView
+            android:id="@+id/value_source"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/none_selected"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/button_source"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/gap"
+            android:minHeight="@dimen/touch_target"
+            android:text="@string/choose_source"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/label_destination"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="@string/heading_destination"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:accessibilityHeading="true" />
+
+        <TextView
+            android:id="@+id/value_destination"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/none_selected"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/button_destination"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/gap"
+            android:minHeight="@dimen/touch_target"
+            android:text="@string/choose_destination"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/label_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="@string/heading_status"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:accessibilityHeading="true" />
+
+        <Button
+            android:id="@+id/button_review"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/gap"
+            android:minHeight="@dimen/touch_target"
+            android:text="@string/action_review"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/button_copy"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/gap"
+            android:minHeight="@dimen/touch_target"
+            android:text="@string/action_copy"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/button_cancel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/gap"
+            android:minHeight="@dimen/touch_target"
+            android:text="@string/action_cancel"
+            android:textSize="16sp" />
+
+        <ProgressBar
+            android:id="@+id/progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/gap"
+            android:contentDescription="@string/desc_progress" />
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/gap"
+            android:text="@string/status_idle"
+            android:textSize="16sp"
+            android:focusable="true" />
+
+        <TextView
+            android:id="@+id/results"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="@dimen/gap"
+            android:layout_marginBottom="24dp"
+            android:contentDescription="@string/desc_results"
+            android:textSize="15sp"
+            android:textIsSelectable="true"
+            android:focusable="true" />
+    </LinearLayout>
+</ScrollView>

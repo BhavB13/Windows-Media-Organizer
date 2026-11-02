@@ -39,6 +39,9 @@ packages = [
     "duplicate_transfer_manager",
     "duplicate_transfer_manager.controllers",
     "duplicate_transfer_manager.core",
+    "duplicate_transfer_manager.index",
+    "duplicate_transfer_manager.media",
+    "duplicate_transfer_manager.previews",
     "duplicate_transfer_manager.services",
     "duplicate_transfer_manager.sorting",
     "duplicate_transfer_manager.ui",
@@ -55,6 +58,7 @@ py-modules = [
     "runtime_paths",
     "transfer_safety",
     "utils",
+    "volume_identity",
 ]
 
 [tool.unittest]

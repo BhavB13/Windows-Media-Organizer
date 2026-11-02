@@ -62,6 +62,45 @@ from models import FileInfo
 
 
 class Phase2UiTests(unittest.TestCase):
+    def test_partial_cleanup_refuses_to_touch_an_active_transfer(self):
+        page = self.window.pages["import"]
+        with (
+            patch.object(type(page.controller), "busy", new_callable=PropertyMock, return_value=True),
+            patch("duplicate_transfer_manager.ui.pages.cleanup_partial_files") as cleanup,
+            patch.object(QMessageBox, "question") as confirm,
+        ):
+            page._cleanup_partials()
+        cleanup.assert_not_called()
+        confirm.assert_not_called()
+
+    def test_partial_cleanup_runs_off_main_thread_and_blocks_transfer_overlap(self):
+        import threading
+        page = self.window.pages["import"]
+        page.output_path.set_path(self.temp_dir.name)
+        page.dry_run_cleanup.setChecked(True)
+        main_thread = threading.get_ident()
+        threads = []
+        release = threading.Event()
+
+        def cleanup(root, dry_run):
+            threads.append(threading.get_ident())
+            release.wait(5)
+            return [str(Path(root) / "owned-file")]
+
+        with patch("duplicate_transfer_manager.ui.pages.cleanup_partial_files", side_effect=cleanup):
+            try:
+                page._cleanup_partials()
+                self.assertTrue(page.controller.busy)
+                self.assertFalse(page.cleanup_partials_button.isEnabled())
+                self.assertFalse(page.controller.start_task(lambda _token, _reporter: None))
+            finally:
+                release.set()
+                self.assertTrue(page.controller.wait_for_done(5000))
+                self.application.processEvents()
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], main_thread)
+        self.assertTrue(page.cleanup_partials_button.isEnabled())
+
     @classmethod
     def setUpClass(cls):
         cls.application = QApplication.instance() or QApplication([])
@@ -101,6 +140,33 @@ class Phase2UiTests(unittest.TestCase):
         cancel.assert_called_once()
         wait.assert_called_once()
         self.assertTrue(event.isAccepted())
+
+    def test_shutdown_timeout_keeps_the_window_open(self):
+        controller = self.window.pages["import"].controller
+        with (
+            patch.object(type(controller), "busy", new_callable=PropertyMock, return_value=True),
+            patch.object(controller, "cancel"),
+            patch.object(controller, "wait_for_done", return_value=False),
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+            patch.object(QMessageBox, "warning") as warning,
+        ):
+            event = QCloseEvent()
+            self.window.closeEvent(event)
+        self.assertFalse(event.isAccepted())
+        warning.assert_called_once()
+
+    def test_shutdown_waits_for_background_quarantine_work(self):
+        from PySide6.QtCore import QThreadPool
+        with (
+            patch.object(QThreadPool, "activeThreadCount", return_value=1),
+            patch.object(QThreadPool, "waitForDone", return_value=False) as wait,
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+            patch.object(QMessageBox, "warning"),
+        ):
+            event = QCloseEvent()
+            self.window.closeEvent(event)
+        self.assertFalse(event.isAccepted())
+        wait.assert_called_once()
 
     def test_declining_the_close_prompt_leaves_the_window_open(self):
         controller = self.window.pages["import"].controller
@@ -183,7 +249,9 @@ class Phase2UiTests(unittest.TestCase):
             {
                 "overview",
                 "audit",
+                "library",
                 "duplicates",
+                "similar",
                 "import",
                 "sort",
                 "activity",
@@ -771,11 +839,50 @@ class Phase2UiTests(unittest.TestCase):
             control.deleteLater()
 
     def test_navigation_controls_have_keyboard_shortcuts_and_focus_policy(self):
-        self.assertEqual(len(self.window.sidebar.shortcuts), len(ROUTES))
         self.assertEqual(
-            [shortcut.key().toString() for shortcut in self.window.sidebar.shortcuts],
-            [f"Alt+{index}" for index in range(1, 10)],
+            len(self.window.sidebar.shortcuts), len([route for route in ROUTES if route.shortcut])
         )
+        # Similar Photos has no shortcut: every Alt+digit is taken.
+        self.assertEqual(next(r for r in ROUTES if r.key == "similar").shortcut, "")
+        bound = {
+            route.key: shortcut.key().toString()
+            for route, shortcut in zip(
+                [route for route in ROUTES if route.shortcut], self.window.sidebar.shortcuts
+            )
+        }
+        # The original nine keep the shortcuts people already know; Library,
+        # added later beside Disk Audit, takes the free Alt+0.
+        self.assertEqual(
+            bound,
+            {
+                "overview": "Alt+1",
+                "audit": "Alt+2",
+                "library": "Alt+0",
+                "duplicates": "Alt+3",
+                "import": "Alt+4",
+                "sort": "Alt+5",
+                "activity": "Alt+6",
+                "quarantine": "Alt+7",
+                "settings": "Alt+8",
+                "help": "Alt+9",
+            },
+        )
+        self.assertEqual(len(set(bound.values())), len(bound))
+
+    def test_library_page_is_reachable_and_guarded_at_shutdown(self):
+        from duplicate_transfer_manager.ui.library_page import LibraryPage
+
+        # The page existed for a while with no route to it.
+        self.window.navigate("library")
+        self.assertIsInstance(self.window.stack.currentWidget(), LibraryPage)
+        library = self.window.pages["library"]
+        # Opening the page loads the catalog in the background; let it finish
+        # so tearDown does not close the window on running work.
+        self.assertTrue(library.wait_for_done(5000))
+
+        # An index in progress must hold the window open like any other job.
+        with patch.object(type(library.controller), "busy", new_callable=PropertyMock, return_value=True):
+            self.assertIn(library.controller, self.window._busy_controllers())
         for route in ROUTES:
             button = self.window.sidebar.buttons[route.key]
             self.assertTrue(button.accessibleName())

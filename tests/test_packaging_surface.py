@@ -113,3 +113,29 @@ class UpdateStatusDoesNotOverstateItselfTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WheelManifestTests(unittest.TestCase):
+    """pyproject lists packages and modules explicitly, so anything new must be
+    added there by hand. Forgetting one only shows up in an installed wheel,
+    which then fails to start even though the checkout runs fine."""
+
+    def _declared(self, key: str) -> set[str]:
+        block = re.search(rf"{key}\s*=\s*\[(.*?)\]", _read("pyproject.toml"), re.S)
+        self.assertIsNotNone(block, f"{key} block not found in pyproject.toml")
+        return set(re.findall(r'"([^"]+)"', block.group(1)))
+
+    def test_every_package_under_src_is_declared(self):
+        source = REPO_ROOT / "src"
+        on_disk = {
+            ".".join(init.parent.relative_to(source).parts)
+            for init in source.rglob("__init__.py")
+            if "__pycache__" not in init.parts
+        }
+        missing = sorted(on_disk - self._declared("packages"))
+        self.assertEqual(missing, [], f"packages missing from pyproject.toml: {missing}")
+
+    def test_every_top_level_module_is_declared(self):
+        on_disk = {path.stem for path in REPO_ROOT.glob("*.py")}
+        missing = sorted(on_disk - self._declared("py-modules"))
+        self.assertEqual(missing, [], f"py-modules missing from pyproject.toml: {missing}")

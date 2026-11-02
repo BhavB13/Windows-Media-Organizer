@@ -42,6 +42,8 @@ from utils import DEFAULT_EXCLUDES, DEFAULT_MEDIA_EXTS, HashCache
 from ..controllers import DeviceController, DuplicateScanController, TransferController
 from ..controllers.base import OperationWorker
 from ..core import AppSettings, CancellationToken, OperationResult, OperationState
+from ..services.cloud_guard import CHOICE_CANCEL, CHOICE_DOWNLOAD, CHOICE_SKIP, assess_cloud_downloads
+from ..services.transfer_service import DESTINATION_DISCONNECTED_TEXT
 from ..runtime_paths import get_runtime_paths
 from ..sorting import SortExecutor
 from ..services import (
@@ -87,6 +89,34 @@ from .widgets import (
     ToastBanner,
     format_eta,
 )
+
+
+def ask_cloud_choice(parent: QWidget, assessment) -> str:
+    """Ask what to do about files that reading would download from the cloud.
+
+    Returns CHOICE_SKIP, CHOICE_DOWNLOAD or CHOICE_CANCEL. Cancel is the default
+    button: the safe answer to a surprise download is no.
+    """
+
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setWindowTitle("Files will be downloaded")
+    box.setText(assessment.message)
+    box.setInformativeText(
+        "Scanning only the files on this PC leaves the cloud-only ones out and downloads nothing."
+    )
+    skip = box.addButton("Scan only files on this PC", QMessageBox.ButtonRole.AcceptRole)
+    download = box.addButton("Download and scan everything", QMessageBox.ButtonRole.DestructiveRole)
+    cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+    box.setDefaultButton(cancel)
+    box.setEscapeButton(cancel)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is skip:
+        return CHOICE_SKIP
+    if clicked is download:
+        return CHOICE_DOWNLOAD
+    return CHOICE_CANCEL
 
 
 class BasePage(QScrollArea):
@@ -153,6 +183,35 @@ class BasePage(QScrollArea):
             lambda: self._background_workers.remove(worker) if worker in self._background_workers else None
         )
         QThreadPool.globalInstance().start(worker)
+
+    def start_after_cloud_check(self, roots, is_adb: bool, proceed, abandon) -> None:
+        """Check ``roots`` for cloud-only files off the main thread, then start.
+
+        ``proceed(skip_cloud)`` runs when nothing would download, when the user
+        chooses to scan only local files (``skip_cloud=True``) or to download
+        everything, or when the check itself fails - a broken advisory check
+        must never block a scan. ``abandon`` runs when the user cancels.
+        """
+
+        if is_adb:
+            proceed(False)
+            return
+
+        def decide(assessment) -> None:
+            if assessment is not None and assessment.would_download:
+                choice = ask_cloud_choice(self, assessment)
+                if choice == CHOICE_CANCEL:
+                    abandon()
+                    return
+                proceed(choice == CHOICE_SKIP)
+                return
+            proceed(False)
+
+        self.run_in_background(
+            lambda: assess_cloud_downloads(list(roots)),
+            decide,
+            lambda _failure: proceed(False),
+        )
 
     def finish(self) -> None:
         self.content.addStretch(1)
@@ -896,11 +955,31 @@ class DuplicatesPage(BasePage):
         self.review_button.setEnabled(False)
         self.results_card.hide()
         self.progress_panel.show()
+        settings = self._build_settings()
+        self.progress_panel.update_progress(
+            0, "Checking for cloud-only files…", "Reading file attributes only", "0% • 0 items • ETA —"
+        )
+        self.start_after_cloud_check(
+            [settings.scan_root],
+            bool(getattr(settings, "use_adb", False)),
+            lambda skip_cloud=False: self._begin_scan(settings, skip_cloud),
+            self._abandon_scan,
+        )
+
+    def _begin_scan(self, settings, skip_cloud: bool = False) -> None:
+        settings.skip_cloud_placeholders = bool(skip_cloud)
         self.progress_panel.update_progress(0, "Starting scan…", "Validating source and options", "0% • 0 items • ETA —")
-        started = self.controller.start(self._build_settings())
+        started = self.controller.start(settings)
         if not started:
             self.review_button.setEnabled(True)
             self.scan_button.setEnabled(True)
+
+    def _abandon_scan(self) -> None:
+        self.progress_panel.hide()
+        self.review_button.setEnabled(True)
+        self.scan_button.setEnabled(True)
+        self.banner.set_message("Scan not started. Nothing was read or downloaded.", "info")
+        self.banner.show()
 
     def _on_progress(self, event) -> None:
         value = int((event.progress or 0) * 100)
@@ -944,9 +1023,13 @@ class DuplicatesPage(BasePage):
         self.review = review
         self._render_review()
         if self.review.groups:
-            self.banner.set_message("Scan complete. Review checked duplicates before confirming quarantine.", "success")
+            message, kind = "Scan complete. Review checked duplicates before confirming quarantine.", "success"
         else:
-            self.banner.set_message("Scan complete. No duplicate groups were found.", "info")
+            message, kind = "Scan complete. No duplicate groups were found.", "info"
+        skipped_cloud = int(result.counts.get("skipped_cloud_files", 0) or 0)
+        if skipped_cloud:
+            message += f" {skipped_cloud:,} cloud-only file(s) were left out and not downloaded."
+        self.banner.set_message(message, kind)
         self.operation_service.record(
             "duplicate_scan",
             "completed",
@@ -1488,6 +1571,7 @@ class ImportPage(BasePage):
         self.stall_timeout.setSuffix(" sec stall timeout")
         self.stall_timeout.valueChanged.connect(lambda _value: self._invalidate_review())
         cleanup_partials = QPushButton("Clean partial files in save location")
+        self.cleanup_partials_button = cleanup_partials
         cleanup_partials.clicked.connect(self._cleanup_partials)
         for label, widget in (
             ("Hash mode", self.hash_mode),
@@ -1571,6 +1655,7 @@ class ImportPage(BasePage):
         self.controller.recoverable_error.connect(self._on_failed)
         self.controller.failed.connect(self._on_failed)
         self.controller.technical_log.connect(self._on_log)
+        self.controller.busy_changed.connect(lambda busy: self.cleanup_partials_button.setEnabled(not busy))
         self._source_changed("folder")
         self._apply_android_preferences(self.app_settings)
         self.finish()
@@ -1881,12 +1966,37 @@ class ImportPage(BasePage):
         self.review_button.setEnabled(False)
         self.run_button.setEnabled(False)
         self._set_stage("validation")
+        settings = self.current_settings
+        self.progress_panel.update_progress(
+            0, "Checking for cloud-only files…", "Reading file attributes only", "0% • 0 items • ETA —"
+        )
+        self.start_after_cloud_check(
+            [settings.source_root],
+            bool(getattr(settings, "source_is_adb", False)),
+            lambda skip_cloud=False: self._begin_import(settings, skip_cloud),
+            self._abandon_import,
+        )
+
+    def _begin_import(self, settings, skip_cloud: bool = False) -> None:
+        settings.skip_cloud_placeholders = bool(skip_cloud)
         self.progress_panel.update_progress(0, "Validating transfer settings…", "Preparing import", "0% • 0 items • ETA —")
-        if not self.controller.start(self.current_settings):
+        if not self.controller.start(settings):
             self.review_button.setEnabled(True)
             self.run_button.setEnabled(True)
 
+    def _abandon_import(self) -> None:
+        self.progress_panel.hide()
+        self.stage_card.hide()
+        self.review_button.setEnabled(True)
+        self.run_button.setEnabled(True)
+        self.banner.set_message("Import not started. Nothing was read, downloaded or copied.", "info")
+        self.banner.show()
+
     def _cleanup_partials(self) -> None:
+        if self.controller.busy:
+            self.banner.set_message("Wait for the current operation to finish before cleaning partial files.", "warning")
+            self.banner.show()
+            return
         root = self.output_path.path() or self.library_path.path()
         if not root:
             self.banner.set_message("Choose an existing library or save location before cleaning partial files.", "warning")
@@ -1902,10 +2012,19 @@ class ImportPage(BasePage):
             )
             if response != QMessageBox.StandardButton.Yes:
                 return
-        removed = cleanup_partial_files(root, dry_run=self.dry_run_cleanup.isChecked())
-        action = "Would remove" if self.dry_run_cleanup.isChecked() else "Removed"
-        self.banner.set_message(f"{action} {len(removed)} partial transfer file(s).", "success")
-        self.banner.show()
+        dry_run = self.dry_run_cleanup.isChecked()
+
+        def cleanup(cancellation, _reporter):
+            cancellation.raise_if_cancelled()
+            removed = cleanup_partial_files(root, dry_run=dry_run)
+            return OperationResult(
+                status=OperationState.COMPLETED,
+                data={"partial_cleanup": {"count": len(removed), "dry_run": dry_run}},
+            )
+
+        # Use the same worker boundary as transfers so cleanup cannot overlap
+        # an import or block the UI while walking a large removable drive.
+        self.controller.start_task(cleanup)
 
     def _set_stage(self, active_stage: str) -> None:
         for key, label in self.stage_labels.items():
@@ -1939,6 +2058,13 @@ class ImportPage(BasePage):
         self.review_button.setEnabled(True)
         self.run_button.setEnabled(True)
         self.progress_panel.hide()
+        if "partial_cleanup" in result.data:
+            cleanup = result.data["partial_cleanup"]
+            action = "Would remove" if cleanup["dry_run"] else "Removed"
+            self.banner.set_message(f"{action} {cleanup['count']} partial transfer file(s).", "success")
+            self.banner.show()
+            self.run_button.setEnabled(self.current_settings is not None)
+            return
         self._set_stage("finalization")
         summary = summarize_transfer_result(result)
         self.result_summary.set_metrics(summary.items())
@@ -1954,7 +2080,31 @@ class ImportPage(BasePage):
             failures=[failure.message for failure in result.failures],
         )
         errors = int(result.counts.get("errors", 0))
-        if errors:
+        engine_result = (
+            result.data.get("engine_result", {})
+            if hasattr(result, "data") and isinstance(result.data, dict)
+            else {}
+        )
+        is_disconnected = bool(
+            engine_result.get("destination_disconnected")
+            or any(getattr(f, "code", "") == "destination_disconnected" for f in getattr(result, "failures", ()))
+        )
+        too_large_count = int(engine_result.get("too_large_skipped", 0) or 0)
+        if is_disconnected:
+            self.banner.set_message(
+                DESTINATION_DISCONNECTED_TEXT,
+                "warning",
+            )
+            self.run_button.setEnabled(True)
+            self.run_button.show()
+        elif too_large_count > 0:
+            file_word = "file was" if too_large_count == 1 else "files were"
+            self.banner.set_message(
+                f"{too_large_count} {file_word} too large for this FAT32 drive. "
+                "exFAT or NTFS drives can hold them.",
+                "info",
+            )
+        elif errors:
             # A green "Import complete" next to a non-zero error count told the
             # user everything had arrived when some of it had not.
             self.banner.set_message(
@@ -1989,15 +2139,32 @@ class ImportPage(BasePage):
         self.review_button.setEnabled(True)
         self.run_button.setEnabled(True)
         self.progress_panel.hide()
+        detail = str(getattr(error, "technical_detail", ""))
+        msg = str(getattr(error, "message", str(error)))
+        engine_result = getattr(error, "data", {}).get("engine_result", {}) if hasattr(error, "data") and isinstance(error.data, dict) else {}
+        disconnect_message = DESTINATION_DISCONNECTED_TEXT
+        is_disconnected = (
+            disconnect_message in detail
+            or disconnect_message in msg
+            or getattr(error, "code", "") == "destination_disconnected"
+            or bool(engine_result.get("destination_disconnected"))
+            or "destination drive was disconnected" in detail.lower()
+            or "destination drive was disconnected" in msg.lower()
+        )
         self.operation_service.record(
             "import",
             "failed",
             title="Failed import",
             summary={"resume_setup": self._resume_setup()},
-            failures=[getattr(error, "message", str(error))],
+            failures=[disconnect_message if is_disconnected else msg],
             resume_available=True,
         )
-        self.banner.set_message(getattr(error, "message", str(error)), "danger")
+        if is_disconnected:
+            self.banner.set_message(disconnect_message, "warning")
+            self.run_button.setEnabled(True)
+            self.run_button.show()
+        else:
+            self.banner.set_message(msg, "danger")
         self.banner.show()
 
 
@@ -2515,16 +2682,16 @@ class QuarantinePage(BasePage):
         toolbar.addLayout(action_row)
         self.content.addWidget(toolbar_card)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
-            ["Restore", "Operation", "Original path", "Quarantined copy", "Size", "Device", "Status"]
+            ["Restore", "Operation", "Reason", "Original path", "Quarantined copy", "Size", "Device", "Status"]
         )
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setColumnWidth(0, 72)
         self.table.setMinimumHeight(340)
@@ -2562,6 +2729,15 @@ class QuarantinePage(BasePage):
         self.refresh()
         self.finish()
 
+    @staticmethod
+    def _format_reason(reason: str | None) -> str:
+        raw = str(reason or "").strip()
+        if not raw or raw.lower() == "duplicate":
+            return "Duplicate"
+        if raw.lower() == "similar":
+            return "Similar photo"
+        return raw.title()
+
     def refresh(self) -> None:
         self.records = self.service.list_records()
         query = self.search.text().lower().strip()
@@ -2589,10 +2765,11 @@ class QuarantinePage(BasePage):
             check.toggled.connect(lambda checked, target_row=row: self._quarantine_selection_changed(target_row, checked))
             self.table.setCellWidget(row, 0, check)
             self.table.setItem(row, 1, QTableWidgetItem(record.operation_id))
-            self.table.setItem(row, 2, QTableWidgetItem(record.original_path))
-            self.table.setItem(row, 3, QTableWidgetItem(record.stored_path))
-            self.table.setItem(row, 4, QTableWidgetItem(format_duplicate_size(record.size)))
-            self.table.setItem(row, 5, QTableWidgetItem("Android" if record.source_is_adb else "This PC"))
+            self.table.setItem(row, 2, QTableWidgetItem(self._format_reason(record.reason)))
+            self.table.setItem(row, 3, QTableWidgetItem(record.original_path))
+            self.table.setItem(row, 4, QTableWidgetItem(record.stored_path))
+            self.table.setItem(row, 5, QTableWidgetItem(format_duplicate_size(record.size)))
+            self.table.setItem(row, 6, QTableWidgetItem("Android" if record.source_is_adb else "This PC"))
             status = (
                 f"Restored to {record.restored_path}"
                 if record.restored_at
@@ -2600,7 +2777,7 @@ class QuarantinePage(BasePage):
                 if record.source_is_adb
                 else "Ready to restore"
             )
-            self.table.setItem(row, 6, QTableWidgetItem(status))
+            self.table.setItem(row, 7, QTableWidgetItem(status))
         total = sum(record.size for record in active)
         operations = len({record.operation_id for record in active})
         self.empty.setVisible(not active)
@@ -2643,6 +2820,7 @@ class QuarantinePage(BasePage):
         detail = [
             f"Original: {record.original_path}",
             f"Quarantined: {record.stored_path}",
+            f"Reason: {self._format_reason(record.reason)}",
             f"Size: {format_duplicate_size(record.size)}",
             "Source: Android copy" if record.source_is_adb else "Source: This PC",
         ]

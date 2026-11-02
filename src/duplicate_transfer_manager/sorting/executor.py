@@ -427,10 +427,18 @@ class SortExecutor:
             if item.conflict != "overwrite":
                 raise OSError("Destination changed after preview; review the plan again.")
             # Named from the source path rather than a directory count, which
-            # re-listed the whole replaced/ folder for every overwrite.
+            # re-listed the whole replaced/ folder for every overwrite. The
+            # random component matters: the token alone is stable per
+            # destination, so a retry of a failed overwrite -- or a second run
+            # item aimed at the same path -- copied over an original already
+            # retained here and lost it. mkstemp gives each attempt a name no
+            # other attempt can hold.
             token = hashlib.sha256(str(destination).encode("utf-8", "replace")).hexdigest()[:12]
-            backup_path = run_root / "replaced" / f"{token}_{destination.name}"
-            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            replaced_dir = run_root / "replaced"
+            replaced_dir.mkdir(parents=True, exist_ok=True)
+            handle, reserved = tempfile.mkstemp(prefix=f"{token}_", suffix=f"_{destination.name}", dir=replaced_dir)
+            os.close(handle)
+            backup_path = Path(reserved)
             journal_path = run_root / "journal.json"
             # Record the intent before touching the incumbent. run_root is on
             # the app data drive while destinations are commonly on another
@@ -450,27 +458,68 @@ class SortExecutor:
             )
             # Verify the copy before removing the original, matching what undo
             # already does when it displaces a file.
-            incumbent_fingerprint = self._fingerprint(destination)
-            shutil.copy2(str(destination), str(backup_path))
-            self._verify_fingerprint(backup_path, incumbent_fingerprint)
+            try:
+                incumbent_fingerprint = self._fingerprint(destination)
+                shutil.copy2(str(destination), str(backup_path))
+                self._verify_fingerprint(backup_path, incumbent_fingerprint)
+            except Exception:
+                # The incumbent is still in place, so the reservation holds
+                # nothing. Leaving an empty file would pin this run in history
+                # forever, since prune_runs keeps any run holding originals.
+                try:
+                    backup_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
             destination.unlink()
             backup = str(backup_path)
+        # published records whether *this* item put the destination there.
+        # Rollback used to unlink whatever stood at the destination path on any
+        # failure, which deleted an unrelated file that appeared between the
+        # existence check above and the failure.
+        published = False
         try:
             if item.action == SortAction.COPY:
                 self._copy(source, destination, control)
             else:
                 self._move(source, destination, control)
+            published = True
             self._verify_fingerprint(destination, fingerprint)
-        except Exception:
-            if item.action in {SortAction.MOVE, SortAction.RENAME, SortAction.QUARANTINE} and not source.exists() and destination.exists():
-                source.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(destination), str(source))
-            elif destination.exists():
-                try:
-                    destination.unlink()
-                except OSError:
-                    pass
+        except Exception as exc:
+            if published:
+                if item.action in {SortAction.MOVE, SortAction.RENAME, SortAction.QUARANTINE} and not source.exists() and destination.exists():
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(destination), str(source))
+                elif destination.exists():
+                    try:
+                        destination.unlink()
+                    except OSError:
+                        pass
             if backup and Path(backup).exists():
+                if destination.exists():
+                    # Something this item never published now occupies the
+                    # destination, so putting the incumbent back would destroy
+                    # it -- the same clobber the publication path refuses. Both
+                    # files survive: the arrival stays put and the incumbent
+                    # stays in replaced/, which prune_runs will not delete.
+                    self._append_record(
+                        run_root / "journal.json",
+                        {
+                            "status": "replaced_retained",
+                            "source": item.metadata.path,
+                            "destination": str(destination),
+                            "replaced_backup": backup,
+                            "created_at": _now(),
+                        },
+                    )
+                    if isinstance(exc, OSError):
+                        # Cancellation and per-file skips keep their own type so
+                        # the run loop still treats them as control flow.
+                        raise OSError(
+                            f"{exc} The replaced original was not put back because another file now "
+                            f"occupies the destination; it is kept at {backup}."
+                        ) from exc
+                    raise
                 shutil.move(backup, str(destination))
             raise
         return self._record(item, "completed", fingerprint=fingerprint, verified=True, replaced_backup=backup)
@@ -533,10 +582,51 @@ class SortExecutor:
                     technical_detail=f"Required {required + reserve} bytes; available {free} bytes at {root}.",
                 )
 
+    @staticmethod
+    def _publish(temporary: Path, destination: Path) -> None:
+        """Put a staging file in place without ever replacing another file.
+
+        ``os.replace`` silently overwrites, so a destination created by anyone
+        else after the plan's existence check was destroyed. Both steps here
+        fail with ``FileExistsError`` instead when the name is taken.
+
+        Portability: this is a Windows desktop app, and Windows ``os.rename``
+        is natively no-clobber. The POSIX path needs ``os.link``, which every
+        filesystem this app is tested on supports. On one that does not (FAT
+        via some drivers, a few network mounts) the copy fails rather than
+        falling back. There is no linkless fallback because there is no safe
+        one: reserving the name with ``O_CREAT|O_EXCL`` and then calling
+        ``os.replace`` is still a two-step race, and a failure between them
+        leaves an empty file at the user's destination -- exactly the data loss
+        this method exists to prevent.
+        """
+
+        if os.name == "nt":
+            os.rename(temporary, destination)
+            return
+        os.link(temporary, destination)
+        os.unlink(temporary)
+
     def _copy(self, source: Path, destination: Path, control: SortExecutionControl) -> None:
-        temporary = destination.with_name(f".{destination.name}.dtm-partial")
+        """Copy through a uniquely named staging file this call alone owns.
+
+        The staging name used to be derived from the destination, so two runs
+        (or a leftover from a crash) collided, and the ``finally`` unlinked that
+        deterministic path even when ``open("xb")`` had failed because the file
+        was somebody else's. mkstemp both creates and owns the name.
+        """
+
+        handle, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".dtm-partial", dir=destination.parent)
+        temporary = Path(name)
+        published = False
         try:
-            with source.open("rb") as input_stream, temporary.open("xb") as output_stream:
+            stream = os.fdopen(handle, "wb")
+            handle = -1
+            # Our own stream is entered first. With the source first, a source
+            # that fails to open left the staging descriptor never entered and
+            # so never closed, and Windows refuses to unlink a file with an
+            # open handle -- the cleanup below silently did nothing.
+            with stream as output_stream, source.open("rb") as input_stream:
                 while True:
                     if control.checkpoint(str(source)):
                         raise PerFileSkipped("File was skipped during copying.")
@@ -546,24 +636,56 @@ class SortExecutor:
                     output_stream.write(chunk)
                 output_stream.flush()
                 os.fsync(output_stream.fileno())
-            os.replace(temporary, destination)
-            shutil.copystat(source, destination)
+            # Stamp the metadata while the file is still ours. Doing it after
+            # publication meant a copystat failure had to delete an already
+            # published destination to keep the "no destination on failure"
+            # contract; now nothing is published yet and the cleanup below
+            # covers it.
+            shutil.copystat(source, temporary)
+            self._publish(temporary, destination)
+            published = True
         finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if handle != -1:
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+            if not published:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _move(self, source: Path, destination: Path, control: SortExecutionControl) -> None:
         control.checkpoint(str(source))
         try:
-            os.replace(source, destination)
+            if os.name == "nt":
+                os.rename(source, destination)
+            else:
+                os.link(source, destination)
+                try:
+                    source.unlink()
+                except OSError:
+                    destination.unlink(missing_ok=True)
+                    raise
+            return
+        except FileExistsError:
+            raise
         except OSError as exc:
-            if exc.errno not in {errno.EXDEV, errno.EACCES, errno.EPERM}:
+            if exc.errno not in {errno.EXDEV, errno.EACCES, errno.EPERM, errno.ENOSYS, errno.EMLINK, errno.EOPNOTSUPP}:
                 raise
-            self._copy(source, destination, control)
+        self._copy(source, destination, control)
+        try:
             self._verify_fingerprint(destination, self._fingerprint(source, control))
             source.unlink()
+        except Exception:
+            # We published this copy, and the source is still intact, so ours
+            # is the file to withdraw.
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def _fingerprint(path: Path, control: SortExecutionControl | None = None) -> str:

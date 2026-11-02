@@ -10,6 +10,34 @@ release onward.
 
 ## [Unreleased]
 
+### Android companion and September reliability review
+
+- Added a native Android companion under `android/` for copying selected phone
+  folders to mounted USB storage. Content comparison uses SHA-256 and source
+  files remain untouched. See its README for build instructions and device
+  verification requirements.
+- The Android overlap check no longer crashes on Android 8.0 through 9. It
+  called a storage API introduced in Android 10 without a version guard, which
+  would have thrown inside the check that stops a folder being copied into
+  itself. On those versions the app now falls back to its own reasoning and
+  refuses the run when it cannot prove the two folders are separate.
+- Sort Files uses uniquely owned staging files and refuses to overwrite a file
+  that appears after review. Failed replacements preserve displaced originals,
+  including when another file prevents automatic restoration.
+- Import dry runs avoid creating destination subfolders, consult existing resume
+  state without writing it, and account for duplicates within the source batch.
+- Imports also compare against a separate save folder, preventing repeat copies
+  when a resume journal is unavailable.
+- Chained controller operations retain their own cancellation token. Partial-file
+  cleanup runs off the UI thread and cannot overlap an import on that page.
+- A replace-policy import that fails verification now puts the displaced original
+  back at its own path instead of leaving that path empty with no record of where
+  the file went. Where the original cannot be put back, its location is reported.
+- Local copies are verified by content, not just by size, so a copy that matches
+  in length but differs in bytes is no longer counted as a success.
+- Cancelling a retrying pull stops at once, instead of finishing the remaining
+  attempts and a reconnect wait first.
+
 ### Removed
 
 - **The legacy Tkinter frontend.** `README.md` documented `python legacy_main.py`

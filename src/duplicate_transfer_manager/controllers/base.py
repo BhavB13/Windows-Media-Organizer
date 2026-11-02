@@ -30,6 +30,7 @@ class WorkerSignals(QObject):
     result = Signal(object)
     error = Signal(object)
     finished = Signal()
+    finished_operation = Signal(object)
     technical_log = Signal(str)
 
 
@@ -57,6 +58,7 @@ class OperationWorker(QRunnable):
             self.signals.technical_log.emit(error.technical_detail)
             self.signals.error.emit(error)
         finally:
+            self.signals.finished_operation.emit(self.cancellation)
             self.signals.finished.emit()
 
 
@@ -126,7 +128,7 @@ class BaseOperationController(QObject):
         worker.signals.result.connect(self._on_result)
         worker.signals.error.connect(self._on_error)
         worker.signals.technical_log.connect(self.technical_log.emit)
-        worker.signals.finished.connect(self._on_finished)
+        worker.signals.finished_operation.connect(self._on_finished)
         self._set_state(OperationState.VALIDATING)
         self._thread_pool.start(worker)
         return True
@@ -179,11 +181,14 @@ class BaseOperationController(QObject):
             self.recoverable_error.emit(error)
         self.failed.emit(error)
 
-    @Slot()
-    def _on_finished(self) -> None:
+    @Slot(object)
+    def _on_finished(self, cancellation: CancellationToken) -> None:
         with self._lock:
-            self._worker = None
-            self._cancellation = None
+            # A completion callback can already have started the next task.
+            # The previous worker's queued finish must not clear its token.
+            if self._cancellation is cancellation:
+                self._worker = None
+                self._cancellation = None
 
     def wait_for_done(self, timeout_ms: int = -1) -> bool:
         """Testing and shutdown helper; normal UI code should remain event-driven."""

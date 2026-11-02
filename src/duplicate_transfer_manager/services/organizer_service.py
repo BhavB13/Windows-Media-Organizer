@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import shutil
 import struct
+import tempfile
 from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -321,12 +323,16 @@ class FileOrganizerService:
             source = Path(item.source_path)
             target = Path(item.destination_path)
             replaced_backup = ""
+            source_fingerprint = ""
+            moved_to_target = False
+            record: dict | None = None
             try:
                 if not source.exists():
                     raise FileNotFoundError(source)
                 current = source.stat()
                 if current.st_size != item.size or current.st_mtime != item.modified:
                     raise OSError("Source file changed after the reviewed plan was created. Review again before moving it.")
+                source_fingerprint = self._fingerprint(source)
                 if target.exists() and item.collision != "replace":
                     raise OSError("Destination changed after review. Review again before moving this file.")
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -336,20 +342,40 @@ class FileOrganizerService:
                     # before moving the reviewed source into its place.
                     backup = operation_root / "replaced_destinations" / f"{len(records):06d}_{target.name}"
                     backup.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(target), str(backup))
+                    self._move_verified(target, backup)
                     replaced_backup = str(backup)
-                shutil.move(str(source), str(target))
-                records.append({
+                self._move_verified(source, target, source_fingerprint)
+                moved_to_target = True
+                record = {
                     **asdict(item), "destination_path": str(target), "moved_at": _now(), "restored_at": "",
-                    "source_fingerprint": self._fingerprint(target), "replaced_destination_backup": replaced_backup,
-                })
-                self._write_manifest(manifest_path, operation_id, settings, records, skipped, failures, dry_run=False, plan=plan)
+                    "source_fingerprint": source_fingerprint, "replaced_destination_backup": replaced_backup,
+                }
+                records.append(record)
+                try:
+                    self._write_manifest(manifest_path, operation_id, settings, records, skipped, failures, dry_run=False, plan=plan)
+                except OSError:
+                    records.pop()
+                    record = None
+                    raise
             except OSError as exc:
+                # A move that cannot be durably recorded is not a completed
+                # operation. Put it back while the verified bytes and their
+                # expected fingerprint are still known.
+                if moved_to_target and target.exists() and not source.exists():
+                    try:
+                        source.parent.mkdir(parents=True, exist_ok=True)
+                        self._move_verified(target, source, source_fingerprint)
+                        moved_to_target = False
+                    except OSError as rollback_exc:
+                        exc = OSError(
+                            f"{exc}; the moved file could not be returned to {source}: "
+                            f"{rollback_exc}. It remains at {target}."
+                        )
                 # If replacing failed after moving the existing destination
                 # aside, put it back before continuing with the other files.
                 if replaced_backup and Path(replaced_backup).exists() and not target.exists():
                     try:
-                        shutil.move(replaced_backup, str(target))
+                        self._move_verified(Path(replaced_backup), target)
                     except OSError:
                         pass
                 failures.append(f"{source}: {exc}")
@@ -368,11 +394,12 @@ class FileOrganizerService:
         restored: list[str] = []
         skipped: list[str] = []
         failures: list[str] = []
-        for record in payload.get("records", []):
+        for record_index, record in enumerate(payload.get("records", [])):
             if record.get("restored_at"):
                 continue
             source = Path(record.get("destination_path", ""))
             target = Path(record.get("source_path", ""))
+            rollback_backup: Path | None = None
             try:
                 if not source.exists():
                     raise FileNotFoundError(source)
@@ -388,18 +415,38 @@ class FileOrganizerService:
                 if not dry_run:
                     resolved.parent.mkdir(parents=True, exist_ok=True)
                     if conflict_policy == "replace" and resolved.exists():
-                        resolved.unlink()
-                    shutil.move(str(source), str(resolved))
+                        backup_dir = manifest.parent / "rollback_replaced"
+                        backup_dir.mkdir(parents=True, exist_ok=True)
+                        backup_base = backup_dir / f"{record_index:06d}_{resolved.name}"
+                        rollback_backup = backup_base
+                        suffix = 1
+                        while rollback_backup.exists():
+                            rollback_backup = backup_base.with_name(
+                                f"{backup_base.stem}_{suffix}{backup_base.suffix}"
+                            )
+                            suffix += 1
+                        self._move_verified(resolved, rollback_backup)
+                        record["rollback_replaced_backup"] = str(rollback_backup)
+                    self._move_verified(source, resolved, fingerprint)
                     backup_text = str(record.get("replaced_destination_backup", ""))
                     backup = Path(backup_text) if backup_text else None
                     if backup and backup.exists():
                         # The destination is now free because the reviewed
                         # source has returned to its original location.
-                        shutil.move(str(backup), str(Path(record["destination_path"])))
+                        self._move_verified(backup, Path(record["destination_path"]))
                     record["restored_at"] = _now()
                     record["restored_path"] = str(resolved)
                 restored.append(str(resolved))
             except OSError as exc:
+                if rollback_backup and rollback_backup.exists() and not target.exists():
+                    try:
+                        self._move_verified(rollback_backup, target)
+                        record.pop("rollback_replaced_backup", None)
+                    except OSError as restore_exc:
+                        exc = OSError(
+                            f"{exc}; the file displaced during rollback is retained at "
+                            f"{rollback_backup} because it could not be restored: {restore_exc}"
+                        )
                 failures.append(f"{target}: {exc}")
         if not dry_run:
             manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -412,11 +459,26 @@ class FileOrganizerService:
             try:
                 modified = datetime.fromtimestamp(manifest.stat().st_mtime, UTC)
                 if modified < cutoff:
+                    if self._holds_replaced_originals(manifest.parent):
+                        continue
                     shutil.rmtree(manifest.parent)
                     removed += 1
             except OSError:
                 continue
         return removed
+
+    @staticmethod
+    def _holds_replaced_originals(operation_root: Path) -> bool:
+        """Treat unreadable or occupied backup folders as user data to retain."""
+
+        for folder_name in ("replaced_destinations", "rollback_replaced"):
+            replaced = operation_root / folder_name
+            try:
+                if replaced.is_dir() and any(path.is_file() for path in replaced.iterdir()):
+                    return True
+            except OSError:
+                return True
+        return False
 
     def list_operations(self) -> list[dict]:
         operations: list[dict] = []
@@ -537,6 +599,80 @@ class FileOrganizerService:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    @staticmethod
+    def _publish_no_clobber(temporary: Path, destination: Path) -> None:
+        if os.name == "nt":
+            os.rename(temporary, destination)
+            return
+        os.link(temporary, destination)
+        try:
+            temporary.unlink()
+        except OSError:
+            destination.unlink(missing_ok=True)
+            raise
+
+    @classmethod
+    def _move_verified(cls, source: Path, destination: Path, expected: str = "") -> None:
+        """Move without trusting an unverified cross-volume copy."""
+
+        expected = expected or cls._fingerprint(source)
+        try:
+            cls._publish_no_clobber(source, destination)
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            cross_volume = exc.errno in {
+                errno.EXDEV,
+                errno.EACCES,
+                errno.EPERM,
+                errno.ENOSYS,
+                errno.EMLINK,
+                getattr(errno, "EOPNOTSUPP", 95),
+            } or getattr(exc, "winerror", None) in {1, 17, 50}
+            if not cross_volume:
+                raise
+        else:
+            try:
+                if cls._fingerprint(destination) != expected:
+                    raise OSError("File verification failed after moving.")
+            except Exception:
+                if not source.exists() and destination.exists():
+                    try:
+                        cls._publish_no_clobber(destination, source)
+                    except OSError:
+                        pass
+                raise
+            return
+
+        handle, name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".dtm-partial", dir=destination.parent
+        )
+        os.close(handle)
+        temporary = Path(name)
+        published = False
+        try:
+            shutil.copy2(source, temporary)
+            if cls._fingerprint(temporary) != expected:
+                raise OSError("File verification failed before completing a cross-volume move.")
+            cls._publish_no_clobber(temporary, destination)
+            published = True
+            if cls._fingerprint(destination) != expected:
+                raise OSError("File verification failed after completing a cross-volume move.")
+            source.unlink()
+        except Exception:
+            if published and source.exists():
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
 
     @staticmethod
     def _cleanup_empty(settings: OrganizerSettings, roots: list[Path]) -> tuple[str, ...]:

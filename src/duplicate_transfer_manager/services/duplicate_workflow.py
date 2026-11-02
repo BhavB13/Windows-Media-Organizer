@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 from uuid import uuid4
 
 try:
@@ -26,6 +26,7 @@ from models import FileInfo
 from utils import ensure_unique_path
 
 from ..core import ErrorCode, QuarantineRecord, ServiceError
+from ..previews.thumbnails import ThumbnailCache
 from ..runtime_paths import RuntimePaths, get_runtime_paths
 from .support_services import _atomic_json_write
 
@@ -175,47 +176,44 @@ def _dimensions(path: str, is_adb: bool) -> tuple[str, str]:
         return "", "Preview metadata is unavailable."
 
 
-def _thumbnail(path: str, target: Path, is_adb: bool) -> tuple[str, str]:
+REVIEW_THUMBNAIL_SIZE = 96
+# Review thumbnails are small; this keeps tens of thousands of them while
+# putting a ceiling on a folder that previously grew without limit.
+REVIEW_THUMBNAIL_BUDGET_BYTES = 256 * 1024 * 1024
+
+
+def _thumbnail(path: str, cache: ThumbnailCache, is_adb: bool) -> tuple[str, str]:
+    """Return a cached review thumbnail for ``path``.
+
+    Thumbnails come from the shared persistent cache rather than being decoded
+    here. That cache keys each entry on the file's path, size and mtime_ns, so
+    an edited photo gets a new thumbnail; it honours the EXIF orientation tag,
+    so portrait photos are no longer shown on their side; it scales JPEGs while
+    decoding them instead of decoding at full size first; and it holds the
+    thumbnail folder to a byte budget.
+    """
+
     if is_adb:
         return "", "Android preview unavailable before quarantine."
     if Image is None:
         return "", "Thumbnail generation requires Pillow."
     if Path(path).suffix.lower() not in IMAGE_EXTENSIONS:
         return "", "No thumbnail for this file type."
-    if _thumbnail_is_current(path, target):
-        return str(target), ""
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with Image.open(path) as image:
-            image.thumbnail((96, 96))
-            image.convert("RGB").save(target, "JPEG", quality=82)
-        return str(target), ""
-    except (OSError, UnidentifiedImageError):
-        return "", "Thumbnail unavailable."
+    result = cache.get_or_create(path, REVIEW_THUMBNAIL_SIZE)
+    if result.thumbnail_path and not result.error:
+        return str(result.thumbnail_path), ""
+    return "", "Thumbnail unavailable."
 
 
-def _thumbnail_is_current(path: str, target: Path) -> bool:
-    """True when a previously written thumbnail still describes this file.
+def _preview(path: str, cache: ThumbnailCache, is_adb: bool) -> tuple[str, str, str]:
+    """Dimensions and thumbnail for one review item.
 
-    Thumbnail paths are derived from the group hash, so re-scanning the same
-    folder recomputed and rewrote an identical JPEG for every duplicate every
-    time. Decoding and re-encoding is the expensive part of building a review.
-    """
-
-    try:
-        return target.stat().st_mtime >= Path(path).stat().st_mtime
-    except OSError:
-        return False
-
-
-def _preview(path: str, target: Path, is_adb: bool) -> tuple[str, str, str]:
-    """Dimensions and thumbnail from a single decode.
-
-    These used to be two separate ``Image.open`` calls over the same file.
+    Reading the dimensions opens only the image header; the pixel decode
+    happens inside the thumbnail cache, and only on a cache miss.
     """
 
     dimensions, dimension_status = _dimensions(path, is_adb)
-    thumbnail_path, thumbnail_status = _thumbnail(path, target, is_adb)
+    thumbnail_path, thumbnail_status = _thumbnail(path, cache, is_adb)
     return dimensions, thumbnail_path, thumbnail_status or dimension_status
 
 
@@ -242,6 +240,7 @@ def build_duplicate_review(
     """Convert engine duplicate groups into stable review data."""
 
     thumb_root = Path(thumbnail_root) if thumbnail_root else get_runtime_paths().cache / "thumbnails"
+    thumbnails = ThumbnailCache(cache_dir=thumb_root, max_bytes=REVIEW_THUMBNAIL_BUDGET_BYTES)
     groups: list[DuplicateGroup] = []
     for group_index, raw_group in enumerate(raw_groups, 1):
         files = list(raw_group)
@@ -255,7 +254,7 @@ def build_duplicate_review(
             item_id = f"{group_hash}-{item_index}"
             dimensions, thumbnail_path, status = _preview(
                 file_info.path,
-                thumb_root / group_hash / f"{item_index}.jpg",
+                thumbnails,
                 file_info.is_adb,
             )
             items.append(
@@ -311,6 +310,7 @@ class DuplicateQuarantineService:
         operation_id: str | None = None,
         adb_serial: str = "",
         dry_run: bool = False,
+        reason: str | Mapping[str, str] = "duplicate",
     ) -> QuarantineResult:
         selected = set(selected_ids)
         operation = operation_id or f"duplicate_{_utc_stamp()}_{uuid4().hex}"
@@ -360,12 +360,13 @@ class DuplicateQuarantineService:
                     target_name = f"{stem}-{index}{suffix}"
                 claimed_names.add(target_name)
                 stored_path = operation_root / target_name
+                item_reason = reason.get(item.id, "duplicate") if isinstance(reason, Mapping) else reason
                 record = QuarantineRecord(
                     original_path=item.path,
                     stored_path=str(stored_path),
                     hash=group.hash,
                     size=item.size,
-                    reason="duplicate",
+                    reason=item_reason,
                     operation_id=operation,
                     source_is_adb=item.is_adb,
                     device_serial=adb_serial if item.is_adb else "",

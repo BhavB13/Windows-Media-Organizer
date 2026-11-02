@@ -62,6 +62,97 @@ is tracked in [OVERHAUL_PLAN.md](OVERHAUL_PLAN.md).
   directory or paths recorded in a transfer journal — so unrelated files that
   happen to end in `.partial` are never deleted.
 - Run copy-only dry runs before making changes.
+- **Find similar photos** (sidebar: *Similar Photos*). Groups photos that look
+  alike even when they share no bytes — a resized, recompressed or re-exported
+  copy, including a rotated one — using perceptual hashes computed in pure
+  Python. Strict, balanced and loose sensitivity. Each group shows the photos
+  side by side with the recommended keep marked and the reasons written out:
+  highest pixel count first, then larger file at equal pixels, then capture
+  metadata, then the earliest timestamp. Byte-identical copies are labelled as
+  such. Nothing is selected by default; chosen photos go to the same reversible
+  quarantine, and a selection that would remove every copy of a photo is
+  refused.
+- **Browse and search a library catalog** (sidebar: *Library*, Alt+0). An
+  incremental SQLite index keyed on the volume and the path relative to its
+  root, re-reading a file only when its size or nanosecond mtime changed;
+  search by kind, name, size and capture date; storage analytics by kind,
+  volume, capture year and extension. An unplugged drive's entries stay and are
+  shown as offline. The catalog is additive: the existing JSON caches remain the
+  transfer engine's source of truth.
+- **Warnings before downloading cloud-only files.** Before a duplicate scan,
+  similar-photo comparison or import reads a folder, the app checks file
+  attributes for OneDrive, Dropbox, Google Drive and iCloud placeholders, whose
+  bytes are fetched the moment a file is read. If any would download, it says
+  how many, how large and from where, and asks; Cancel is the default. The check
+  never opens a file.
+- **Sort by camera or phone.** Destination templates accept `{camera}`,
+  `{camera_make}` and `{camera_model}` from EXIF alongside the existing date and
+  type tokens, made safe as Windows folder names.
+- **Capture dates for HEIC and RAW.** iPhone HEIC/HEIF, AVIF, TIFF-based RAW
+  (DNG, CR2, NEF, ARW, ORF, RW2, PEF and others) and Fujifilm RAF are dated and
+  attributed from their own EXIF, read without extra libraries, instead of by
+  the day they were copied. Canon CR3 is not yet read.
+- **Faster repeat comparisons.** Similar Photos remembers each photo's
+  perceptual hash until the file changes, so scanning the same library again
+  decodes only new or edited photos.
+- **Clearer phone connection messages.** Each `adb` device state (unauthorized,
+  offline, recovery, bootloader, no permissions and others) gets its own
+  instruction instead of one generic "authorize USB debugging".
+- **Upright, cached previews.** Duplicate and similar-photo previews come from a
+  persistent thumbnail cache that honours EXIF orientation, decodes JPEGs at
+  reduced size, keys entries on path, size and mtime so edited photos refresh,
+  and is held to a byte budget.
+- **Live sort destination preview.** When editing a rule's destination template
+  in Sort Files, the dialog displays a live example path rendered from sample
+  photo metadata as you type. Malformed braces or unknown tokens show an inline
+  error and disable saving until corrected.
+- **Quarantine reason column.** The Quarantine table and details panel show a
+  Reason column indicating whether each item was quarantined as a "Duplicate" or
+  a "Similar photo" (records created before this field existed display as
+  "Duplicate").
+
+### External drives
+
+- Hash caches are keyed to the volume's GUID or serial and the path relative to
+  its mount point, not to the drive letter, so a drive that comes back as `F:`
+  instead of `E:` keeps its cache, and a cache is never matched against a
+  different drive that was given the same letter. An offline volume's cache is
+  never marked stale.
+- Copying to a FAT32 drive skips files of 4 GB or more up front, with a reason
+  in the report, instead of failing after writing most of a long video; they are
+  also left out of the free-space estimate.
+- If the destination drive is unplugged mid-transfer, the run stops and reports
+  the disconnect instead of failing every remaining file. Running again after
+  reconnecting resumes from the journal.
+- A source folder inside the compare or output folder is refused, as are
+  overlaps hidden by a junction, symlink or `subst` drive. Previously a source
+  inside the library made every new photo match itself and report as already
+  imported.
+
+## Android apps
+
+The native Android project in [`android/`](android/README.md) has two modules,
+both independent of the Windows app.
+
+- `:app` — the USB companion. Copies files from a selected phone folder to a
+  USB drive mounted by Android, skipping identical content and retaining phone
+  originals.
+- `:organizer` — a Kotlin and Jetpack Compose organizer. Browses photos and
+  videos through MediaStore, filters by kind, name, size and date, finds exact
+  duplicates (size first, then SHA-256), recommends which copy to keep, and
+  summarises storage. It is read-only with respect to your media: it never
+  deletes, moves or writes a file. It handles Android 14 partial photo access
+  as its own state.
+
+Build both debug APKs and run the organizer's JVM unit tests:
+
+```powershell
+cd android
+.\gradlew.bat :organizer:testDebugUnitTest :organizer:assembleDebug :app:assembleDebug
+```
+
+See the Android README for supported storage providers and the physical-device
+verification checklist. The organizer has not yet been run on a device.
 
 ## Requirements
 
