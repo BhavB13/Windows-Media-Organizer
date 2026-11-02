@@ -15,6 +15,7 @@ import android.util.LruCache
 import android.util.Size
 import com.bhavb13.dtm.organizer.core.ContentHashSource
 import com.bhavb13.dtm.organizer.core.MediaItem
+import com.bhavb13.dtm.organizer.core.MediaPaging
 import com.bhavb13.dtm.organizer.core.MediaKind
 import com.bhavb13.dtm.organizer.core.PermissionStatus
 import kotlinx.coroutines.Dispatchers
@@ -63,14 +64,14 @@ class MediaStoreRepository(private val context: Context) : ContentHashSource {
             return@withContext emptyList()
         }
 
-        val combined = mutableListOf<MediaItem>()
-        // Query up to offset + limit from each permitted collection and merge chronologically
-        // so that mixed image + video pages remain consistently ordered across pages.
+        val collections = mutableListOf<List<MediaItem>>()
+        // Read up to offset + limit rows from each permitted collection, in the same
+        // order MediaPaging merges and slices them, so no item can fall between pages.
         val fetchWindow = (offset + limit).coerceAtLeast(limit)
 
         if (permissionStatus.canReadImages) {
             coroutineContext.ensureActive()
-            combined.addAll(
+            collections.add(
                 queryCollection(
                     collectionUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
                     kind = MediaKind.IMAGE,
@@ -80,7 +81,7 @@ class MediaStoreRepository(private val context: Context) : ContentHashSource {
         }
         if (permissionStatus.canReadVideos) {
             coroutineContext.ensureActive()
-            combined.addAll(
+            collections.add(
                 queryCollection(
                     collectionUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
                     kind = MediaKind.VIDEO,
@@ -89,17 +90,7 @@ class MediaStoreRepository(private val context: Context) : ContentHashSource {
             )
         }
 
-        combined.sortWith(
-            compareByDescending<MediaItem> { it.effectiveCaptureDateMillis }
-                .thenBy { it.id }
-        )
-
-        if (offset >= combined.size) {
-            emptyList()
-        } else {
-            val end = (offset + limit).coerceAtMost(combined.size)
-            combined.subList(offset, end)
-        }
+        MediaPaging.page(collections, offset, limit)
     }
 
     private fun queryCollection(
@@ -108,7 +99,7 @@ class MediaStoreRepository(private val context: Context) : ContentHashSource {
         maxCount: Int
     ): List<MediaItem> {
         val projection = buildProjection(kind)
-        val sortOrder = "${MediaStore.MediaColumns.DATE_MODIFIED} DESC, ${MediaStore.MediaColumns._ID} DESC"
+        val sortOrder = MediaPaging.SQL_SORT_ORDER
 
         val results = mutableListOf<MediaItem>()
         try {
