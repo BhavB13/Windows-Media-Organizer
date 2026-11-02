@@ -925,23 +925,9 @@ class CatalogService:
             total_bytes = sum(item.size for item in discovered)
             processed_bytes = 0
 
-            # If compute_hashes=True on a volume that was previously indexed without hashes,
-            # remove only the unhashed rows so upsert_files computes their hashes now.
-            rehashed_paths: set[str] = set()
-            if eff_hashes:
-                existing_records = catalog.search(volume_key=resolved_key, stop_event=eff_stop)
-                discovered_by_rel = {item.relative_path: item for item in discovered}
-                unhashed_existing = [
-                    rec.relative_path
-                    for rec in existing_records
-                    if not rec.content_hash
-                    and rec.relative_path in discovered_by_rel
-                    and rec.size == discovered_by_rel[rec.relative_path].size
-                    and rec.mtime_ns == discovered_by_rel[rec.relative_path].mtime_ns
-                ]
-                if unhashed_existing and not _is_cancelled(eff_stop):
-                    catalog.remove_volume_files(resolved_key, unhashed_existing)
-                    rehashed_paths = set(unhashed_existing)
+            # Rows indexed before hashing or similarity was turned on are filled
+            # in place by upsert_files; nothing is removed first, so cancelling
+            # part-way leaves the catalog as it was.
 
             changes_before = catalog.connection.total_changes
 
@@ -1018,10 +1004,6 @@ class CatalogService:
 
             added_count = upsert_res.added
             updated_count = upsert_res.updated
-            if rehashed_paths:
-                backfilled = min(added_count, len(rehashed_paths))
-                added_count -= backfilled
-                updated_count += backfilled
 
             return CatalogIndexResult(
                 volume_key=resolved_key,

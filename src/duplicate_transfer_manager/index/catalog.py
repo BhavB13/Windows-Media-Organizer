@@ -1470,7 +1470,8 @@ class MediaCatalog:
         existing_vol = self.get_volume(key)
         existing_rows = self.connection.execute(
             """
-            SELECT id, relative_path, size, mtime_ns
+            SELECT id, relative_path, size, mtime_ns, content_hash, media_kind,
+                   perceptual_hash, perceptual_algo, perceptual_rotations
             FROM files
             WHERE volume_key = ?
             """,
@@ -1482,6 +1483,18 @@ class MediaCatalog:
                 int(row["size"]),
                 int(row["mtime_ns"]),
             )
+            for row in existing_rows
+        }
+        # What each row already holds, so an unchanged file is revisited only
+        # to fill in something the caller asked for and it does not have yet.
+        existing_values: dict[str, dict[str, Any]] = {
+            str(row["relative_path"]): {
+                "content_hash": row["content_hash"],
+                "media_kind": row["media_kind"],
+                "perceptual_hash": row["perceptual_hash"],
+                "perceptual_algo": row["perceptual_algo"],
+                "perceptual_rotations": row["perceptual_rotations"],
+            }
             for row in existing_rows
         }
 
@@ -1540,18 +1553,33 @@ class MediaCatalog:
             mtime_ns = int(coerced.mtime_ns)
 
             existing_entry = existing_by_path.get(rel_path)
+            carried: dict[str, Any] = {}
             if existing_entry is not None:
                 file_id, old_size, old_mtime_ns = existing_entry
                 if old_size == size and old_mtime_ns == mtime_ns:
-                    unchanged += 1
-                    continue
+                    old = existing_values.get(rel_path, {})
+                    needs_hash = compute_hashes and not old.get("content_hash")
+                    needs_perceptual = (
+                        compute_perceptual
+                        and old.get("media_kind") == "image"
+                        and not old.get("perceptual_hash")
+                    )
+                    if not (needs_hash or needs_perceptual):
+                        unchanged += 1
+                        continue
+                    # Backfill in place. The file is unchanged, so whatever the
+                    # row already holds is still true and is carried over rather
+                    # than recomputed or cleared. Updating instead of deleting
+                    # and re-inserting means a cancelled backfill leaves every
+                    # existing row exactly as it was.
+                    carried = old
 
             # File is either new or has a changed size/mtime_ns: compute hash and metadata now.
             if _is_cancelled(stop_event):
                 return UpsertResult(volume_status="cancelled", cancelled=True)
 
             file_path_obj = Path(coerced.file_path) if coerced.file_path is not None else None
-            content_hash = coerced.content_hash
+            content_hash = coerced.content_hash or carried.get("content_hash")
             if content_hash is None and compute_hashes and file_path_obj is not None:
                 if hash_fn is not None:
                     content_hash = hash_fn(file_path_obj)
@@ -1576,9 +1604,9 @@ class MediaCatalog:
                 else classify_media_kind(ext or filename)
             )
 
-            p_hash = coerced.perceptual_hash
-            p_algo = coerced.perceptual_algo or perceptual_algo
-            p_rot = coerced.perceptual_rotations
+            p_hash = coerced.perceptual_hash or carried.get("perceptual_hash")
+            p_algo = coerced.perceptual_algo or carried.get("perceptual_algo") or perceptual_algo
+            p_rot = coerced.perceptual_rotations or carried.get("perceptual_rotations")
 
             if p_hash is None and compute_perceptual and media_kind == "image" and file_path_obj is not None:
                 try:
