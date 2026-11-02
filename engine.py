@@ -593,6 +593,10 @@ def build_compare_scan_settings(settings):
     scan_settings = copy(settings)
     scan_settings.use_adb = False
     scan_settings.source_is_adb = False
+    # Skipping cloud-only files is a choice about the source. Leaving library
+    # files out of the comparison would make a photo already in the library
+    # look new and import it a second time.
+    scan_settings.skip_cloud_placeholders = False
     return scan_settings
 
 def build_transfer_hash_settings(settings):
@@ -798,6 +802,7 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
                     "incomplete": result.incomplete,
                     "errors": list(result.errors),
                     "unreadable": list(result.unreadable),
+                    "skipped_cloud_files": getattr(result, "skipped_cloud_files", 0),
                 }
             ),
         ),
@@ -1628,6 +1633,8 @@ def execute_smart_transfer(settings, stop_event, hash_cache, logger, progress_ca
         "source_listing_incomplete": bool(source_discovery.get("incomplete")),
         "source_listing_errors": len(source_discovery.get("errors", [])),
         "source_unreadable_files": len(source_discovery.get("unreadable", [])),
+        # Cloud-only source files left out at the user's request, never read.
+        "skipped_cloud_files": int(source_discovery.get("skipped_cloud_files", 0) or 0),
     }
     if not settings.dry_run:
         try:

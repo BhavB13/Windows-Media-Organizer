@@ -240,7 +240,7 @@ class SimilarReviewPage(BasePage):
         self.scan_button.setEnabled(False)
         self.progress_panel.show()
         self.progress_panel.update_progress(0, "Checking for cloud-only files…", "Reading file attributes only", "")
-        self.start_after_cloud_check([root], False, lambda: self._run_scan(root), self._abandon_scan)
+        self.start_after_cloud_check([root], False, lambda skip_cloud=False: self._run_scan(root, skip_cloud), self._abandon_scan)
         return True
 
     def _abandon_scan(self) -> None:
@@ -248,7 +248,7 @@ class SimilarReviewPage(BasePage):
         self.scan_button.setEnabled(True)
         self._show_banner("Nothing was read or downloaded.", "info")
 
-    def _run_scan(self, root: str) -> None:
+    def _run_scan(self, root: str, skip_cloud: bool = False) -> None:
         sensitivity = self.sensitivity.currentData() or DEFAULT_SENSITIVITY
         handle = self.controller
         handle.begin()
@@ -259,6 +259,7 @@ class SimilarReviewPage(BasePage):
                 return self.service.scan(
                     [root],
                     sensitivity=sensitivity,
+                    skip_cloud=skip_cloud,
                     stop_event=handle.stop,
                     progress=lambda done, total, message: self.progress_changed.emit(done, total, message),
                 )

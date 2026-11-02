@@ -42,7 +42,7 @@ from utils import DEFAULT_EXCLUDES, DEFAULT_MEDIA_EXTS, HashCache
 from ..controllers import DeviceController, DuplicateScanController, TransferController
 from ..controllers.base import OperationWorker
 from ..core import AppSettings, CancellationToken, OperationResult, OperationState
-from ..services.cloud_guard import assess_cloud_downloads
+from ..services.cloud_guard import CHOICE_CANCEL, CHOICE_DOWNLOAD, CHOICE_SKIP, assess_cloud_downloads
 from ..services.transfer_service import DESTINATION_DISCONNECTED_TEXT
 from ..runtime_paths import get_runtime_paths
 from ..sorting import SortExecutor
@@ -91,20 +91,32 @@ from .widgets import (
 )
 
 
-def confirm_cloud_downloads(parent: QWidget, assessment) -> bool:
-    """Ask before reading files that would be downloaded from cloud storage.
+def ask_cloud_choice(parent: QWidget, assessment) -> str:
+    """Ask what to do about files that reading would download from the cloud.
 
-    Cancel is the default button: the safe answer to a surprise download is no.
+    Returns CHOICE_SKIP, CHOICE_DOWNLOAD or CHOICE_CANCEL. Cancel is the default
+    button: the safe answer to a surprise download is no.
     """
 
-    answer = QMessageBox.question(
-        parent,
-        "Files will be downloaded",
-        f"{assessment.message}\n\nContinue anyway?",
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        QMessageBox.StandardButton.No,
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setWindowTitle("Files will be downloaded")
+    box.setText(assessment.message)
+    box.setInformativeText(
+        "Scanning only the files on this PC leaves the cloud-only ones out and downloads nothing."
     )
-    return answer == QMessageBox.StandardButton.Yes
+    skip = box.addButton("Scan only files on this PC", QMessageBox.ButtonRole.AcceptRole)
+    download = box.addButton("Download and scan everything", QMessageBox.ButtonRole.DestructiveRole)
+    cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+    box.setDefaultButton(cancel)
+    box.setEscapeButton(cancel)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is skip:
+        return CHOICE_SKIP
+    if clicked is download:
+        return CHOICE_DOWNLOAD
+    return CHOICE_CANCEL
 
 
 class BasePage(QScrollArea):
@@ -175,26 +187,30 @@ class BasePage(QScrollArea):
     def start_after_cloud_check(self, roots, is_adb: bool, proceed, abandon) -> None:
         """Check ``roots`` for cloud-only files off the main thread, then start.
 
-        ``proceed`` runs when nothing would download, when the user accepts the
-        warning, or when the check itself fails - a broken advisory check must
-        never block a scan. ``abandon`` runs when the user declines.
+        ``proceed(skip_cloud)`` runs when nothing would download, when the user
+        chooses to scan only local files (``skip_cloud=True``) or to download
+        everything, or when the check itself fails - a broken advisory check
+        must never block a scan. ``abandon`` runs when the user cancels.
         """
 
         if is_adb:
-            proceed()
+            proceed(False)
             return
 
         def decide(assessment) -> None:
             if assessment is not None and assessment.would_download:
-                if not confirm_cloud_downloads(self, assessment):
+                choice = ask_cloud_choice(self, assessment)
+                if choice == CHOICE_CANCEL:
                     abandon()
                     return
-            proceed()
+                proceed(choice == CHOICE_SKIP)
+                return
+            proceed(False)
 
         self.run_in_background(
             lambda: assess_cloud_downloads(list(roots)),
             decide,
-            lambda _failure: proceed(),
+            lambda _failure: proceed(False),
         )
 
     def finish(self) -> None:
@@ -946,11 +962,12 @@ class DuplicatesPage(BasePage):
         self.start_after_cloud_check(
             [settings.scan_root],
             bool(getattr(settings, "use_adb", False)),
-            lambda: self._begin_scan(settings),
+            lambda skip_cloud=False: self._begin_scan(settings, skip_cloud),
             self._abandon_scan,
         )
 
-    def _begin_scan(self, settings) -> None:
+    def _begin_scan(self, settings, skip_cloud: bool = False) -> None:
+        settings.skip_cloud_placeholders = bool(skip_cloud)
         self.progress_panel.update_progress(0, "Starting scan…", "Validating source and options", "0% • 0 items • ETA —")
         started = self.controller.start(settings)
         if not started:
@@ -1006,9 +1023,13 @@ class DuplicatesPage(BasePage):
         self.review = review
         self._render_review()
         if self.review.groups:
-            self.banner.set_message("Scan complete. Review checked duplicates before confirming quarantine.", "success")
+            message, kind = "Scan complete. Review checked duplicates before confirming quarantine.", "success"
         else:
-            self.banner.set_message("Scan complete. No duplicate groups were found.", "info")
+            message, kind = "Scan complete. No duplicate groups were found.", "info"
+        skipped_cloud = int(result.counts.get("skipped_cloud_files", 0) or 0)
+        if skipped_cloud:
+            message += f" {skipped_cloud:,} cloud-only file(s) were left out and not downloaded."
+        self.banner.set_message(message, kind)
         self.operation_service.record(
             "duplicate_scan",
             "completed",
@@ -1952,11 +1973,12 @@ class ImportPage(BasePage):
         self.start_after_cloud_check(
             [settings.source_root],
             bool(getattr(settings, "source_is_adb", False)),
-            lambda: self._begin_import(settings),
+            lambda skip_cloud=False: self._begin_import(settings, skip_cloud),
             self._abandon_import,
         )
 
-    def _begin_import(self, settings) -> None:
+    def _begin_import(self, settings, skip_cloud: bool = False) -> None:
+        settings.skip_cloud_placeholders = bool(skip_cloud)
         self.progress_panel.update_progress(0, "Validating transfer settings…", "Preparing import", "0% • 0 items • ETA —")
         if not self.controller.start(settings):
             self.review_button.setEnabled(True)

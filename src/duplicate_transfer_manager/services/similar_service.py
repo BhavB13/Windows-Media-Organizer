@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from discovery import is_cloud_placeholder
 from models import FileInfo
 from utils import DEFAULT_EXCLUDES
 
@@ -77,8 +78,12 @@ def _is_cancelled(stop_event: Any) -> bool:
     return bool(stop_event is not None and stop_event.is_set())
 
 
-def find_images(roots: Iterable[str], *, stop_event: Any = None) -> list[str]:
-    """Image files under ``roots``, skipping system folders and the app's own."""
+def find_images(roots: Iterable[str], *, stop_event: Any = None, skip_cloud: bool = False) -> list[str]:
+    """Image files under ``roots``, skipping system folders and the app's own.
+
+    With ``skip_cloud`` set, cloud-only placeholders are left out by their
+    attributes alone; they are never opened, so nothing is downloaded.
+    """
 
     excluded = {name.casefold() for name in DEFAULT_EXCLUDES}
     found: list[str] = []
@@ -89,7 +94,10 @@ def find_images(roots: Iterable[str], *, stop_event: Any = None) -> list[str]:
             dirs[:] = [d for d in dirs if d.casefold() not in excluded and not d.startswith(".")]
             for name in files:
                 if Path(name).suffix.lower() in IMAGE_EXTENSIONS:
-                    found.append(os.path.join(folder, name))
+                    path = os.path.join(folder, name)
+                    if skip_cloud and is_cloud_placeholder(path):
+                        continue
+                    found.append(path)
     return sorted(found)
 
 
@@ -132,6 +140,7 @@ class SimilarPhotoService:
         roots: Iterable[str],
         *,
         sensitivity: str = DEFAULT_SENSITIVITY,
+        skip_cloud: bool = False,
         stop_event: Any = None,
         progress: ProgressCallback | None = None,
         thumbnail_root: str | os.PathLike[str] | None = None,
@@ -143,7 +152,7 @@ class SimilarPhotoService:
                 progress(done, total, message)
 
         report(0, 0, "Finding photos…")
-        images = find_images(roots, stop_event=stop_event)
+        images = find_images(roots, stop_event=stop_event, skip_cloud=skip_cloud)
         if _is_cancelled(stop_event):
             return SimilarPhotoReview(cancelled=True, max_distance=max_distance)
 
