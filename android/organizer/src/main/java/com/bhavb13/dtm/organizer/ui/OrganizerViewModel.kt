@@ -1,6 +1,7 @@
 package com.bhavb13.dtm.organizer.ui
 
 import android.app.Application
+import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
 import android.provider.DocumentsContract
@@ -105,7 +106,22 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
     companion object {
         private const val PAGE_SIZE = 60
         private const val MILLIS_PER_DAY = 24L * 60L * 60L * 1000L
+        private const val PREFS_NAME = "dtm_organizer_prefs"
+        private const val PREF_DESTINATION_TREE_URI = "destination_tree_uri"
+        private const val PREF_SOURCE_TREE_URIS = "source_tree_uris"
     }
+
+    private data class FolderScanInfo(
+        val itemCount: Int,
+        val isTruncated: Boolean,
+        val unreadableSubfolders: Int
+    )
+
+    private val prefs by lazy {
+        application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    private val folderScanMetadata = mutableMapOf<String, FolderScanInfo>()
 
     private val repository = MediaStoreRepository(application.applicationContext)
     private val safFolderManager = SafFolderManager(application.applicationContext)
@@ -124,10 +140,33 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
     init {
         val initialPerm = AndroidPermissionHelper.checkPermissionStatus(application.applicationContext)
         val initialOutcome = PermissionEvaluator.resolveLibraryOutcome(emptyList(), initialPerm)
+
+        val savedDestUri = prefs.getString(PREF_DESTINATION_TREE_URI, null)
+        val savedDestLabel = if (savedDestUri != null) {
+            try {
+                safFolderManager.resolveFolderDisplayName(Uri.parse(savedDestUri))
+            } catch (_: Exception) {
+                null
+            }
+        } else {
+            null
+        }
+
+        if (prefs.getStringSet(PREF_SOURCE_TREE_URIS, null) == null) {
+            val existing = safFolderManager.listPersistedFolderGrants()
+            val initialSources = existing
+                .map { it.treeUri }
+                .filter { it != savedDestUri }
+                .toSet()
+            prefs.edit().putStringSet(PREF_SOURCE_TREE_URIS, initialSources).apply()
+        }
+
         _uiState = MutableStateFlow(
             OrganizerUiState(
                 permissionStatus = initialPerm,
-                libraryOutcome = initialOutcome
+                libraryOutcome = initialOutcome,
+                destinationTreeUri = savedDestUri,
+                destinationLabel = savedDestLabel
             )
         )
         refreshDrivesAndGrantedFolders()
@@ -141,28 +180,52 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update { it.copy(activeTab = tab) }
     }
 
+    private fun isSourceFolder(uriStr: String): Boolean {
+        val savedSources = prefs.getStringSet(PREF_SOURCE_TREE_URIS, emptySet())
+        return savedSources?.contains(uriStr) == true
+    }
+
     fun refreshDrivesAndGrantedFolders() {
         val volumes = UsbStorageHelper.getRemovableVolumes(getApplication())
-        val grants = safFolderManager.listPersistedFolderGrants()
+        val destUri = _uiState.value.destinationTreeUri
+        val grants = safFolderManager.listPersistedFolderGrants(excludeTreeUri = destUri)
+        val enrichedGrants = grants.map { grant ->
+            val cached = folderScanMetadata[grant.treeUri]
+            if (cached != null) {
+                grant.copy(
+                    itemCount = cached.itemCount,
+                    isTruncated = cached.isTruncated,
+                    unreadableSubfolders = cached.unreadableSubfolders
+                )
+            } else {
+                grant
+            }
+        }
         _uiState.update {
             it.copy(
                 removableVolumes = volumes,
-                grantedFolders = grants
+                grantedFolders = enrichedGrants
             )
         }
     }
 
     private fun loadPersistedFolderItems() {
-        val grants = safFolderManager.listPersistedFolderGrants()
+        val destUri = _uiState.value.destinationTreeUri
+        val grants = safFolderManager.listPersistedFolderGrants(excludeTreeUri = destUri)
         if (grants.isEmpty()) return
 
         viewModelScope.launch {
             for (grant in grants) {
                 try {
                     val uri = Uri.parse(grant.treeUri)
-                    val scanned = safFolderManager.browseTreeFiles(uri)
+                    val scanResult = safFolderManager.browseTreeFiles(uri)
+                    folderScanMetadata[grant.treeUri] = FolderScanInfo(
+                        itemCount = scanResult.items.size,
+                        isTruncated = scanResult.truncated,
+                        unreadableSubfolders = scanResult.unreadableSubfolders
+                    )
                     val existingIds = safItems.mapTo(mutableSetOf()) { it.id }
-                    for (item in scanned) {
+                    for (item in scanResult.items) {
                         if (item.id !in existingIds) {
                             safItems.add(item)
                         }
@@ -171,6 +234,7 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
                     // Ignore transient load failure on startup
                 }
             }
+            refreshDrivesAndGrantedFolders()
             val combined = mergeItems()
             _uiState.update { state ->
                 val outcome = PermissionEvaluator.resolveLibraryOutcome(combined, state.permissionStatus)
@@ -253,14 +317,28 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun addGrantedSourceFolder(treeUri: Uri) {
+        val uriStr = treeUri.toString()
         safFolderManager.takePersistableReadPermission(treeUri)
+
+        val sources = prefs.getStringSet(PREF_SOURCE_TREE_URIS, emptySet())?.toMutableSet() ?: mutableSetOf()
+        sources.add(uriStr)
+        prefs.edit().putStringSet(PREF_SOURCE_TREE_URIS, sources).apply()
+
         viewModelScope.launch {
             _uiState.update { it.copy(isLoadingPage = true) }
-            val scanned = safFolderManager.browseTreeFiles(treeUri)
-            val existingIds = safItems.mapTo(mutableSetOf()) { it.id }
-            for (item in scanned) {
-                if (item.id !in existingIds) {
-                    safItems.add(item)
+            val scanResult = safFolderManager.browseTreeFiles(treeUri)
+            folderScanMetadata[uriStr] = FolderScanInfo(
+                itemCount = scanResult.items.size,
+                isTruncated = scanResult.truncated,
+                unreadableSubfolders = scanResult.unreadableSubfolders
+            )
+            val isCurrentDest = uriStr == _uiState.value.destinationTreeUri
+            if (!isCurrentDest) {
+                val existingIds = safItems.mapTo(mutableSetOf()) { it.id }
+                for (item in scanResult.items) {
+                    if (item.id !in existingIds) {
+                        safItems.add(item)
+                    }
                 }
             }
             refreshDrivesAndGrantedFolders()
@@ -286,11 +364,22 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun removeGrantedFolder(folderUriString: String) {
+        // Removing a source folder must never release the destination's permission
+        val currentDestUri = _uiState.value.destinationTreeUri
+        if (folderUriString == currentDestUri) {
+            return
+        }
+
         val uri = Uri.parse(folderUriString)
         safFolderManager.releaseReadPermission(uri)
-        val folderLabel = safFolderManager.resolveFolderDisplayName(uri)
-        val bucketTarget = "SAF: $folderLabel"
-        safItems.removeAll { it.bucketName == bucketTarget || it.id.startsWith(folderUriString) }
+        // Match by tree, not folder name: two granted folders can share a name.
+        safItems.removeAll { it.id.startsWith("$folderUriString/document/") }
+
+        val sources = prefs.getStringSet(PREF_SOURCE_TREE_URIS, emptySet())?.toMutableSet() ?: mutableSetOf()
+        sources.remove(folderUriString)
+        prefs.edit().putStringSet(PREF_SOURCE_TREE_URIS, sources).apply()
+
+        folderScanMetadata.remove(folderUriString)
 
         refreshDrivesAndGrantedFolders()
         val combined = mergeItems()
@@ -309,14 +398,84 @@ class OrganizerViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun setOrganizeDestination(treeUri: Uri) {
+        val oldDestUriStr = _uiState.value.destinationTreeUri
+        val newDestUriStr = treeUri.toString()
+
         safFolderManager.takePersistableReadWritePermission(treeUri)
         val label = safFolderManager.resolveFolderDisplayName(treeUri)
+
+        prefs.edit().putString(PREF_DESTINATION_TREE_URI, newDestUriStr).apply()
+
+        // Changing the destination releases the old destination's write grant only if it is not also a source folder.
+        if (oldDestUriStr != null && oldDestUriStr != newDestUriStr) {
+            val oldWasSource = isSourceFolder(oldDestUriStr)
+            if (!oldWasSource) {
+                val oldUri = Uri.parse(oldDestUriStr)
+                safFolderManager.releaseWritePermission(oldUri)
+                safFolderManager.releaseReadPermission(oldUri)
+            }
+        }
+
+        // Destination files must not appear in sources / library
+        safItems.removeAll { it.id.startsWith("$newDestUriStr/document/") }
+
+        // If old destination was also a source folder, re-scan it so its files return to library
+        if (oldDestUriStr != null && isSourceFolder(oldDestUriStr)) {
+            viewModelScope.launch {
+                try {
+                    val oldUri = Uri.parse(oldDestUriStr)
+                    val scanResult = safFolderManager.browseTreeFiles(oldUri)
+                    folderScanMetadata[oldDestUriStr] = FolderScanInfo(
+                        itemCount = scanResult.items.size,
+                        isTruncated = scanResult.truncated,
+                        unreadableSubfolders = scanResult.unreadableSubfolders
+                    )
+                    val existingIds = safItems.mapTo(mutableSetOf()) { it.id }
+                    for (item in scanResult.items) {
+                        if (item.id !in existingIds) {
+                            safItems.add(item)
+                        }
+                    }
+                } catch (_: Exception) {
+                    // Ignore transient scan error
+                }
+                refreshDrivesAndGrantedFolders()
+                val combined = mergeItems()
+                _uiState.update { state ->
+                    val outcome = PermissionEvaluator.resolveLibraryOutcome(combined, state.permissionStatus)
+                    state.copy(
+                        allItems = combined,
+                        filteredItems = MediaFilter.filter(combined, state.filterCriteria),
+                        libraryOutcome = outcome,
+                        storageSummary = StorageAggregator.summarize(
+                            combined,
+                            state.duplicateScanResult?.groups ?: emptyList()
+                        )
+                    )
+                }
+            }
+        }
+
         _uiState.update {
             it.copy(
-                destinationTreeUri = treeUri.toString(),
+                destinationTreeUri = newDestUriStr,
                 destinationLabel = label,
                 organizePlan = null,
                 organizeResult = null
+            )
+        }
+        refreshDrivesAndGrantedFolders()
+        val combined = mergeItems()
+        _uiState.update { state ->
+            val outcome = PermissionEvaluator.resolveLibraryOutcome(combined, state.permissionStatus)
+            state.copy(
+                allItems = combined,
+                filteredItems = MediaFilter.filter(combined, state.filterCriteria),
+                libraryOutcome = outcome,
+                storageSummary = StorageAggregator.summarize(
+                    combined,
+                    state.duplicateScanResult?.groups ?: emptyList()
+                )
             )
         }
     }

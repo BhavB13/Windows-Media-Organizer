@@ -7,11 +7,16 @@ import android.database.Cursor
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.webkit.MimeTypeMap
+import com.bhavb13.dtm.organizer.core.FolderListing
 import com.bhavb13.dtm.organizer.core.GrantedFolderInfo
 import com.bhavb13.dtm.organizer.core.MediaItem
 import com.bhavb13.dtm.organizer.core.MediaKind
+import com.bhavb13.dtm.organizer.core.TreeFolder
+import com.bhavb13.dtm.organizer.core.TreeWalk
+import com.bhavb13.dtm.organizer.core.TreeWalkResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.coroutines.coroutineContext
@@ -74,9 +79,39 @@ class SafFolderManager(private val context: Context) {
     }
 
     /**
-     * Lists all persisted folder tree grants held by this app.
+     * Releases a previously persisted write permission for a folder tree.
      */
-    fun listPersistedFolderGrants(): List<GrantedFolderInfo> {
+    fun releaseWritePermission(treeUri: Uri): Boolean {
+        return try {
+            resolver.releasePersistableUriPermission(
+                treeUri,
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+            true
+        } catch (_: SecurityException) {
+            false
+        }
+    }
+
+    /**
+     * Releases previously persisted read and write permissions for a folder tree.
+     */
+    fun releaseReadWritePermissions(treeUri: Uri): Boolean {
+        return try {
+            resolver.releasePersistableUriPermission(
+                treeUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+            true
+        } catch (_: SecurityException) {
+            false
+        }
+    }
+
+    /**
+     * Lists all persisted folder tree grants held by this app, optionally excluding [excludeTreeUri].
+     */
+    fun listPersistedFolderGrants(excludeTreeUri: String? = null): List<GrantedFolderInfo> {
         val persisted = try {
             resolver.persistedUriPermissions
         } catch (_: Exception) {
@@ -86,10 +121,14 @@ class SafFolderManager(private val context: Context) {
         val results = mutableListOf<GrantedFolderInfo>()
         for (perm in persisted) {
             if (perm.isReadPermission) {
+                val uriStr = perm.uri.toString()
+                if (excludeTreeUri != null && uriStr == excludeTreeUri) {
+                    continue
+                }
                 val displayName = resolveFolderDisplayName(perm.uri)
                 results.add(
                     GrantedFolderInfo(
-                        treeUri = perm.uri.toString(),
+                        treeUri = uriStr,
                         displayName = displayName,
                         isReadOnly = !perm.isWritePermission
                     )
@@ -128,85 +167,104 @@ class SafFolderManager(private val context: Context) {
     }
 
     /**
-     * Browses files in a granted tree via [DocumentsContract] child queries.
-     * Recursively walks up to 64 subdirectories off the main thread.
+     * Browses files in a granted tree via [TreeWalk] and [DocumentsContract] child queries.
+     * Breadth-first walk up to 2,000 subdirectories and 50,000 files off the main thread.
+     * Returns a [TreeWalkResult] containing collected items, truncation flag, and counts.
      */
-    suspend fun browseTreeFiles(treeUri: Uri): List<MediaItem> = withContext(Dispatchers.IO) {
+    suspend fun browseTreeFiles(treeUri: Uri): TreeWalkResult<MediaItem> = withContext(Dispatchers.IO) {
         val rootDocId = try {
             DocumentsContract.getTreeDocumentId(treeUri)
         } catch (_: Exception) {
-            return@withContext emptyList()
+            return@withContext TreeWalkResult(
+                items = emptyList(),
+                truncated = false,
+                foldersVisited = 0,
+                unreadableSubfolders = 1
+            )
         }
         val folderLabel = resolveFolderDisplayName(treeUri)
-        val collected = mutableListOf<MediaItem>()
-        val queue = ArrayDeque<Pair<String, String>>()
-        queue.add(rootDocId to folderLabel)
-        var visitedDirs = 0
+        val rootFolder = TreeFolder(id = rootDocId, name = folderLabel)
 
-        while (queue.isNotEmpty() && visitedDirs < 64) {
-            coroutineContext.ensureActive()
-            val (parentDocId, currentBucket) = queue.removeFirst()
-            visitedDirs++
-
-            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
-            val projection = arrayOf(
-                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                DocumentsContract.Document.COLUMN_MIME_TYPE,
-                DocumentsContract.Document.COLUMN_SIZE,
-                DocumentsContract.Document.COLUMN_LAST_MODIFIED
-            )
-
-            try {
-                resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
-                    val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                    val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                    val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                    val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
-                    val modIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
-
-                    while (cursor.moveToNext()) {
-                        val docId = cursor.getStringOrNull(idIdx) ?: continue
-                        val name = cursor.getStringOrNull(nameIdx) ?: docId
-                        val mime = cursor.getStringOrNull(mimeIdx).orEmpty()
-
-                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
-                            queue.add(docId to name)
-                            continue
-                        }
-
-                        val resolvedKind = resolveMediaKind(name, mime) ?: continue
-                        val size = cursor.getLongOrZero(sizeIdx)
-                        val lastMod = cursor.getLongOrZero(modIdx)
-                        val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
-
-                        collected.add(
-                            MediaItem(
-                                id = docUri.toString(),
-                                displayName = name,
-                                mimeType = mime.ifBlank { if (resolvedKind == MediaKind.IMAGE) "image/*" else "video/*" },
-                                kind = resolvedKind,
-                                sizeBytes = size,
-                                dateAddedMillis = lastMod,
-                                dateModifiedMillis = lastMod,
-                                captureDateMillis = lastMod.takeIf { it > 0L },
-                                width = null,
-                                height = null,
-                                durationMillis = null,
-                                cameraMake = null,
-                                cameraModel = null,
-                                bucketId = "saf:$currentBucket",
-                                bucketName = "SAF: $currentBucket",
-                                relativePath = docId
-                            )
-                        )
-                    }
-                }
-            } catch (_: Exception) {
-                // Gracefully skip unreadable subdirectories
+        TreeWalk.walk(
+            rootFolder = rootFolder,
+            maxFolders = TreeWalk.DEFAULT_MAX_FOLDERS,
+            maxFiles = TreeWalk.DEFAULT_MAX_FILES,
+            isCancelled = { !coroutineContext.isActive },
+            listChildren = { folder ->
+                queryFolderChildren(treeUri, folder.id, folder.name)
             }
+        )
+    }
+
+    private fun queryFolderChildren(
+        treeUri: Uri,
+        parentDocId: String,
+        currentBucket: String
+    ): FolderListing<MediaItem> {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED
+        )
+
+        val subfolders = mutableListOf<TreeFolder>()
+        val files = mutableListOf<MediaItem>()
+
+        return try {
+            val cursor = resolver.query(childrenUri, projection, null, null, null)
+                ?: return FolderListing.Unreadable("Null cursor for folder $parentDocId")
+
+            cursor.use { c ->
+                val idIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val modIdx = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+
+                while (c.moveToNext()) {
+                    val docId = c.getStringOrNull(idIdx) ?: continue
+                    val name = c.getStringOrNull(nameIdx) ?: docId
+                    val mime = c.getStringOrNull(mimeIdx).orEmpty()
+
+                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        subfolders.add(TreeFolder(id = docId, name = name))
+                        continue
+                    }
+
+                    val resolvedKind = resolveMediaKind(name, mime) ?: continue
+                    val size = c.getLongOrZero(sizeIdx)
+                    val lastMod = c.getLongOrZero(modIdx)
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+
+                    files.add(
+                        MediaItem(
+                            id = docUri.toString(),
+                            displayName = name,
+                            mimeType = mime.ifBlank { if (resolvedKind == MediaKind.IMAGE) "image/*" else "video/*" },
+                            kind = resolvedKind,
+                            sizeBytes = size,
+                            dateAddedMillis = lastMod,
+                            dateModifiedMillis = lastMod,
+                            captureDateMillis = lastMod.takeIf { it > 0L },
+                            width = null,
+                            height = null,
+                            durationMillis = null,
+                            cameraMake = null,
+                            cameraModel = null,
+                            bucketId = "saf:$currentBucket",
+                            bucketName = "SAF: $currentBucket",
+                            relativePath = docId
+                        )
+                    )
+                }
+            }
+            FolderListing.Success(subfolders = subfolders, files = files)
+        } catch (e: Exception) {
+            FolderListing.Unreadable(e.message)
         }
-        collected
     }
 
     private fun resolveMediaKind(fileName: String, mimeType: String): MediaKind? {
