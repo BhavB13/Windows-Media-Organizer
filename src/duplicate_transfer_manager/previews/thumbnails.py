@@ -33,6 +33,7 @@ DEFAULT_MAX_CACHE_BYTES: int = 256 * 1024 * 1024  # 256 MiB
 DEFAULT_MAX_WORKERS: int = 4
 DEFAULT_JPEG_QUALITY: int = 85
 SHARD_PREFIX_LENGTH: int = 2
+LEDGER_FILENAME: str = "cache_size.json"
 
 _VALID_KEY_RE = re.compile(r"^[0-9a-f]{16,128}$")
 _TRANSPARENT_MODES = frozenset({"RGBA", "LA", "PA", "RGBa", "La"})
@@ -371,11 +372,15 @@ class ThumbnailCache:
 
         self._lock = threading.RLock()
         self._evict_lock = threading.Lock()
-        # Running total of the cache's size, seeded by one full scan and grown
-        # by each write, so a full eviction walk runs only when the budget may
-        # actually be exceeded rather than after every thumbnail.
-        self._estimated_bytes: int | None = None
-        self._writes_since_recount: int = 0
+        self._ledger_path: Path = self._cache_dir / LEDGER_FILENAME
+        # Running total of the cache's size, seeded from the on-disk ledger
+        # if present and parseable, so a new instance's first write avoids
+        # walking and stat-ing every file in the cache directory.
+        # The writes counter is carried in the ledger too, so short-lived
+        # instances (one per scan) still add up to a periodic real recount.
+        ledger = self._read_ledger()
+        self._estimated_bytes: int | None = ledger[0] if ledger else None
+        self._writes_since_recount: int = ledger[1] if ledger else 0
         self._last_touch_ns: int = time.time_ns()
         self._orientation_memo: dict[tuple[str, int, int], int] = {}
         self._hits: int = 0
@@ -896,6 +901,52 @@ class ThumbnailCache:
         name = path.name
         return name.startswith(".tmp_") or name.endswith(".part") or name.endswith(".tmp")
 
+    @staticmethod
+    def _is_ledger_file(path: Path) -> bool:
+        return path.name == LEDGER_FILENAME
+
+    def _read_ledger(self) -> tuple[int, int] | None:
+        """Return (total_bytes, writes_since_recount) from the size ledger.
+
+        None when it is missing or unusable, which makes the next write
+        fall back to a full count.
+        """
+
+        try:
+            data = json.loads(self._ledger_path.read_text(encoding="utf-8"))
+            total = data["total_bytes"]
+            writes = data.get("writes_since_recount", 0)
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+        if not all(type(value) is int and value >= 0 for value in (total, writes)):
+            return None
+        return total, writes
+
+    def _write_ledger(self, total_bytes: int, writes_since_recount: int) -> None:
+        """Atomically persist the running size estimate; failures are ignored."""
+
+        encoded = json.dumps(
+            {
+                "version": 1,
+                "total_bytes": int(total_bytes),
+                "writes_since_recount": int(writes_since_recount),
+                "written_at": time.time(),
+            }
+        ).encode("utf-8")
+        temp_name = ""
+        try:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            temp_fd, temp_name = tempfile.mkstemp(prefix=".tmp_ledger_", suffix=".tmp", dir=str(self._cache_dir))
+            with os.fdopen(temp_fd, "wb") as temp_file:
+                temp_file.write(encoded)
+            os.replace(temp_name, self._ledger_path)
+        except OSError:
+            if temp_name:
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+
     def _collect_cache_entries(self) -> list[tuple[int, int, Path]]:
         """Collect (mtime_ns, size_bytes, path) for all completed cache entries."""
 
@@ -913,7 +964,7 @@ class ThumbnailCache:
                 if shard.is_symlink():
                     continue
                 if shard.is_file():
-                    if self._is_temp_entry(shard):
+                    if self._is_temp_entry(shard) or self._is_ledger_file(shard):
                         continue
                     resolved_file = shard.resolve()
                     if resolved_file != resolved_root and resolved_file.is_relative_to(resolved_root):
@@ -927,7 +978,12 @@ class ThumbnailCache:
                     continue
                 for child in shard.iterdir():
                     try:
-                        if self._is_temp_entry(child) or child.is_symlink() or not child.is_file():
+                        if (
+                            self._is_temp_entry(child)
+                            or self._is_ledger_file(child)
+                            or child.is_symlink()
+                            or not child.is_file()
+                        ):
                             continue
                         resolved_child = child.resolve()
                         if resolved_child == resolved_root or not resolved_child.is_relative_to(resolved_root):
@@ -943,6 +999,7 @@ class ThumbnailCache:
     # A full recount after this many writes corrects drift when another cache
     # instance shares the same folder and writes to it too.
     RECOUNT_EVERY_WRITES = 256
+    LEDGER_EVERY_WRITES = 16
 
     def _note_write(self, path: Path) -> None:
         """Account for a new entry and evict only if the budget may be exceeded.
@@ -955,6 +1012,7 @@ class ThumbnailCache:
             size = int(Path(path).stat().st_size)
         except OSError:
             size = 0
+        persist = None
         with self._lock:
             needs_recount = (
                 self._estimated_bytes is None
@@ -964,6 +1022,10 @@ class ThumbnailCache:
                 self._estimated_bytes += size
                 self._writes_since_recount += 1
                 over_budget = self._estimated_bytes > self.max_bytes
+                if self._writes_since_recount % self.LEDGER_EVERY_WRITES == 0:
+                    persist = (self._estimated_bytes, self._writes_since_recount)
+        if persist is not None:
+            self._write_ledger(*persist)
         if needs_recount or over_budget:
             self.evict()
 
@@ -1029,6 +1091,7 @@ class ThumbnailCache:
         with self._lock:
             self._estimated_bytes = int(total_bytes)
             self._writes_since_recount = 0
+        self._write_ledger(int(total_bytes), 0)
 
     def clear(self) -> EvictionResult:
         """Evict all cached thumbnails inside the cache directory."""
@@ -1251,6 +1314,7 @@ __all__ = [
     "DEFAULT_MAX_CACHE_BYTES",
     "DEFAULT_MAX_WORKERS",
     "DEFAULT_THUMBNAIL_SIZE",
+    "LEDGER_FILENAME",
     "SHARD_PREFIX_LENGTH",
     "EvictionResult",
     "StopEventLike",
