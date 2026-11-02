@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import string
 
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -69,6 +70,93 @@ def camera_tokens(metadata) -> dict[str, str]:
         "camera_make": folder_component(make),
         "camera_model": folder_component(model),
     }
+
+
+# Fixed, documented sample photo used for live template previews when no file
+# metadata is explicitly provided (JPEG taken 2024-07-14 by "Apple iPhone 15 Pro").
+SAMPLE_PHOTO = FileMetadata(
+    path="IMG_0001.jpg",
+    name="IMG_0001.jpg",
+    extension=".jpg",
+    size=2_400_000,
+    created=datetime(2024, 7, 14, 12, 0, 0).timestamp(),
+    modified=datetime(2024, 7, 14, 12, 0, 0).timestamp(),
+    captured=datetime(2024, 7, 14, 12, 0, 0).timestamp(),
+    media_type="image",
+    attributes={"camera_make": "Apple", "camera_model": "iPhone 15 Pro"},
+)
+
+
+def template_values(metadata: FileMetadata) -> dict[str, str]:
+    """Token values for destination and rename templates.
+
+    Builds the dictionary of tokens available in destination templates
+    ({camera}, {year}, {month}, etc.) from a file's metadata.
+    """
+
+    source = Path(metadata.path)
+    captured = metadata.captured or metadata.modified
+    # Local time, deliberately. These folders are named for a human date:
+    # the one on the camera for an EXIF capture, and the one Windows
+    # Explorer shows for the modified-time fallback. Rendering in UTC moved
+    # an evening photo into the next day, and around New Year into the next
+    # year, while the review table beside it showed the local date.
+    stamp = datetime.fromtimestamp(captured)
+    return {
+        "name": source.name,
+        "stem": source.stem,
+        "suffix": source.suffix,
+        "extension": metadata.extension.lstrip(".") or "extensionless",
+        "media_type": metadata.media_type.title() or "Other",
+        "year": f"{stamp.year:04d}",
+        "month": f"{stamp.month:02d}",
+        "day": f"{stamp.day:02d}",
+        **camera_tokens(metadata),
+    }
+
+
+def preview_destination(template: str, metadata: FileMetadata | None = None) -> tuple[str, str]:
+    """Render a folder destination template for live preview without filesystem access.
+
+    Renders `template` using the same token values as `SortPlanner`.
+    When `metadata` is None, a fixed documented sample photo is used
+    (JPEG taken 2024-07-14 by "Apple iPhone 15 Pro").
+
+    Returns `(rendered_path, "")` on success, or `("", error_message)` if the
+    template contains unknown tokens or malformed braces.
+    """
+
+    cleaned = (template or "").strip()
+    if not cleaned:
+        return "", ""
+
+    target_meta = metadata if metadata is not None else SAMPLE_PHOTO
+    values = template_values(target_meta)
+
+    formatter = string.Formatter()
+    try:
+        parsed = list(formatter.parse(cleaned))
+    except ValueError as exc:
+        return "", f"Malformed braces in template: {exc}"
+
+    for _, field_name, _, _ in parsed:
+        if field_name is not None:
+            raw_token = field_name.split(".")[0].split("[")[0]
+            if not raw_token:
+                return "", "Malformed braces in template: empty token '{}'"
+            if raw_token not in values:
+                valid_tokens = ", ".join(f"{{{k}}}" for k in sorted(values.keys()))
+                return "", f"Unknown token '{{{raw_token}}}'. Valid tokens: {valid_tokens}"
+
+    try:
+        rendered = cleaned.format_map(values)
+        return rendered, ""
+    except KeyError as exc:
+        missing = exc.args[0]
+        valid_tokens = ", ".join(f"{{{k}}}" for k in sorted(values.keys()))
+        return "", f"Unknown token '{{{missing}}}'. Valid tokens: {valid_tokens}"
+    except ValueError as exc:
+        return "", f"Malformed braces in template: {exc}"
 
 class SortPlanner:
     def __init__(
@@ -190,20 +278,7 @@ class SortPlanner:
             root = self.paths.sorting / "quarantine"
         else:
             root = Path(association.destination).expanduser() if association.destination else source.parent
-        captured = metadata.captured or metadata.modified
-        # Local time, deliberately. These folders are named for a human date:
-        # the one on the camera for an EXIF capture, and the one Windows
-        # Explorer shows for the modified-time fallback. Rendering in UTC moved
-        # an evening photo into the next day, and around New Year into the next
-        # year, while the review table beside it showed the local date.
-        stamp = datetime.fromtimestamp(captured)
-        values = {
-            "name": source.name, "stem": source.stem, "suffix": source.suffix,
-            "extension": metadata.extension.lstrip(".") or "extensionless",
-            "media_type": metadata.media_type.title() or "Other",
-            "year": f"{stamp.year:04d}", "month": f"{stamp.month:02d}", "day": f"{stamp.day:02d}",
-            **camera_tokens(metadata),
-        }
+        values = template_values(metadata)
         try:
             folder = str(root).format_map(values)
             name = association.rename_template.format_map(values) if association.action == SortAction.RENAME else source.name
