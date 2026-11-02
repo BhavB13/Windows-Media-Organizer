@@ -11,8 +11,8 @@ few fields of EXIF, and every format here stores ordinary TIFF-structured EXIF:
 * HEIF, HEIC and AVIF keep an "Exif" item inside the ISO-BMFF ``meta`` box,
   located through ``iinf`` and ``iloc``; image size is in the ``ispe`` property.
 * Fujifilm RAF embeds a JPEG whose APP1 segment carries the EXIF.
-
-Canon CR3 stores EXIF in vendor boxes inside a ``uuid`` box and is not read.
+* Canon CR3 is ISO-BMFF and stores EXIF in CMT1 and CMT2 boxes inside a Canon
+  ``uuid`` box in ``moov``.
 
 Everything is read-only and bounded: only the headers and the EXIF block are
 read, never the image data, and malformed input yields an empty result rather
@@ -32,7 +32,8 @@ TIFF_RAW_EXTENSIONS = frozenset(
 )
 HEIF_EXTENSIONS = frozenset({".heic", ".heif", ".hif", ".avif"})
 RAF_EXTENSIONS = frozenset({".raf"})
-SUPPORTED_EXTENSIONS = TIFF_RAW_EXTENSIONS | HEIF_EXTENSIONS | RAF_EXTENSIONS
+CR3_EXTENSIONS = frozenset({".cr3"})
+SUPPORTED_EXTENSIONS = TIFF_RAW_EXTENSIONS | HEIF_EXTENSIONS | RAF_EXTENSIONS | CR3_EXTENSIONS
 
 # Upper bounds on what is read, so a hostile or corrupt file cannot make the
 # reader allocate or scan without limit.
@@ -48,6 +49,8 @@ TAG_DATETIME_ORIGINAL = 36867
 TAG_DATETIME_DIGITIZED = 36868
 TAG_IMAGE_WIDTH = 256
 TAG_IMAGE_LENGTH = 257
+
+CANON_CR3_UUID = bytes.fromhex("85c0b687820f11e08111f4ce462b6a48")
 
 
 @dataclass(frozen=True)
@@ -302,11 +305,47 @@ def _read_iloc_item(handle, head: bytes, start: int, end: int, wanted: int) -> b
     return b""
 
 
+def _cr3_metadata(path: Path) -> ContainerMetadata:
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(MAX_METADATA_BYTES)
+        moov = _find(head, 0, len(head), "moov")
+        if moov is None:
+            return ContainerMetadata()
+        moov_start, moov_end = moov
+        cmt1_tags: dict[int, object] = {}
+        cmt2_tags: dict[int, object] = {}
+        for kind, payload, box_end in _boxes(head, moov_start, moov_end):
+            if kind == "uuid" and box_end - payload >= 16 and head[payload:payload + 16] == CANON_CR3_UUID:
+                for child_kind, child_payload, child_end in _boxes(head, payload + 16, box_end):
+                    if child_kind == "CMT1":
+                        cmt1_tags = parse_tiff(head[child_payload:child_end])
+                    elif child_kind == "CMT2":
+                        cmt2_tags = parse_tiff(head[child_payload:child_end])
+                if cmt1_tags and cmt2_tags:
+                    break
+        captured = 0.0
+        for tag_val in (
+            cmt2_tags.get(TAG_DATETIME_ORIGINAL),
+            cmt2_tags.get(TAG_DATETIME_DIGITIZED),
+            cmt1_tags.get(TAG_DATETIME),
+        ):
+            if isinstance(tag_val, str):
+                captured = _parse_exif_datetime(tag_val)
+                if captured:
+                    break
+        make = str(cmt1_tags.get(TAG_MAKE, "") or "").strip()
+        model = str(cmt1_tags.get(TAG_MODEL, "") or "").strip()
+        return ContainerMetadata(captured=captured, make=make, model=model)
+    except (OSError, ValueError, struct.error, IndexError, KeyError, TypeError):
+        return ContainerMetadata()
+
+
 # ----------------------------------------------------------------- entry point
 
 
 def read_container_metadata(path: str | Path) -> ContainerMetadata:
-    """Capture date, camera and size for a HEIF or RAW file, or an empty result."""
+    """Capture date, camera and size for a HEIF, CR3 or RAW file, or an empty result."""
 
     candidate = Path(path)
     suffix = candidate.suffix.lower()
@@ -323,6 +362,8 @@ def read_container_metadata(path: str | Path) -> ContainerMetadata:
                 handle.seek(jpeg_offset)
                 jpeg = handle.read(min(jpeg_length, MAX_METADATA_BYTES))
             return _from_tiff_tags(parse_tiff(_exif_from_jpeg(jpeg)))
+        if suffix in CR3_EXTENSIONS:
+            return _cr3_metadata(candidate)
         if suffix in TIFF_RAW_EXTENSIONS:
             with candidate.open("rb") as handle:
                 data = handle.read(MAX_METADATA_BYTES)
