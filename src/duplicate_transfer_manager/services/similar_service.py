@@ -269,6 +269,13 @@ class SimilarPhotoService:
                     ErrorCode.VALIDATION,
                     "Keep at least one photo from every group. This would leave no copy of one photo in place.",
                 )
+        # Byte-identical groups are true duplicates; the rest are only similar.
+        reasons = {
+            item.id: "duplicate" if group.kind == "identical" else "similar"
+            for group in review.groups
+            for item in group.items
+            if item.id in selected
+        }
         return DuplicateQuarantineService(self.paths).quarantine(
-            review.duplicate_review, selected, dry_run=dry_run
+            review.duplicate_review, selected, dry_run=dry_run, reason=reasons
         )

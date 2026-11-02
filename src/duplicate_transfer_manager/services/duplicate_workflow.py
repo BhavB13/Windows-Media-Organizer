@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 from uuid import uuid4
 
 try:
@@ -310,6 +310,7 @@ class DuplicateQuarantineService:
         operation_id: str | None = None,
         adb_serial: str = "",
         dry_run: bool = False,
+        reason: str | Mapping[str, str] = "duplicate",
     ) -> QuarantineResult:
         selected = set(selected_ids)
         operation = operation_id or f"duplicate_{_utc_stamp()}_{uuid4().hex}"
@@ -359,12 +360,13 @@ class DuplicateQuarantineService:
                     target_name = f"{stem}-{index}{suffix}"
                 claimed_names.add(target_name)
                 stored_path = operation_root / target_name
+                item_reason = reason.get(item.id, "duplicate") if isinstance(reason, Mapping) else reason
                 record = QuarantineRecord(
                     original_path=item.path,
                     stored_path=str(stored_path),
                     hash=group.hash,
                     size=item.size,
-                    reason="duplicate",
+                    reason=item_reason,
                     operation_id=operation,
                     source_is_adb=item.is_adb,
                     device_serial=adb_serial if item.is_adb else "",
